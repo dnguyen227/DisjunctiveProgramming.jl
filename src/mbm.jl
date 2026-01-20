@@ -62,29 +62,51 @@ function _reformulate_disjunct(
     for cref in filtered_constraints
         empty!(method.M)
 
-        for d in method.conlvref
-            # Skip already-deactivated disjuncts
-            d in method.deactivated && continue
+        # Check if we have precomputed M values for this constraint
+        if method.precomputed_M !== nothing &&
+           haskey(method.precomputed_M, cref.index)
+            # Use precomputed M values
+            precomputed = method.precomputed_M[cref.index]
+            for d in method.conlvref
+                d in method.deactivated && continue
+                if haskey(precomputed.M_values, d)
+                    M_result = precomputed.M_values[d]
+                    if M_result === nothing
+                        push!(method.deactivated, d)
+                        @warn "Disjunct $(d) is infeasible, deactivating."
+                        delete!(bconref, d)
+                    else
+                        method.M[d] = M_result
+                    end
+                end
+            end
+        else
+            # Compute M values (original logic)
+            for d in method.conlvref
+                # Skip already-deactivated disjuncts
+                d in method.deactivated && continue
 
-            d_constraints = _indicator_to_constraints(model)[d]
-            disjunct_constraints = [
-                c for c in d_constraints if c isa DisjunctConstraintRef
-            ]
-            if !isempty(disjunct_constraints)
-                M_result = _maximize_M(
-                    model,
-                    JuMP.constraint_object(cref),
-                    disjunct_constraints,
-                    method
-                )
-                # Check for infeasibility: disjunct d has empty feasible region
-                if M_result === nothing
-                    push!(method.deactivated, d)
-                    @warn "Disjunct $(d) is infeasible, deactivating."
-                    # Remove from bconref since it's now deactivated
-                    delete!(bconref, d)
-                else
-                    method.M[d] = M_result
+                d_constraints = _indicator_to_constraints(model)[d]
+                disjunct_constraints = [
+                    c for c in d_constraints if c isa DisjunctConstraintRef
+                ]
+                if !isempty(disjunct_constraints)
+                    M_result = _maximize_M(
+                        model,
+                        JuMP.constraint_object(cref),
+                        disjunct_constraints,
+                        method
+                    )
+                    # Check for infeasibility: disjunct d has empty feasible
+                    # region
+                    if M_result === nothing
+                        push!(method.deactivated, d)
+                        @warn "Disjunct $(d) is infeasible, deactivating."
+                        # Remove from bconref since it's now deactivated
+                        delete!(bconref, d)
+                    else
+                        method.M[d] = M_result
+                    end
                 end
             end
         end
@@ -549,9 +571,167 @@ function _replace_variables_in_constraint(
 end
 
 function _replace_variables_in_constraint(
-    ::F, 
+    ::F,
     ::S
 ) where {F, S}
     error("_replace_variables_in_constraint not implemented for " *
           "$(typeof(F)) and $(typeof(S))")
+end
+
+################################################################################
+#                          COMPUTE M VALUES (PUBLIC API)
+################################################################################
+"""
+    MValueResult
+
+Struct containing the M value computation result for a single constraint.
+
+## Fields
+- `constraint_name::String`: Name of the constraint being relaxed
+- `constraint_indicator::LogicalVariableRef`: Indicator for the disjunct
+  containing this constraint
+- `M_values::Dict`: Maps other disjunct indicators to their M values
+- `constraint_obj::JuMP.AbstractConstraint`: The original constraint object
+"""
+struct MValueResult{M <: JuMP.AbstractModel}
+    constraint_name::String
+    constraint_indicator::LogicalVariableRef{M}
+    M_values::Dict{LogicalVariableRef{M}, Any}
+    constraint_obj::JuMP.AbstractConstraint
+end
+
+"""
+    compute_M_values(
+        model::JuMP.AbstractModel,
+        method::MBM
+        )::Dict{DisjunctConstraintIndex, MValueResult}
+
+Compute Multiple Big-M values for all disjunctive constraints in the model
+without performing the reformulation.
+
+This function solves the MBM subproblems to determine the M value for each
+constraint-disjunct pair according to Equation (2) from Trespalacios &
+Grossmann (2015):
+
+```math
+M_{ij} = \\max_x \\{ r_i(x) : r_j(x) \\leq 0, x^L \\leq x \\leq x^U \\}
+```
+
+## Arguments
+- `model::JuMP.AbstractModel`: A GDPModel with disjunctive constraints
+- `method::MBM`: MBM method specifying the optimizer for subproblems
+
+## Returns
+- `Dict{DisjunctConstraintIndex, MValueResult}`: Maps each disjunct constraint
+  to its MValueResult containing all computed M values
+
+## Example
+```julia
+model = GDPModel(Gurobi.Optimizer)
+# ... add variables, constraints, disjunctions ...
+
+M_results = compute_M_values(model, MBM(Gurobi.Optimizer))
+
+for (idx, result) in M_results
+    println("Constraint: \$(result.constraint_name)")
+    for (other_disj, M_val) in result.M_values
+        println("  vs \$(other_disj): M = \$(M_val)")
+    end
+end
+```
+"""
+function compute_M_values(
+    model::JuMP.AbstractModel,
+    method::MBM
+)
+    results = Dict{DisjunctConstraintIndex, MValueResult}()
+    mbm = _MBM(method, model)
+
+    # Iterate over all disjunctions
+    for (disj_idx, disj_data) in _disjunctions(model)
+        disj = disj_data.constraint
+
+        # Process each disjunct (indicator)
+        for indicator in disj.indicators
+            # Set up MBM context for this disjunct
+            mbm.conlvref = filter(x -> x != indicator, disj.indicators)
+
+            # Get constraints for this indicator
+            !haskey(_indicator_to_constraints(model), indicator) && continue
+            constraints = _indicator_to_constraints(model)[indicator]
+            filtered_constraints = [
+                c for c in constraints if c isa DisjunctConstraintRef
+            ]
+
+            # Compute M for each constraint against other disjuncts
+            for cref in filtered_constraints
+                con = JuMP.constraint_object(cref)
+                cref_idx = cref.index
+                cdata = _disjunct_constraints(model)[cref_idx]
+                cname = string(cdata.name)
+
+                M_dict = Dict{typeof(indicator), Any}()
+
+                for other_indicator in mbm.conlvref
+                    other_constraints = _indicator_to_constraints(model)[
+                        other_indicator
+                    ]
+                    disjunct_constraints = [
+                        c for c in other_constraints
+                        if c isa DisjunctConstraintRef
+                    ]
+
+                    if !isempty(disjunct_constraints)
+                        M_val = _maximize_M(
+                            model, con, disjunct_constraints, mbm
+                        )
+                        M_dict[other_indicator] = M_val
+                    end
+                end
+
+                results[cref_idx] = MValueResult(
+                    cname,
+                    indicator,
+                    M_dict,
+                    con
+                )
+            end
+        end
+    end
+
+    return results
+end
+
+"""
+    print_M_values(
+        M_results::Dict{DisjunctConstraintIndex, MValueResult};
+        io::IO = stdout
+        )
+
+Pretty-print the computed M values.
+
+## Arguments
+- `M_results`: Output from `compute_M_values`
+- `io`: IO stream for output (default: stdout)
+"""
+function print_M_values(
+    M_results::Dict{DisjunctConstraintIndex, MValueResult};
+    io::IO = stdout
+)
+    println(io, "="^70)
+    println(io, "MBM M-Value Summary")
+    println(io, "="^70)
+
+    for (idx, result) in sort(collect(M_results), by = x -> string(x[2].constraint_name))
+        println(io, "\nConstraint: $(result.constraint_name)")
+        println(io, "  Indicator: $(result.constraint_indicator)")
+        println(io, "  M values:")
+        for (other_disj, M_val) in result.M_values
+            if M_val === nothing
+                println(io, "    vs $(other_disj): INFEASIBLE (disjunct has empty region)")
+            else
+                println(io, "    vs $(other_disj): M = $(M_val)")
+            end
+        end
+    end
 end

@@ -368,21 +368,63 @@ struct BigM{T} <: AbstractReformulationMethod
 end
 
 """
-    MBM{O, T, L <: LogicalVariableRef} <: AbstractReformulationMethod
+    MBM{O, T} <: AbstractReformulationMethod
 
-A type for using the multiple big-M reformulation approach for disjunctive constraints.
+A type for using the multiple big-M reformulation approach for disjunctive
+constraints.
 
 **Fields**
 - `optimizer::O`: Optimizer to use when solving mini-models (required).
-- `default_M::T`: Default big-M value to use if no big-M is specified for a logical variable (1e9).
+- `default_M::T`: Default big-M value to use if subproblem fails (1e9).
+- `precomputed_M::Union{Nothing, Dict}`: Pre-computed M values from
+  `compute_M_values()`. If provided, skips M computation during reformulation.
+
+**Constructors**
+```julia
+MBM(optimizer)                      # Compute M values during reformulation
+MBM(optimizer, default_M)           # With custom default M
+MBM(optimizer, M_results)           # Use pre-computed M values
+MBM(optimizer, M_results, default_M) # Both pre-computed and custom default
+```
+
+**Example**
+```julia
+# Option 1: Compute M values during reformulation
+optimize!(model, gdp_method = MBM(Gurobi.Optimizer))
+
+# Option 2: Pre-compute, inspect, then reformulate
+M_results = compute_M_values(model, MBM(Gurobi.Optimizer))
+# ... inspect or modify M_results ...
+optimize!(model, gdp_method = MBM(Gurobi.Optimizer, M_results))
+```
 """
 mutable struct MBM{O, T} <: AbstractReformulationMethod
     optimizer::O
     default_M::T
-    
-    # Constructor with optimizer (required) and optional default_M
-    function MBM(optimizer::O, default_M::T = 1e9) where {O, T}
-        new{O, T}(optimizer, default_M)
+    precomputed_M::Union{Nothing, Dict}
+
+    # Constructor with optimizer only
+    function MBM(optimizer::O) where {O}
+        new{O, Float64}(optimizer, 1e9, nothing)
+    end
+
+    # Constructor with optimizer and default_M (numeric)
+    function MBM(optimizer::O, default_M::T) where {O, T <: Number}
+        new{O, T}(optimizer, default_M, nothing)
+    end
+
+    # Constructor with optimizer and precomputed M values
+    function MBM(optimizer::O, precomputed_M::Dict) where {O}
+        new{O, Float64}(optimizer, 1e9, precomputed_M)
+    end
+
+    # Constructor with all three arguments
+    function MBM(
+        optimizer::O,
+        precomputed_M::Dict,
+        default_M::T
+    ) where {O, T <: Number}
+        new{O, T}(optimizer, default_M, precomputed_M)
     end
 end
 
@@ -392,13 +434,16 @@ mutable struct _MBM{O, T, M <: JuMP.AbstractModel} <: AbstractReformulationMetho
     default_M::T
     conlvref::Vector{LogicalVariableRef{M}}
     deactivated::Set{LogicalVariableRef{M}}
+    precomputed_M::Union{Nothing, Dict}
 
     function _MBM(method::MBM{O, T}, model::M) where {O, T, M <: JuMP.AbstractModel}
-        new{O, T, M}(method.optimizer,
+        new{O, T, M}(
+            method.optimizer,
             Dict{LogicalVariableRef{M}, Union{T, Vector{T}}}(),
             method.default_M,
             Vector{LogicalVariableRef{M}}(),
-            Set{LogicalVariableRef{M}}()
+            Set{LogicalVariableRef{M}}(),
+            method.precomputed_M
         )
     end
 end
