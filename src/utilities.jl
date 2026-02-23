@@ -83,7 +83,7 @@ model structure.
 function copy_gdp_data(
     model::M,
     new_model::M,
-    ref_map::GenericReferenceMap
+    ref_map
     ) where {M <: JuMP.AbstractModel}
     
     old_gdp = model.ext[:GDP]
