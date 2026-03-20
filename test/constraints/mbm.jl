@@ -14,6 +14,42 @@ function test_mbm()
     @test DP._is_all_zeros([0.0, 0.0])
     @test !DP._is_all_zeros([0, 1, 0])
     @test !DP._is_all_zeros([5.0, 0.0])
+    @test !DP._is_all_zeros("not a number") # non-numeric fallback
+end
+
+# _var_ref_type when all map values are Numbers (no VariableRef
+# found → returns V). Covers line 537.
+function test__var_ref_type_numeric_map()
+    model = Model()
+    @variable(model, x[1:2])
+    aff = @expression(model, 2*x[1] + 3*x[2])
+    var_map = Dict{VariableRef, Any}(x[1] => 5.0, x[2] => 3.0)
+    @test DP._var_ref_type(typeof(aff), var_map) == VariableRef
+end
+
+# _replace_variables_in_constraint with QuadExpr where var_map
+# maps some vars to Numbers. Covers lines 569, 571, 574.
+function test__replace_variables_quad_numeric_map()
+    model = Model()
+    sub = Model()
+    @variable(model, x[1:3])
+    @variable(sub, y)
+    quad1 = @expression(model, x[1] * x[2])
+
+    # both Number (line 569)
+    map1 = Dict{VariableRef, Any}(x[1] => 2.0, x[2] => 3.0)
+    result1 = DP._replace_variables_in_constraint(quad1, map1)
+    @test result1.aff.constant ≈ 6.0
+
+    # ra Number, rb VariableRef (line 571)
+    map2 = Dict{VariableRef, Any}(x[1] => 2.0, x[2] => y)
+    result2 = DP._replace_variables_in_constraint(quad1, map2)
+    @test result2.aff.terms[y] ≈ 2.0
+
+    # rb Number, ra VariableRef (line 574)
+    map3 = Dict{VariableRef, Any}(x[1] => y, x[2] => 3.0)
+    result3 = DP._replace_variables_in_constraint(quad1, map3)
+    @test result3.aff.terms[y] ≈ 3.0
 end
 
 function test__replace_variables_in_constraint()
@@ -44,76 +80,108 @@ function test__replace_variables_in_constraint()
     expected = JuMP.@expression(sub_model, sin(new_vars[x[3]]) - 0.0)
     @test JuMP.isequal_canonical(expr3, expected)
     @test expr4 == [new_vars[x[i]] for i in 1:3]
-    @test_throws ErrorException DP._replace_variables_in_constraint(
+    @test_throws MethodError DP._replace_variables_in_constraint(
         "String", new_vars)
 end
 
-function test__constraint_to_objective()
+function test__prepare_objectives()
     model = Model()
     sub_model = Model()
 
     @variable(model, x[1:2])
-    @constraint(model, lessthan, x[1] <= 1) 
+    @constraint(model, lessthan, x[1] <= 1)
     @constraint(model, greaterthan, x[2] >= 1)
-    @constraint(model, interval, 0 <= x[1] <= 55)
-    @constraint(model, equalto, x[1] == 1)
-    new_vars = Dict{AbstractVariableRef, AbstractVariableRef}()
-    [new_vars[x[i]] = @variable(sub_model) for i in 1:2]
-    DP._constraint_to_objective(sub_model, constraint_object(lessthan), 
-        new_vars)
-    @test objective_function(sub_model) == JuMP.@expression(sub_model, 
-        new_vars[x[1]] - 1)
-    DP._constraint_to_objective(sub_model, constraint_object(greaterthan), 
-        new_vars)
-    @test objective_function(sub_model) == JuMP.@expression(sub_model, 
-        1 - new_vars[x[2]])
-    @test_throws ErrorException DP._constraint_to_objective(sub_model, 
-        constraint_object(interval), new_vars)
+    new_vars = Dict{VariableRef, Vector{VariableRef}}()
+    for i in 1:2
+        new_vars[x[i]] = [@variable(sub_model)]
+    end
+    sub = DP.GDPSubmodel(sub_model,
+        collect(keys(new_vars)), new_vars)
+
+    # LessThan: max(f - upper) = max(x[1] - 1)
+    objs_le = DP._prepare_objectives(
+        model, constraint_object(lessthan), sub)
+    @test length(objs_le) == 1
+    @test objs_le[1] == JuMP.@expression(sub_model,
+        new_vars[x[1]][1] - 1)
+
+    # GreaterThan: max(lower - f) = max(1 - x[2])
+    objs_ge = DP._prepare_objectives(
+        model, constraint_object(greaterthan), sub)
+    @test length(objs_ge) == 1
+    @test objs_ge[1] == JuMP.@expression(sub_model,
+        1 - new_vars[x[2]][1])
 end
 
-function test_mini_model()
+function test_raw_M()
     model = GDPModel()
     @variable(model, 0 <= x, start = 1)
     @variable(model, 0 <= y)
     @variable(model, Y[1:5], Logical)
-    @constraint(model, con, 3*-x <= 4, Disjunct(Y[1]))
-    @constraint(model, con2, 3*x + y >= 15, Disjunct(Y[2]))
-    @constraint(model, infeasiblecon, 3*x + y == 15, Disjunct(Y[3]))
-    @constraint(model, intervalcon, 0 <= x <= 55, Disjunct(Y[4]))
-    #infeasible constraint (x >= 100 but x <= 1 after bounds)
-    @constraint(model, truly_infeasible, x >= 100, Disjunct(Y[5]))
-    @disjunction(model, [Y[1], Y[2], Y[3], Y[4], Y[5]])
-    mbm = DP._MBM(DP.MBM(HiGHS.Optimizer), JuMP.Model())
-    @test DP._mini_model(model, constraint_object(con),
-        DisjunctConstraintRef[con2], mbm)== 0.0
+    @constraint(model, con, 3*-x <= 4,
+        Disjunct(Y[1]))
+    @constraint(model, con2, 3*x + y >= 15,
+        Disjunct(Y[2]))
+    @constraint(model, infeasiblecon,
+        3*x + y == 15, Disjunct(Y[3]))
+    @constraint(model, intervalcon,
+        0 <= x <= 55, Disjunct(Y[4]))
+    @constraint(model, truly_infeasible,
+        x >= 100, Disjunct(Y[5]))
+    @disjunction(model,
+        [Y[1], Y[2], Y[3], Y[4], Y[5]])
+    mbm = DP._MBM(
+        DP.MBM(HiGHS.Optimizer), JuMP.Model())
+    sub = DP.create_submodel(model,
+        DisjunctConstraintRef[con2], mbm)
+    objs = DP._prepare_objectives(model,
+        constraint_object(con), sub)
+    raw = DP._raw_M(sub, objs, mbm)
+    @test DP.condense_values(model, raw) == 0.0
     set_upper_bound(x, 1)
-    @test DP._mini_model(model, constraint_object(con2),
-        DisjunctConstraintRef[con], mbm)== 15
+    sub2 = DP.create_submodel(model,
+        DisjunctConstraintRef[con], mbm)
+    objs2 = DP._prepare_objectives(model,
+        constraint_object(con2), sub2)
+    raw = DP._raw_M(sub2, objs2, mbm)
+    @test DP.condense_values(model, raw) == 15
     set_integer(y)
-    @constraint(model, con3, y*x == 15, Disjunct(Y[1]))
-    @test DP._mini_model(model, constraint_object(con2),
-        DisjunctConstraintRef[con], mbm)== 15
-    # Create fresh _MBM after changing bounds (as reformulate_disjunction does)
+    @constraint(model, con3, y*x == 15,
+        Disjunct(Y[1]))
+    objs3 = DP._prepare_objectives(model,
+        constraint_object(con2), sub2)
+    raw = DP._raw_M(sub2, objs3, mbm)
+    @test DP.condense_values(model, raw) == 15
+    # Fresh _MBM after changing bounds
     JuMP.fix(y, 5; force=true)
-    mbm2 = DP._MBM(DP.MBM(HiGHS.Optimizer), JuMP.Model())
-    @test DP._mini_model(model, constraint_object(con2),
-        DisjunctConstraintRef[con], mbm2)== 10
-    # With x <= 1 and y = 5, con2's region (3x + y >= 15) is infeasible:
-    # 3(1) + 5 = 8 < 15, so returns nothing (detected infeasibility)
+    mbm2 = DP._MBM(
+        DP.MBM(HiGHS.Optimizer), JuMP.Model())
+    sub3 = DP.create_submodel(model,
+        DisjunctConstraintRef[con], mbm2)
+    objs4 = DP._prepare_objectives(model,
+        constraint_object(con2), sub3)
+    raw = DP._raw_M(sub3, objs4, mbm2)
+    @test DP.condense_values(model, raw) == 10
+    # Infeasible region → nothing
     delete_lower_bound(x)
-    mbm3 = DP._MBM(DP.MBM(HiGHS.Optimizer), JuMP.Model())
-    @test DP._mini_model(model, constraint_object(con2),
-        DisjunctConstraintRef[con2], mbm3) == nothing
+    mbm3 = DP._MBM(
+        DP.MBM(HiGHS.Optimizer), JuMP.Model())
+    sub4 = DP.create_submodel(model,
+        DisjunctConstraintRef[con2], mbm3)
+    objs5 = DP._prepare_objectives(model,
+        constraint_object(con2), sub4)
+    @test DP._raw_M(sub4, objs5, mbm3) == nothing
 
-    # infeasible (x >= 100 but x has upper bound 1)
+    # infeasible (x >= 100 but x <= 1)
     set_upper_bound(x, 1)
-    mbm4 = DP._MBM(DP.MBM(HiGHS.Optimizer), JuMP.Model())
-    @test DP._mini_model(
-        model,
-        constraint_object(con),
+    mbm4 = DP._MBM(
+        DP.MBM(HiGHS.Optimizer), JuMP.Model())
+    sub5 = DP.create_submodel(model,
         DisjunctConstraintRef[truly_infeasible],
-        mbm4
-    ) == nothing
+        mbm4)
+    objs6 = DP._prepare_objectives(model,
+        constraint_object(con), sub5)
+    @test DP._raw_M(sub5, objs6, mbm4) == nothing
 end
 
 function test_maximize_M()
@@ -663,28 +731,35 @@ function test__create_submodel()
         DP._indicator_to_constraints(model)[Y[1]]
     )
 
-    sub_model, var_map = DP._create_submodel(model, constraints, mbm)
+    sub = DP.create_submodel(model, constraints, mbm)
 
-    # Check submodel was created
-    @test sub_model isa Model
-
+    # Check submodel struct
+    @test sub isa DP.GDPSubmodel
+    @test sub.model isa Model
     # Check variable mapping exists
-    @test haskey(var_map, x)
-    @test haskey(var_map, y)
+    @test haskey(sub.fwd, x)
+    @test haskey(sub.fwd, y)
 
-    # Check mapped variables have correct bounds in submodel
-    @test has_lower_bound(var_map[x])
-    @test lower_bound(var_map[x]) == 0
-    @test has_upper_bound(var_map[x])
-    @test upper_bound(var_map[x]) == 10
+    # Check mapped variables (length-1 vectors)
+    @test length(sub.fwd[x]) == 1
+    @test length(sub.fwd[y]) == 1
 
-    @test has_lower_bound(var_map[y])
-    @test lower_bound(var_map[y]) == 0
-    @test has_upper_bound(var_map[y])
-    @test upper_bound(var_map[y]) == 5
+    # Check bounds in submodel
+    xm = sub.fwd[x][1]
+    ym = sub.fwd[y][1]
+    @test has_lower_bound(xm)
+    @test lower_bound(xm) == 0
+    @test has_upper_bound(xm)
+    @test upper_bound(xm) == 10
+
+    @test has_lower_bound(ym)
+    @test lower_bound(ym) == 0
+    @test has_upper_bound(ym)
+    @test upper_bound(ym) == 5
 
     # Check constraint was added to submodel
-    @test num_constraints(sub_model, AffExpr, MOI.LessThan{Float64}) == 1
+    @test num_constraints(sub.model, AffExpr,
+        MOI.LessThan{Float64}) == 1
 end
 
 # Test get_variable_info
@@ -730,9 +805,11 @@ end
     test__create_submodel()
     test_get_variable_info()
     test_mbm()
+    test__var_ref_type_numeric_map()
+    test__replace_variables_quad_numeric_map()
     test__replace_variables_in_constraint()
-    test__constraint_to_objective()
-    test_mini_model()
+    test__prepare_objectives()
+    test_raw_M()
     test_maximize_M()
     test_reformulate_disjunct_constraint()
     test_reformulate_disjunct()

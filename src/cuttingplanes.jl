@@ -1,149 +1,215 @@
-function reformulate_model(
-    model::JuMP.AbstractModel, 
-    method::cutting_planes
-    ) 
-    _clear_reformulations(model)
-    var_type = JuMP.variable_ref_type(model)
-    obj = objective_function(model)
-    sense = objective_sense(model)
+################################################################################
+#                        CUTTING PLANES SUBPROBLEM
+################################################################################
 
-    #Creation of seperation (SEP) and relaxed big M model (rBM).
-    SEP, sep_ref_map, _ = copy_gdp_model(model)
-    rBM, rBM_ref_map, _ = copy_gdp_model(model)
-    reformulate_model(rBM, BigM(method.M_value))
-    reformulate_model(SEP, Hull())
-    main_to_SEP_map = Dict(v => sep_ref_map[v] for v in collect_all_vars(model))
-    main_to_rBM_map = Dict(v => rBM_ref_map[v] for v in collect_all_vars(model))
-    JuMP.set_optimizer(SEP, method.optimizer)
-    JuMP.set_optimizer(rBM, method.optimizer)
-    JuMP.set_silent(rBM)
-    JuMP.set_silent(SEP)
-    JuMP.relax_integrality(rBM)
-    JuMP.relax_integrality(SEP)
-    JuMP.@objective(rBM, sense, 
-        _replace_variables_in_constraint(obj, main_to_rBM_map)
-    )
-    #Mapping of variables between models.
-    rBM_to_SEP_map = Dict{var_type, var_type}()
-    SEP_to_rBM_map = Dict{var_type, var_type}()
-    for (var, rBM_var) in main_to_rBM_map
-        SEP_var = main_to_SEP_map[var]
-        rBM_to_SEP_map[rBM_var] = SEP_var
-        SEP_to_rBM_map[SEP_var] = rBM_var
-    end
-    
-    #Main cutting planes loop.
-    i = 1
-    sep_obj = Inf
-    while i <= method.max_iter && sep_obj > method.seperation_tolerance
-        rBM_sol = _solve_rBM(rBM)
-        SEP_sol = _solve_SEP(SEP, rBM, rBM_sol, SEP_to_rBM_map, rBM_to_SEP_map)
-        sep_obj = objective_value(SEP)
-        _cutting_planes(model, rBM, main_to_rBM_map, 
-            main_to_SEP_map, rBM_sol, SEP_sol
-        )
-        i += 1
-    end
-
-    #Final reformulation with added cutting planes.
-    reformulate_model(model, method.final_reform_method)
+# Configure optimizer on a subproblem.
+function configure_optimizer(sub::GDPSubmodel,
+    method::cutting_planes)
+    JuMP.set_optimizer(sub.model, method.optimizer)
+    JuMP.set_silent(sub.model)
     return
 end
 
-function _solve_rBM(
-    rBM::M,
-    ) where {M <: JuMP.AbstractModel}
-    T = JuMP.value_type(M)
-    optimize!(rBM, ignore_optimize_hook = true)
-    rBM_vars = collect_all_vars(rBM)
+################################################################################
+#                       EXTENSION POINT FUNCTIONS
+################################################################################
 
-    #Solution to be passed to SEP model.
-    sol = Dict{JuMP.AbstractVariableRef,T}(var => zero(T) for var in rBM_vars)
-    for rBM_var in rBM_vars
-        sol[rBM_var] = JuMP.value(rBM_var)
+# Collect decision variables for cutting planes.
+# Extensions may override to customize variable
+# collection.
+function collect_cp_vars(model::JuMP.AbstractModel)
+    return collect_all_vars(model)
+end
+
+# Build one cutting planes subproblem (SEP). dec_vars is
+# the shared key space (collected once from the clean
+# model). Extensions may override for custom subproblem
+# construction.
+function build_cp_subproblem(
+    model::JuMP.AbstractModel,
+    dec_vars::Vector{V},
+    reform_method::AbstractReformulationMethod,
+    method::cutting_planes
+    ) where {V}
+    copy, ref_map, _ = copy_gdp_model(model)
+    reformulate_model(copy, reform_method)
+    obj = JuMP.objective_function(model)
+    sense = JuMP.objective_sense(model)
+    m2c = Dict(v => ref_map[v] for v in dec_vars)
+    JuMP.@objective(copy, sense,
+        _replace_variables_in_constraint(obj, m2c))
+    fwd = Dict(v => [ref_map[v]] for v in dec_vars)
+    sub = GDPSubmodel(copy, dec_vars, fwd)
+    configure_optimizer(sub, method)
+    return sub
+end
+
+# Set up the rBM (relaxed Big-M) subproblem.
+# Reformulates the model in-place (no copy).
+# Returns (rBM::GDPSubmodel, undo_fn). Extensions
+# may override for custom rBM setup.
+function setup_rbm(
+    model::JuMP.AbstractModel,
+    dec_vars::Vector{V},
+    method::cutting_planes
+    ) where {V}
+    reformulate_model(model, BigM(method.M_value))
+    fwd = Dict(v => [v] for v in dec_vars)
+    sub = GDPSubmodel(model, dec_vars, fwd)
+    configure_optimizer(sub, method)
+    undo_relax = JuMP.relax_integrality(model)
+    return sub, undo_relax
+end
+
+# Extract solution from a solved subproblem. Keyed by
+# original dec_vars.
+function _extract_solution(sub::GDPSubmodel)
+    V = eltype(sub.dec_vars)
+    first_var = first(values(sub.fwd))[1]
+    T = JuMP.value_type(typeof(JuMP.owner_model(first_var)))
+    sol = Dict{V, Vector{T}}()
+    for var in sub.dec_vars
+        tvars = sub.fwd[var]
+        sol[var] = [JuMP.value(tv) for tv in tvars]
     end
     return sol
 end
 
-function _solve_SEP(
-    SEP::M,
-    rBM::M,
-    rBM_sol::Dict{<:JuMP.AbstractVariableRef,T},
-    SEP_to_rBM_map::Dict{<:JuMP.AbstractVariableRef,<:JuMP.AbstractVariableRef},
-    rBM_to_SEP_map::Dict{<:JuMP.AbstractVariableRef,<:JuMP.AbstractVariableRef} 
-    ) where {M <: JuMP.AbstractModel, T <: Number}
-
-    SEP_vars = [rBM_to_SEP_map[rBM_var] for rBM_var in collect_all_vars(rBM)]
-
-    #Modified objective function for SEP.
-    obj_expr = sum(
-        (SEP_var - rBM_sol[SEP_to_rBM_map[SEP_var]])^2 for SEP_var in SEP_vars
-    )
-    JuMP.@objective(SEP, Min, obj_expr)
-    optimize!(SEP, ignore_optimize_hook = true)
-
-    #Solution to be used in cutting plane generation.
-    sol = Dict{JuMP.AbstractVariableRef, T}(var => zero(T) for var in SEP_vars)
-    for SEP_var in SEP_vars
-        sol[SEP_var] = JuMP.value(SEP_var)
+# Set the quadratic separation objective:
+# min sum_var sum_k (x_k - rBM_k)^2.
+function _set_sep_objective(sub::GDPSubmodel, rBM_sol)
+    obj_expr = _zero_quad(sub.model)
+    for var in sub.dec_vars
+        tvars = sub.fwd[var]
+        vals = rBM_sol[var]
+        for k in 1:length(tvars)
+            JuMP.add_to_expression!(
+                obj_expr,
+                (tvars[k] - vals[k]) *
+                (tvars[k] - vals[k])
+                )
+        end
     end
-    return sol
+    JuMP.@objective(sub.model, Min, obj_expr)
+    return
 end
 
-function _cutting_planes(
-    model::M,
-    rBM::M,
-    main_to_rBM_map::Dict{<:JuMP.AbstractVariableRef,<:JuMP.AbstractVariableRef},
-    main_to_SEP_map::Dict{<:JuMP.AbstractVariableRef,<:JuMP.AbstractVariableRef},
-    rBM_sol::Dict{<:JuMP.AbstractVariableRef,T},
-    SEP_sol::Dict{<:JuMP.AbstractVariableRef,T},
-    ) where {M <: JuMP.AbstractModel, T <: Number}
-    main_vars = collect_all_vars(model)
+# Solve the separation problem. Returns (sep_obj, sep_sol).
+function _solve_separation(sep::GDPSubmodel, rBM_sol)
+    _set_sep_objective(sep, rBM_sol)
+    JuMP.optimize!(sep.model, ignore_optimize_hook = true)
+    sep_obj = JuMP.objective_value(sep.model)
+    sep_sol = _extract_solution(sep)
+    return sep_obj, sep_sol
+end
 
-    #Cutting plane generation
-    ξ_sep = Dict{JuMP.AbstractVariableRef,T}(var =>zero(T) for var in main_vars)
-    for var in main_vars
-        ξ_sep[var] = 2*(SEP_sol[main_to_SEP_map[var]]
-            -rBM_sol[main_to_rBM_map[var]]
-        )
+# Add a cut to a subproblem.
+# cut: sum_var sum_k 2*(sep_k-rBM_k)*(x_k-sep_k) >= 0
+function _add_cut(sub::GDPSubmodel, rBM_sol, sep_sol)
+    cut_expr = _zero_aff(sub.model)
+    for var in sub.dec_vars
+        tvars = sub.fwd[var]
+        rbm_vals = rBM_sol[var]
+        sep_vals = sep_sol[var]
+        for k in 1:length(tvars)
+            xi = 2 * (sep_vals[k] - rbm_vals[k])
+            JuMP.add_to_expression!(cut_expr, xi,
+                tvars[k])
+            JuMP.add_to_expression!(cut_expr,
+                -xi * sep_vals[k])
+        end
     end
-    #Cutting plane added to main model.
-    main_cut = JuMP.@expression(model, 
-        sum(ξ_sep[var]*(var - SEP_sol[main_to_SEP_map[var]]) 
-            for var in main_vars
-        )
+    JuMP.@constraint(sub.model, cut_expr >= 0)
+    return
+end
+
+# Add a cut to the original model. Extensions may
+# override for custom cut representations.
+function add_original_model_cut(
+    model::JuMP.AbstractModel, dec_vars::Vector{V},
+    rBM_sol::Dict{V, Vector{T1}},
+    sep_sol::Dict{V, Vector{T2}}
+    ) where {V, T1, T2}
+    cut_expr = _zero_aff(model)
+    for var in dec_vars
+        xi = 2 * (sep_sol[var][1] - rBM_sol[var][1])
+        sp = sep_sol[var][1]
+        JuMP.add_to_expression!(cut_expr, xi, var)
+        JuMP.add_to_expression!(cut_expr, -xi * sp)
+    end
+    JuMP.@constraint(model, cut_expr >= 0)
+    return
+end
+
+################################################################################
+#                        UNIFIED CUTTING PLANES LOOP
+################################################################################
+
+function reformulate_model(
+    model::JuMP.AbstractModel, method::cutting_planes
     )
-    #Cutting plane added to rBM
-    rBM_cut = _replace_variables_in_constraint(main_cut, main_to_rBM_map)
-    JuMP.@constraint(model, main_cut >= 0.0)
-    JuMP.@constraint(rBM, rBM_cut >= 0.0)
+    _clear_reformulations(model)
+    dec_vars = collect_cp_vars(model)
+
+    # Build SEP first (from clean model)
+    sep = build_cp_subproblem(model, dec_vars,
+        Hull(), method)
+    JuMP.relax_integrality(sep.model)
+
+    # Set up rBM
+    rBM, undo_relax = setup_rbm(model, dec_vars, method)
+
+    # Cutting plane loop
+    prev_sep_obj = Inf
+    for iter in 1:method.max_iter
+        # 1. Solve rBM
+        JuMP.optimize!(rBM.model,
+            ignore_optimize_hook = true)
+        rBM_sol = _extract_solution(rBM)
+
+        # 2. Solve SEP
+        sep_obj, sep_sol = _solve_separation(sep,
+            rBM_sol)
+
+        # 3. Check convergence
+        if sep_obj <= method.seperation_tolerance
+            break
+        end
+
+        # 4. Check stalling
+        rel_improvement = (prev_sep_obj - sep_obj) /
+            max(abs(prev_sep_obj), 1e-10)
+        if iter > 1 && rel_improvement < 0.01
+            break
+        end
+        prev_sep_obj = sep_obj
+
+        # 5. Add cuts
+        _add_cut(rBM, rBM_sol, sep_sol)
+        if rBM.model !== model
+            add_original_model_cut(model, dec_vars,
+                rBM_sol, sep_sol)
+        end
+    end
+
+    if undo_relax !== nothing
+        undo_relax()
+    end
+
+    # Mark model as ready (inner reformulate_model calls
+    # set the solution method to BigM; override it here)
+    _set_solution_method(model, method)
+    _set_ready_to_optimize(model, true)
+    return
 end
 
 ################################################################################
 #                              ERROR MESSAGES
 ################################################################################
 
-function reformulate_model(::M, ::cutting_planes) where {M}
-    error("reformulate_model not implemented for model type `$(M)`.")
-end
-
-function _solve_rBM(::M) where {M}
-    error("_solve_rBM not implemented for model type `$(M)`.")
-end
-
-function _solve_SEP(::M, ::N, ::H, ::S, ::R) where {M, N, H, S, R}
-    error("_solve_SEP not implemented for argument types:\n
-          SEP: `$(M)`, rBM: `$(N)`,\n
-          rBM_sol: `$(H)`,\n
-          SEP_to_rBM_map: `$(S)`,\n
-          rBM_to_SEP_map: `$(R)`.")
-end
-
-function _cutting_planes(::M, ::N, ::H, ::S, ::R, ::T) where {M, N, H, S, R, T}
-    error("_cutting_planes not implemented for argument types: \n
-          model: `$(M)`, rBM: `$(N)`,\n
-          main_to_rBM_map: `$(H)`, main_to_SEP_map: 
-          `$(S)`,\n
-          rBM_sol: `$(R)`,\n
-          SEP_sol: `$(T)`.")
+function reformulate_model(
+    ::M, ::cutting_planes
+    ) where {M}
+    error("reformulate_model not implemented for " *
+          "model type `$(M)`.")
 end
