@@ -182,6 +182,23 @@ function test_raw_M()
     objs6 = DP._prepare_objectives(model,
         constraint_object(con), sub5)
     @test DP._raw_M(sub5, objs6, mbm4) == nothing
+
+    # Unbounded subproblem → default_M fallback.
+    # No lower bound on x means max(5 - x) s.t. x <= 3
+    # is unbounded (DUAL_INFEASIBLE).
+    model_ub = GDPModel()
+    @variable(model_ub, xu)  # no bounds
+    @variable(model_ub, Yu[1:2], Logical)
+    @constraint(model_ub, ub_con1, xu <= 3, Disjunct(Yu[1]))
+    @constraint(model_ub, ub_con2, xu >= 5, Disjunct(Yu[2]))
+    @disjunction(model_ub, [Yu[1], Yu[2]])
+    mbm_ub = DP._MBM(DP.MBM(HiGHS.Optimizer), JuMP.Model())
+    sub_ub = DP.create_submodel(model_ub,
+        DisjunctConstraintRef[ub_con1], mbm_ub)
+    objs_ub = DP._prepare_objectives(model_ub,
+        constraint_object(ub_con2), sub_ub)
+    raw_ub = DP._raw_M(sub_ub, objs_ub, mbm_ub)
+    @test raw_ub == [mbm_ub.default_M]
 end
 
 function test_maximize_M()
