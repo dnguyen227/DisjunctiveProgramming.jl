@@ -1,7 +1,7 @@
 ################################################################################
 #                                MODEL COPYING
 ################################################################################
-# extentsion point for model copying
+# Extension point for model copying (creates empty model).
 function _copy_model(
     model::M
     ) where {M <: JuMP.AbstractModel}
@@ -38,12 +38,12 @@ end
 ################################################################################
 #                         ZERO EXPRESSION CONSTRUCTORS
 ################################################################################
-# Create a type-correct zero affine expression.
+# Create a type-correct zero affine expression for the model.
 _zero_aff(model::JuMP.AbstractModel) = zero(
     JuMP.GenericAffExpr{JuMP.value_type(typeof(model)),
                         JuMP.variable_ref_type(model)})
 
-# Create a type-correct zero quadratic expression.
+# Create a type-correct zero quadratic expression for the model.
 _zero_quad(model::JuMP.AbstractModel) = zero(
     JuMP.GenericQuadExpr{JuMP.value_type(typeof(model)),
                          JuMP.variable_ref_type(model)})

@@ -193,10 +193,9 @@ function test_reformulate_model()
 end
 
 
-# Maximization where Hull is strictly tighter than BigM, forcing
-# many cuts that eventually stall (diminishing returns →
-# rel_improvement < 0.01). Covers cuttingplanes.jl line 186.
-function test_cp_stalling()
+# Maximization where Hull is strictly tighter than BigM,
+# forcing many CP iterations with a tight tolerance.
+function test_cp_many_iterations()
     model = GDPModel(HiGHS.Optimizer)
     set_silent(model)
     @variable(model, 0 <= x <= 10)
@@ -220,5 +219,5 @@ end
     test_cp_loop_helpers()
     test_cp_cut_generation()
     test_reformulate_model()
-    test_cp_stalling()
+    test_cp_many_iterations()
 end
