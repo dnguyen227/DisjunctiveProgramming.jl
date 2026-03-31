@@ -47,10 +47,10 @@ function reformulate_model(
     model::JuMP.AbstractModel, method::LOA
     )
     _clear_reformulations(model)
-    disj_info = _collect_disjunction_info(model)
+    info = _collect_disjunction_info(model)
 
     # Step 1: Set covering initialization
-    combos = _set_covering_combos(disj_info, method)
+    combos = _set_covering_combos(info)
 
     # Step 2: Solve init subproblems, collect solutions
     z_upper = Inf
@@ -58,7 +58,7 @@ function reformulate_model(
     init_results = _LOAIterationResult[]
     for combo in combos
         result = _solve_loa_subproblem(
-            model, combo, disj_info, method)
+            model, combo, info, method)
         push!(init_results, result)
         if result.feasible && result.objective < z_upper
             z_upper = result.objective
@@ -68,7 +68,7 @@ function reformulate_model(
 
     # Step 3: Build MILP master
     master, master_maps = _build_loa_master(
-        model, disj_info, init_results, method)
+        model, info, init_results, method)
 
     # Step 4: Main LOA loop
     z_lower = -Inf
@@ -79,27 +79,21 @@ function reformulate_model(
             break
         end
         z_lower = objective_value(master)
-        if _loa_converged(z_upper, z_lower, method)
-            break
-        end
+        _loa_converged(z_upper, z_lower, method) && break
 
-        # Extract selected combo from master solution
         combo = _extract_combo_from_master(
-            master, master_maps, disj_info)
-
-        # Solve NLP subproblem
+            master, master_maps, info)
         result = _solve_loa_subproblem(
-            model, combo, disj_info, method)
+            model, combo, info, method)
         if result.feasible && result.objective < z_upper
             z_upper = result.objective
             best_sol = result.x_values
         end
 
-        # Add OA cuts and no-good cut to master
         _add_oa_cuts_to_master!(
-            master, master_maps, result, disj_info)
+            master, master_maps, result, info, method)
         _add_no_good_cut_to_master!(
-            master, master_maps, combo, disj_info)
+            master, master_maps, combo)
     end
 
     # Step 5: Final reformulation — apply BigM so the original
@@ -144,15 +138,11 @@ function _collect_disjunction_info(model::JuMP.AbstractModel)
         disj = disj_data.constraint
         disj.nested && continue
         push!(disj_indices, idx)
-        inds = disj.indicators
-        indicators_map[idx] = collect(inds)
+        inds = collect(disj.indicators)
+        indicators_map[idx] = inds
         for ind in inds
-            if haskey(ind_to_cons, ind)
-                dc_map[ind] = [ref for ref in ind_to_cons[ind]
-                               if ref isa DisjunctConstraintRef]
-            else
-                dc_map[ind] = []
-            end
+            dc_map[ind] = [ref for ref in get(ind_to_cons, ind, [])
+                           if ref isa DisjunctConstraintRef]
         end
     end
     return _DisjunctionInfo(disj_indices, indicators_map, dc_map)
@@ -164,36 +154,29 @@ end
 # Find a minimum set of disjunct combos such that every disjunct
 # appears True in at least one combo.
 # Following Türkay & Grossmann (1996) eq. 14.
-function _set_covering_combos(
-    info::_DisjunctionInfo, method::LOA
-    )
-    all_combos = _cartesian_product(info)
-
-    # Collect all individual disjuncts that need covering
-    all_disjuncts = []
-    for idx in info.disjunction_indices
-        for ind in info.indicators[idx]
-            push!(all_disjuncts, ind)
-        end
-    end
+function _set_covering_combos(info::_DisjunctionInfo)
+    # Cartesian product via Iterators.product
+    per_disj = [[(idx, ind) for ind in info.indicators[idx]]
+                for idx in info.disjunction_indices]
+    all_combos = isempty(per_disj) ? [] :
+        [collect(c) for c in Iterators.product(per_disj...)]
 
     # Greedy set covering: pick combos covering most uncovered
-    uncovered = Set(all_disjuncts)
+    uncovered = Set(ind for idx in info.disjunction_indices
+                        for ind in info.indicators[idx])
     selected_combos = Dict{Any, Bool}[]
 
     while !isempty(uncovered)
         best_combo = nothing
         best_count = 0
         for combo in all_combos
-            count = sum((ind in uncovered ? 1 : 0)
-                        for (_, ind) in combo)
+            count = sum(ind in uncovered for (_, ind) in combo)
             if count > best_count
                 best_count = count
                 best_combo = combo
             end
         end
         best_combo === nothing && break
-        # Convert to Dict{indicator => Bool}
         combo_dict = Dict{Any, Bool}()
         for (disj_idx, active_ind) in best_combo
             for ind in info.indicators[disj_idx]
@@ -208,31 +191,42 @@ function _set_covering_combos(
     return selected_combos
 end
 
-# Cartesian product over disjunctions. Returns vector of vectors
-# of (DisjunctionIndex, indicator) tuples.
-function _cartesian_product(info::_DisjunctionInfo)
-    combos = Vector{Tuple}[]
-    _cartesian_helper!(
-        combos, info.disjunction_indices,
-        info.indicators, Tuple[], 1)
-    return combos
+################################################################################
+#                     SUBPROBLEM HELPERS
+################################################################################
+# Common setup: copy model, reformulate with BigM, fix binaries.
+function _setup_loa_submodel(model, combo, method)
+    sub, ref_map, lv_map = copy_gdp_model(model)
+    JuMP.set_optimizer(sub, method.optimizer)
+    JuMP.set_silent(sub)
+    reformulate_model(sub, BigM(method.M_value))
+    _fix_loa_binaries!(sub, combo, lv_map)
+    return sub, ref_map
 end
 
-function _cartesian_helper!(
-    result, disj_indices, indicators_map, current, depth
-    )
-    if depth > length(disj_indices)
-        push!(result, copy(current))
-        return
+# Fix binary variables according to a Boolean combo.
+function _fix_loa_binaries!(sub, combo, lv_map)
+    ind_to_bin = _indicator_to_binary(sub)
+    for (ind, active) in combo
+        mapped_ind = lv_map[ind]
+        haskey(ind_to_bin, mapped_ind) || continue
+        bin_var = ind_to_bin[mapped_ind]
+        bin_var isa JuMP.AbstractVariableRef || continue
+        JuMP.fix(bin_var, active ? 1.0 : 0.0; force = true)
     end
-    idx = disj_indices[depth]
-    for ind in indicators_map[idx]
-        push!(current, (idx, ind))
-        _cartesian_helper!(
-            result, disj_indices, indicators_map,
-            current, depth + 1)
-        pop!(current)
-    end
+end
+
+# Check if a solve terminated with a usable solution.
+function _loa_is_feasible(model)
+    s = termination_status(model)
+    s == MOI.OPTIMAL || s == MOI.LOCALLY_SOLVED || s == MOI.FEASIBLE_POINT
+end
+
+# Look up binary variable for an indicator, or return nothing.
+function _get_bin_var(ind_to_bin, mapped_ind)
+    haskey(ind_to_bin, mapped_ind) || return nothing
+    bv = ind_to_bin[mapped_ind]
+    return bv isa JuMP.AbstractVariableRef ? bv : nothing
 end
 
 ################################################################################
@@ -240,42 +234,14 @@ end
 ################################################################################
 # Build and solve the NLP subproblem for a fixed Boolean assignment.
 # Matches (sub-LBOA) from Trespalacios (2014).
-function _solve_loa_subproblem(
-    model::JuMP.AbstractModel,
-    combo::Dict{Any, Bool},
-    info::_DisjunctionInfo,
-    method::LOA
-    )
-    # Copy model, reformulate with BigM, fix binaries
-    sub, ref_map, lv_map = copy_gdp_model(model)
-    JuMP.set_optimizer(sub, method.optimizer)
-    JuMP.set_silent(sub)
-    reformulate_model(sub, BigM(method.M_value))
-
-    # Fix logical variable binaries according to combo
-    ind_to_bin = _indicator_to_binary(sub)
-    for (ind, active) in combo
-        mapped_ind = lv_map[ind]
-        if haskey(ind_to_bin, mapped_ind)
-            bin_var = ind_to_bin[mapped_ind]
-            if bin_var isa JuMP.AbstractVariableRef
-                JuMP.fix(bin_var, active ? 1.0 : 0.0;
-                         force = true)
-            end
-        end
-    end
-
+function _solve_loa_subproblem(model, combo, info, method)
+    sub, ref_map = _setup_loa_submodel(model, combo, method)
     JuMP.optimize!(sub, ignore_optimize_hook = true)
-    status = termination_status(sub)
-    feasible = (status == MOI.OPTIMAL ||
-                status == MOI.LOCALLY_SOLVED ||
-                status == MOI.FEASIBLE_POINT)
 
-    if feasible
-        x_vals = Dict{Any, Float64}()
-        for var in collect_all_vars(model)
-            x_vals[var] = JuMP.value(ref_map[var])
-        end
+    if _loa_is_feasible(sub)
+        x_vals = Dict{Any, Float64}(
+            var => JuMP.value(ref_map[var])
+            for var in collect_all_vars(model))
         return _LOAIterationResult(
             combo, x_vals, objective_value(sub), true, [], [])
     else
@@ -288,41 +254,18 @@ end
 #                    FEASIBILITY SUBPROBLEM
 ################################################################################
 # Solve (feas-LBOA): minimize max constraint violation.
-function _solve_loa_feasibility(
-    model::JuMP.AbstractModel,
-    combo::Dict{Any, Bool},
-    info::_DisjunctionInfo,
-    method::LOA
-    )
-    feas, ref_map, lv_map = copy_gdp_model(model)
-    JuMP.set_optimizer(feas, method.optimizer)
-    JuMP.set_silent(feas)
-    reformulate_model(feas, BigM(method.M_value))
-
-    # Fix logical variable binaries
-    ind_to_bin = _indicator_to_binary(feas)
-    for (ind, active) in combo
-        mapped_ind = lv_map[ind]
-        if haskey(ind_to_bin, mapped_ind)
-            bin_var = ind_to_bin[mapped_ind]
-            if bin_var isa JuMP.AbstractVariableRef
-                JuMP.fix(bin_var, active ? 1.0 : 0.0;
-                         force = true)
-            end
-        end
-    end
+function _solve_loa_feasibility(model, combo, info, method)
+    feas, ref_map = _setup_loa_submodel(model, combo, method)
 
     # Add slack variable and modify objective
     @variable(feas, _loa_slack)
-    # TODO: Properly relax constraints by u.
+    # TODO: Properly relax constraints by slack variable.
     @objective(feas, Min, _loa_slack)
     JuMP.optimize!(feas, ignore_optimize_hook = true)
 
     # Extract solution if available, otherwise use zeros
     x_vals = Dict{Any, Float64}()
-    has_sol = (termination_status(feas) == MOI.OPTIMAL ||
-               termination_status(feas) == MOI.LOCALLY_SOLVED ||
-               termination_status(feas) == MOI.FEASIBLE_POINT)
+    has_sol = _loa_is_feasible(feas)
     for var in collect_all_vars(model)
         if has_sol
             val = try JuMP.value(ref_map[var]) catch; 0.0 end
@@ -342,12 +285,7 @@ end
 #                      MASTER PROBLEM BUILDER
 ################################################################################
 # Build the MILP master with initial OA + no-good cuts.
-function _build_loa_master(
-    model::JuMP.AbstractModel,
-    info::_DisjunctionInfo,
-    init_results::Vector{_LOAIterationResult},
-    method::LOA
-    )
+function _build_loa_master(model, info, init_results, method)
     master, ref_map, lv_map = copy_gdp_model(model)
     JuMP.set_optimizer(master, method.optimizer)
     JuMP.set_silent(master)
@@ -358,11 +296,9 @@ function _build_loa_master(
 
     for result in init_results
         _add_oa_cuts_to_master!(
-            master, master_maps, result, info)
-    end
-    for result in init_results
+            master, master_maps, result, info, method)
         _add_no_good_cut_to_master!(
-            master, master_maps, result.combo, info)
+            master, master_maps, result.combo)
     end
     return master, master_maps
 end
@@ -378,9 +314,7 @@ end
 # AffExpr: linearization = the constraint itself (exact).
 # QuadExpr: linearization is the first-order Taylor approx.
 function _add_oa_cuts_to_master!(
-    master::JuMP.AbstractModel, master_maps,
-    result::_LOAIterationResult,
-    info::_DisjunctionInfo
+    master, master_maps, result, info, method
     )
     ref_map = master_maps.ref_map
     lv_map = master_maps.lv_map
@@ -390,15 +324,7 @@ function _add_oa_cuts_to_master!(
     for (ind, active) in result.combo
         !active && continue
         !haskey(info.disjunct_constraints, ind) && continue
-
-        mapped_ind = lv_map[ind]
-        bin_var = nothing
-        if haskey(ind_to_bin, mapped_ind)
-            bv = ind_to_bin[mapped_ind]
-            if bv isa JuMP.AbstractVariableRef
-                bin_var = bv
-            end
-        end
+        bin_var = _get_bin_var(ind_to_bin, lv_map[ind])
 
         for con_ref in info.disjunct_constraints[ind]
             con_data = _disjunct_constraints(
@@ -408,9 +334,8 @@ function _add_oa_cuts_to_master!(
             rhs = _set_rhs(con.set)
 
             if bin_var !== nothing
-                M = 1e9
                 @constraint(master,
-                    lin_expr <= rhs + M * (1 - bin_var))
+                    lin_expr <= rhs + method.M_value * (1 - bin_var))
             else
                 @constraint(master, lin_expr <= rhs)
             end
@@ -419,13 +344,10 @@ function _add_oa_cuts_to_master!(
 end
 
 # Linearize an AffExpr at point xk (exact, no Taylor needed).
-function _linearize_at(
-    func::JuMP.GenericAffExpr, xk::Dict, ref_map
-    )
+function _linearize_at(func::JuMP.GenericAffExpr, xk::Dict, ref_map)
     result = JuMP.AffExpr(func.constant)
     for (var, coef) in func.terms
-        JuMP.add_to_expression!(
-            result, coef, ref_map[var])
+        JuMP.add_to_expression!(result, coef, ref_map[var])
     end
     return result
 end
@@ -433,9 +355,7 @@ end
 # Linearize a QuadExpr at point xk (first-order Taylor).
 # f(xk) + ∇f(xk)ᵀ(x - xk)
 # = -xk'Q*xk + (2Q*xk + a)'x + b
-function _linearize_at(
-    func::JuMP.GenericQuadExpr, xk::Dict, ref_map
-    )
+function _linearize_at(func::JuMP.GenericQuadExpr, xk::Dict, ref_map)
     grad = Dict{Any, Float64}()
 
     # Affine contribution: a_i
@@ -446,13 +366,11 @@ function _linearize_at(
     # Quadratic contribution: 2*Q_ij*xk_j
     for (pair, coef) in func.terms
         vi, vj = pair.a, pair.b
-        xk_vi = get(xk, vi, 0.0)
-        xk_vj = get(xk, vj, 0.0)
         if vi == vj
-            grad[vi] = get(grad, vi, 0.0) + 2 * coef * xk_vi
+            grad[vi] = get(grad, vi, 0.0) + 2 * coef * get(xk, vi, 0.0)
         else
-            grad[vi] = get(grad, vi, 0.0) + coef * xk_vj
-            grad[vj] = get(grad, vj, 0.0) + coef * xk_vi
+            grad[vi] = get(grad, vi, 0.0) + coef * get(xk, vj, 0.0)
+            grad[vj] = get(grad, vj, 0.0) + coef * get(xk, vi, 0.0)
         end
     end
 
@@ -473,8 +391,7 @@ function _linearize_at(
     end
     result = JuMP.AffExpr(constant)
     for (var, g) in grad
-        JuMP.add_to_expression!(
-            result, g, ref_map[var])
+        JuMP.add_to_expression!(result, g, ref_map[var])
     end
     return result
 end
@@ -490,28 +407,19 @@ _set_rhs(::Any) = 0.0
 ################################################################################
 # Add no-good cut to prevent revisiting the same Boolean combo.
 # Cut: ∑(1 - y_i for i in B) + ∑(y_i for i in N) >= 1
-function _add_no_good_cut_to_master!(
-    master::JuMP.AbstractModel, master_maps,
-    combo::Dict{Any, Bool}, info::_DisjunctionInfo
-    )
+function _add_no_good_cut_to_master!(master, master_maps, combo)
     ind_to_bin = master_maps.ind_to_bin
     lv_map = master_maps.lv_map
     cut_expr = JuMP.AffExpr(0.0)
 
     for (ind, active) in combo
-        mapped_ind = lv_map[ind]
-        if haskey(ind_to_bin, mapped_ind)
-            bin_var = ind_to_bin[mapped_ind]
-            if bin_var isa JuMP.AbstractVariableRef
-                if active  # (1 - y_i) term
-                    JuMP.add_to_expression!(
-                        cut_expr, -1.0, bin_var)
-                    JuMP.add_to_expression!(cut_expr, 1.0)
-                else  # y_i term
-                    JuMP.add_to_expression!(
-                        cut_expr, 1.0, bin_var)
-                end
-            end
+        bin_var = _get_bin_var(ind_to_bin, lv_map[ind])
+        bin_var === nothing && continue
+        if active  # (1 - y_i) term
+            JuMP.add_to_expression!(cut_expr, -1.0, bin_var)
+            JuMP.add_to_expression!(cut_expr, 1.0)
+        else  # y_i term
+            JuMP.add_to_expression!(cut_expr, 1.0, bin_var)
         end
     end
     @constraint(master, cut_expr >= 1.0)
@@ -522,27 +430,16 @@ end
 ################################################################################
 # Read binary variable values from the master solution and
 # determine the active combo.
-function _extract_combo_from_master(
-    master::JuMP.AbstractModel, master_maps,
-    info::_DisjunctionInfo
-    )
+function _extract_combo_from_master(master, master_maps, info)
     ind_to_bin = master_maps.ind_to_bin
     lv_map = master_maps.lv_map
     combo = Dict{Any, Bool}()
 
     for idx in info.disjunction_indices
         for ind in info.indicators[idx]
-            mapped_ind = lv_map[ind]
-            if haskey(ind_to_bin, mapped_ind)
-                bin_var = ind_to_bin[mapped_ind]
-                if bin_var isa JuMP.AbstractVariableRef
-                    combo[ind] = JuMP.value(bin_var) > 0.5
-                else
-                    combo[ind] = false
-                end
-            else
-                combo[ind] = false
-            end
+            bin_var = _get_bin_var(ind_to_bin, lv_map[ind])
+            combo[ind] = bin_var !== nothing ?
+                JuMP.value(bin_var) > 0.5 : false
         end
     end
     return combo
@@ -551,15 +448,10 @@ end
 ################################################################################
 #                       CONVERGENCE CHECK
 ################################################################################
-function _loa_converged(
-    z_upper::Float64, z_lower::Float64, method::LOA
-    )
+function _loa_converged(z_upper, z_lower, method)
     gap = z_upper - z_lower
     gap <= method.atol && return true
-    if abs(z_upper) > 1e-10 &&
-        gap / abs(z_upper) <= method.rtol
-        return true
-    end
+    abs(z_upper) > 1e-10 && gap / abs(z_upper) <= method.rtol && return true
     return false
 end
 

@@ -62,7 +62,15 @@ function test_linear_gdp_example(m, use_complements = false)
     @test value(Y[2])
     @test !value(W[1])
     @test !value(W[2])
-  
+
+    @test optimize!(m, gdp_method = LOA(HiGHS.Optimizer)) isa Nothing
+    @test termination_status(m) == MOI.OPTIMAL
+    @test objective_value(m) ≈ 11 atol=1e-3
+    @test value.(x) ≈ [9,2] atol=1e-3
+    @test !value(Y[1])
+    @test value(Y[2])
+    @test !value(W[1])
+    @test !value(W[2])
 
     m_copy, ref_map = JuMP.copy_model(m)
     lv_map = DP.copy_gdp_data(m, m_copy, ref_map)
@@ -130,11 +138,20 @@ function test_quadratic_gdp_example(use_complements = false) #psplit does not wo
 
     @test optimize!(m, gdp_method = PSplit(2,m)) isa Nothing
     @test termination_status(m) in [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
-    @test objective_value(m) ≈ 6.1237 atol=1e-3  
-    @test value.(x) ≈ [4.0825, 2.0412] atol=1e-3 
-    @test !value(Y[1]) 
+    @test objective_value(m) ≈ 6.1237 atol=1e-3
+    @test value.(x) ≈ [4.0825, 2.0412] atol=1e-3
+    @test !value(Y[1])
     @test value(Y[2])
-    @test !value(W[1]) 
+    @test !value(W[1])
+    @test !value(W[2])
+
+    @test optimize!(m, gdp_method = LOA(optimizer)) isa Nothing
+    @test termination_status(m) in [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
+    @test objective_value(m) ≈ 6.1237 atol=1e-3
+    @test value.(x) ≈ [4.0825, 2.0412] atol=1e-3
+    @test !value(Y[1])
+    @test value(Y[2])
+    @test !value(W[1])
     @test !value(W[2])
 end
 

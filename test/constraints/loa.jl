@@ -38,7 +38,7 @@ function test_set_covering_combos()
 
     info = DP._collect_disjunction_info(model)
     method = LOA(HiGHS.Optimizer)
-    combos = DP._set_covering_combos(info, method)
+    combos = DP._set_covering_combos(info)
 
     # Should cover both Y[1] and Y[2]
     all_active = Set()
@@ -79,7 +79,7 @@ function test_no_good_cut()
     combo = Dict{Any, Bool}(Y[1] => true, Y[2] => false)
 
     num_cons_before = length(JuMP.all_constraints(master; include_variable_in_set_constraints = false))
-    DP._add_no_good_cut_to_master!(master, master_maps, combo, info)
+    DP._add_no_good_cut_to_master!(master, master_maps, combo)
     num_cons_after = length(JuMP.all_constraints(master; include_variable_in_set_constraints = false))
 
     # Should have added exactly 1 constraint
