@@ -155,9 +155,7 @@ function test_cp_cut_generation()
         model;
         include_variable_in_set_constraints = false
     ))
-    DP.add_original_model_cut(
-        model, dec_vars, rBM_sol, sep_sol
-    )
+    DP._add_cut(rBM, rBM_sol, sep_sol)
     num_con_after = length(JuMP.all_constraints(
         model;
         include_variable_in_set_constraints = false

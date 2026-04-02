@@ -119,26 +119,6 @@ function _add_cut(
     return
 end
 
-# Add a cut to the original model. Extensions may override for custom cut
-# representations.
-function add_original_model_cut(
-    model::JuMP.AbstractModel,
-    dec_vars::AbstractVector,
-    rBM_sol::Dict, sep_sol::Dict
-    )
-    cut_expr = zero(JuMP.GenericAffExpr{
-        JuMP.value_type(typeof(model)),
-        JuMP.variable_ref_type(model)})
-    for var in dec_vars
-        xi = 2 * (only(sep_sol[var]) - only(rBM_sol[var]))
-        sp = only(sep_sol[var])
-        JuMP.add_to_expression!(cut_expr, xi, var)
-        JuMP.add_to_expression!(cut_expr, -xi * sp)
-    end
-    JuMP.@constraint(model, cut_expr >= 0)
-    return
-end
-
 ################################################################################
 #                        UNIFIED CUTTING PLANES LOOP
 ################################################################################
