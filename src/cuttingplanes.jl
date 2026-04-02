@@ -181,11 +181,8 @@ function reformulate_model(
             break
         end
 
-        # 4. Add separating cuts to both the rBM and the original model
+        # 4. Add separating cut to rBM
         _add_cut(rBM, rBM_sol, sep_sol)
-        if rBM.model !== model
-            add_original_model_cut(model, dec_vars, rBM_sol, sep_sol)
-        end
     end
 
     if undo_relax !== nothing
