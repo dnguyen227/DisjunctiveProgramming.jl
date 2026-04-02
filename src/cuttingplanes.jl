@@ -4,7 +4,8 @@
 
 # Configure optimizer on a subproblem.
 function configure_optimizer(
-    sub::GDPSubmodel, method::CuttingPlanes
+    sub::GDPSubmodel, 
+    method::CuttingPlanes
     )
     JuMP.set_optimizer(sub.model, method.optimizer)
     JuMP.set_silent(sub.model)
@@ -35,8 +36,8 @@ function build_cp_subproblem(
     obj = JuMP.objective_function(model)
     sense = JuMP.objective_sense(model)
     V = JuMP.variable_ref_type(model)
-    m2c = Dict{V, V}(v => ref_map[v] for v in dec_vars)
-    JuMP.@objective(copy, sense, _replace_variables_in_constraint(obj, m2c))
+    orig_to_copy = Dict{V, V}(v => ref_map[v] for v in dec_vars)
+    JuMP.@objective(copy, sense, _replace_variables_in_constraint(obj, orig_to_copy))
     fwd_map = Dict{V, Vector{V}}(v => [ref_map[v]] for v in dec_vars)
     sub = GDPSubmodel(copy, dec_vars, fwd_map)
     configure_optimizer(sub, method)
@@ -62,12 +63,10 @@ end
 # Extract solution from a solved subproblem, keyed by original dec_vars.
 function _extract_solution(sub::GDPSubmodel)
     V = eltype(sub.dec_vars)
-    first_var = first(values(sub.fwd_map))[1]
-    T = JuMP.value_type(typeof(JuMP.owner_model(first_var)))
+    T = JuMP.value_type(typeof(sub.model))
     sol = Dict{V, Vector{T}}()
     for var in sub.dec_vars
-        tvars = sub.fwd_map[var]
-        sol[var] = [JuMP.value(tv) for tv in tvars]
+        sol[var] = JuMP.value.(sub.fwd_map[var])
     end
     return sol
 end
@@ -77,14 +76,16 @@ function _set_sep_objective(
     sub::GDPSubmodel,
     rBM_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}}
     )
-    obj_expr = _zero_quad(sub.model)
+    obj_expr = zero(JuMP.GenericQuadExpr{
+        JuMP.value_type(typeof(sub.model)),
+        JuMP.variable_ref_type(sub.model)})
     for var in sub.dec_vars
-        tvars = sub.fwd_map[var]
+        sub_vars = sub.fwd_map[var]
         vals = rBM_sol[var]
-        for k in 1:length(tvars)
+        for k in 1:length(sub_vars)
             JuMP.add_to_expression!(obj_expr,
-                (tvars[k] - vals[k]) *
-                (tvars[k] - vals[k]))
+                (sub_vars[k] - vals[k]) *
+                (sub_vars[k] - vals[k]))
         end
     end
     JuMP.@objective(sub.model, Min, obj_expr)
@@ -109,14 +110,16 @@ function _add_cut(
     rBM_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}},
     sep_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}}
     )
-    cut_expr = _zero_aff(sub.model)
+    cut_expr = zero(JuMP.GenericAffExpr{
+        JuMP.value_type(typeof(sub.model)),
+        JuMP.variable_ref_type(sub.model)})
     for var in sub.dec_vars
-        tvars = sub.fwd_map[var]
+        sub_vars = sub.fwd_map[var]
         rbm_vals = rBM_sol[var]
         sep_vals = sep_sol[var]
-        for k in 1:length(tvars)
+        for k in 1:length(sub_vars)
             xi = 2 * (sep_vals[k] - rbm_vals[k])
-            JuMP.add_to_expression!(cut_expr, xi, tvars[k])
+            JuMP.add_to_expression!(cut_expr, xi, sub_vars[k])
             JuMP.add_to_expression!(cut_expr, -xi * sep_vals[k])
         end
     end
@@ -131,10 +134,12 @@ function add_original_model_cut(
     dec_vars::AbstractVector,
     rBM_sol::Dict, sep_sol::Dict
     )
-    cut_expr = _zero_aff(model)
+    cut_expr = zero(JuMP.GenericAffExpr{
+        JuMP.value_type(typeof(model)),
+        JuMP.variable_ref_type(model)})
     for var in dec_vars
-        xi = 2 * (sep_sol[var][1] - rBM_sol[var][1])
-        sp = sep_sol[var][1]
+        xi = 2 * (only(sep_sol[var]) - only(rBM_sol[var]))
+        sp = only(sep_sol[var])
         JuMP.add_to_expression!(cut_expr, xi, var)
         JuMP.add_to_expression!(cut_expr, -xi * sp)
     end
