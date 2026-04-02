@@ -23,7 +23,9 @@ function build_cp_subproblem(
     sense = JuMP.objective_sense(model)
     V = JuMP.variable_ref_type(model)
     orig_to_copy = Dict{V, V}(v => ref_map[v] for v in dec_vars)
-    JuMP.@objective(copy, sense, _replace_variables_in_constraint(obj, orig_to_copy))
+    JuMP.@objective(copy, sense, 
+        _replace_variables_in_constraint(obj, orig_to_copy)
+        )
     fwd_map = Dict{V, Vector{V}}(v => [ref_map[v]] for v in dec_vars)
     sub = GDPSubmodel(copy, dec_vars, fwd_map)
     JuMP.set_optimizer(sub.model, method.optimizer)
@@ -66,14 +68,16 @@ function _set_sep_objective(
     )
     obj_expr = zero(JuMP.GenericQuadExpr{
         JuMP.value_type(typeof(sub.model)),
-        JuMP.variable_ref_type(sub.model)})
+        JuMP.variable_ref_type(sub.model)}
+        )
     for var in sub.dec_vars
         sub_vars = sub.fwd_map[var]
         vals = rBM_sol[var]
         for k in 1:length(sub_vars)
             JuMP.add_to_expression!(obj_expr,
                 (sub_vars[k] - vals[k]) *
-                (sub_vars[k] - vals[k]))
+                (sub_vars[k] - vals[k])
+                )
         end
     end
     JuMP.@objective(sub.model, Min, obj_expr)
@@ -100,7 +104,8 @@ function _add_cut(
     )
     cut_expr = zero(JuMP.GenericAffExpr{
         JuMP.value_type(typeof(sub.model)),
-        JuMP.variable_ref_type(sub.model)})
+        JuMP.variable_ref_type(sub.model)}
+        )
     for var in sub.dec_vars
         sub_vars = sub.fwd_map[var]
         rbm_vals = rBM_sol[var]
