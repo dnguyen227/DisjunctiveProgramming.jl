@@ -12,8 +12,8 @@ end
     copy_model_with_constraints(model, constraints, method)
 
 Create a new model with only the variables (and their bounds)
-from `model` and the selected `constraints`. Used by MBM to
-build minimal feasibility subproblems for M-value computation.
+from `model` and the selected `constraints`. Returns a
+`GDPSubmodel` wrapping the new model.
 """
 function copy_model_with_constraints(
     model::JuMP.AbstractModel,
@@ -48,8 +48,9 @@ end
     copy_and_reformulate(model, decision_vars, reform_method, method)
 
 Copy the GDP model, reformulate the copy with `reform_method`,
-and wrap in a `GDPSubmodel`. The original model is not modified.
-The copy's objective is rewritten in terms of copied variables.
+and wrap in a `GDPSubmodel`. The original model is not
+modified. The copy's objective is rewritten in terms of the
+copied variables.
 """
 function copy_and_reformulate(
     model::JuMP.AbstractModel,
@@ -79,8 +80,7 @@ end
 
 Reformulate the model in-place with `reform_method` and relax
 integrality. Returns `(GDPSubmodel, undo_fn)` where `undo_fn`
-restores integrality. Extensions may override to copy and
-transcribe instead of modifying in-place.
+restores integrality.
 """
 function reformulate_and_relax(
     model::JuMP.AbstractModel,
