@@ -2,16 +2,6 @@
 #                        CUTTING PLANES SUBPROBLEM
 ################################################################################
 
-# Configure optimizer on a subproblem.
-function configure_optimizer(
-    sub::GDPSubmodel, 
-    method::CuttingPlanes
-    )
-    JuMP.set_optimizer(sub.model, method.optimizer)
-    JuMP.set_silent(sub.model)
-    return
-end
-
 ################################################################################
 #                       EXTENSION POINT FUNCTIONS
 ################################################################################
@@ -40,7 +30,8 @@ function build_cp_subproblem(
     JuMP.@objective(copy, sense, _replace_variables_in_constraint(obj, orig_to_copy))
     fwd_map = Dict{V, Vector{V}}(v => [ref_map[v]] for v in dec_vars)
     sub = GDPSubmodel(copy, dec_vars, fwd_map)
-    configure_optimizer(sub, method)
+    JuMP.set_optimizer(sub.model, method.optimizer)
+    JuMP.set_silent(sub.model)
     return sub
 end
 
@@ -55,7 +46,8 @@ function setup_rbm(
     V = JuMP.variable_ref_type(model)
     fwd_map = Dict{V, Vector{V}}(v => [v] for v in dec_vars)
     sub = GDPSubmodel(model, dec_vars, fwd_map)
-    configure_optimizer(sub, method)
+    JuMP.set_optimizer(sub.model, method.optimizer)
+    JuMP.set_silent(sub.model)
     undo_relax = JuMP.relax_integrality(model)
     return sub, undo_relax
 end
