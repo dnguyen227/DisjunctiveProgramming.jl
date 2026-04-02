@@ -27,27 +27,27 @@ function test_copy_and_reformulate()
     @objective(model, Max, x)
 
     method = CuttingPlanes(HiGHS.Optimizer)
-    dec_vars = DP.collect_cp_vars(model)
+    decision_vars = DP.collect_cutting_planes_vars(model)
 
     # Build SEP subproblem (copy-based)
-    sep = DP.copy_and_reformulate(model, dec_vars,
+    separation = DP.copy_and_reformulate(model, decision_vars,
         Hull(), method)
 
-    # GDPSubmodel with dec_vars and fwd_map map
-    @test sep isa DP.GDPSubmodel
-    @test length(sep.dec_vars) == length(dec_vars)
-    @test length(sep.fwd_map) == length(dec_vars)
+    # GDPSubmodel with decision_vars and fwd_map map
+    @test separation isa DP.GDPSubmodel
+    @test length(separation.decision_vars) == length(decision_vars)
+    @test length(separation.fwd_map) == length(decision_vars)
 
     # Each fwd_map value is a length-1 vector
-    for (var, sub_vars) in sep.fwd_map
+    for (var, sub_vars) in separation.fwd_map
         @test length(sub_vars) == 1
         @test sub_vars[1] isa JuMP.VariableRef
     end
 
     # Subproblem is solvable
-    JuMP.relax_integrality(sep.model)
-    optimize!(sep.model, ignore_optimize_hook = true)
-    @test termination_status(sep.model) == MOI.OPTIMAL
+    JuMP.relax_integrality(separation.model)
+    optimize!(separation.model, ignore_optimize_hook = true)
+    @test termination_status(separation.model) == MOI.OPTIMAL
 end
 
 function test_reformulate_and_relax()
@@ -60,10 +60,10 @@ function test_reformulate_and_relax()
     @objective(model, Max, x)
 
     method = CuttingPlanes(HiGHS.Optimizer)
-    dec_vars = DP.collect_cp_vars(model)
+    decision_vars = DP.collect_cutting_planes_vars(model)
 
     # Setup rBM on original model (no copy)
-    rBM, undo = DP.reformulate_and_relax(model, dec_vars, BigM(method.M_value), method)
+    rBM, undo = DP.reformulate_and_relax(model, decision_vars, BigM(method.M_value), method)
 
     # rBM wraps the original model
     @test rBM isa DP.GDPSubmodel
@@ -71,8 +71,8 @@ function test_reformulate_and_relax()
     @test undo !== nothing
 
     # Identity forward map
-    @test length(rBM.fwd_map) == length(dec_vars)
-    for v in dec_vars
+    @test length(rBM.fwd_map) == length(decision_vars)
+    for v in decision_vars
         @test rBM.fwd_map[v] == [v]
     end
 
@@ -94,15 +94,15 @@ function test_cp_loop_helpers()
     @objective(model, Max, x)
 
     method = CuttingPlanes(HiGHS.Optimizer)
-    dec_vars = DP.collect_cp_vars(model)
+    decision_vars = DP.collect_cutting_planes_vars(model)
 
     # Build SEP first (from clean model)
-    sep = DP.copy_and_reformulate(model, dec_vars,
+    separation = DP.copy_and_reformulate(model, decision_vars,
         Hull(), method)
-    JuMP.relax_integrality(sep.model)
+    JuMP.relax_integrality(separation.model)
 
     # Setup rBM on original model
-    rBM, undo = DP.reformulate_and_relax(model, dec_vars, BigM(method.M_value), method)
+    rBM, undo = DP.reformulate_and_relax(model, decision_vars, BigM(method.M_value), method)
     optimize!(model, ignore_optimize_hook = true)
 
     # Extract solution
@@ -111,14 +111,14 @@ function test_cp_loop_helpers()
     @test length(rBM_sol[x]) == 1
 
     # Set SEP objective and solve
-    DP._set_sep_objective(sep, rBM_sol)
-    optimize!(sep.model, ignore_optimize_hook = true)
-    @test termination_status(sep.model) == MOI.OPTIMAL
+    DP._set_separation_objective(separation, rBM_sol)
+    optimize!(separation.model, ignore_optimize_hook = true)
+    @test termination_status(separation.model) == MOI.OPTIMAL
 
     # SEP solution extraction
-    sep_sol = DP._extract_solution(sep)
-    @test haskey(sep_sol, x)
-    @test sep_sol[x][1] ≈ 4.0 atol = 0.1
+    separation_sol = DP._extract_solution(separation)
+    @test haskey(separation_sol, x)
+    @test separation_sol[x][1] ≈ 4.0 atol = 0.1
 
     undo()
 end
@@ -133,29 +133,29 @@ function test_cp_cut_generation()
     @objective(model, Max, x)
 
     method = CuttingPlanes(HiGHS.Optimizer)
-    dec_vars = DP.collect_cp_vars(model)
+    decision_vars = DP.collect_cutting_planes_vars(model)
 
     # Build SEP first (from clean model)
-    sep = DP.copy_and_reformulate(model, dec_vars,
+    separation = DP.copy_and_reformulate(model, decision_vars,
         Hull(), method)
-    JuMP.relax_integrality(sep.model)
+    JuMP.relax_integrality(separation.model)
 
     # Setup rBM on original model, solve
-    rBM, undo = DP.reformulate_and_relax(model, dec_vars, BigM(method.M_value), method)
+    rBM, undo = DP.reformulate_and_relax(model, decision_vars, BigM(method.M_value), method)
     optimize!(model, ignore_optimize_hook = true)
     rBM_sol = DP._extract_solution(rBM)
 
     # Solve SEP
-    DP._set_sep_objective(sep, rBM_sol)
-    optimize!(sep.model, ignore_optimize_hook = true)
-    sep_sol = DP._extract_solution(sep)
+    DP._set_separation_objective(separation, rBM_sol)
+    optimize!(separation.model, ignore_optimize_hook = true)
+    separation_sol = DP._extract_solution(separation)
 
     # Add cut to original model
     num_con_before = length(JuMP.all_constraints(
         model;
         include_variable_in_set_constraints = false
     ))
-    DP._add_cut(rBM, rBM_sol, sep_sol)
+    DP._add_cut(rBM, rBM_sol, separation_sol)
     num_con_after = length(JuMP.all_constraints(
         model;
         include_variable_in_set_constraints = false
@@ -203,9 +203,9 @@ function test_cp_many_iterations()
     @constraint(model, x + y <= 8, Disjunct(Y[2]))
     @disjunction(model, Y)
     @objective(model, Max, x + y)
-    cp = CuttingPlanes(HiGHS.Optimizer;
+    cutting_planes = CuttingPlanes(HiGHS.Optimizer;
         max_iter = 50, seperation_tolerance = 1e-10)
-    @test optimize!(model, gdp_method = cp) isa Nothing
+    @test optimize!(model, gdp_method = cutting_planes) isa Nothing
     @test termination_status(model) in
         [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
 end

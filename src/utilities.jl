@@ -8,6 +8,96 @@ function _copy_model(
     return M()
 end
 
+"""
+    copy_model_with_constraints(model, constraints, method)
+
+Create a new model with only the variables (and their bounds)
+from `model` and the selected `constraints`. Used by MBM to
+build minimal feasibility subproblems for M-value computation.
+"""
+function copy_model_with_constraints(
+    model::JuMP.AbstractModel,
+    constraints::Vector{<:DisjunctConstraintRef},
+    method::_MBM
+    )
+    var_type = JuMP.variable_ref_type(model)
+    sub_model = _copy_model(model)
+    decision_vars = collect_all_vars(model)
+    fwd_map = Dict{var_type, Vector{var_type}}()
+
+    for var in decision_vars
+        copy_var = variable_copy(sub_model, var)
+        fwd_map[var] = [copy_var]
+    end
+
+    for cref in constraints
+        con = JuMP.constraint_object(cref)
+        flat_map = Dict(v => only(ws) for (v, ws) in fwd_map)
+        expr = _replace_variables_in_constraint(con.func, flat_map)
+        T = one(JuMP.value_type(typeof(sub_model)))
+        JuMP.@constraint(sub_model, expr * T in con.set)
+    end
+
+    JuMP.set_optimizer(sub_model, method.optimizer)
+    JuMP.set_silent(sub_model)
+
+    return GDPSubmodel(sub_model, decision_vars, fwd_map)
+end
+
+"""
+    copy_and_reformulate(model, decision_vars, reform_method, method)
+
+Copy the GDP model, reformulate the copy with `reform_method`,
+and wrap in a `GDPSubmodel`. The original model is not modified.
+The copy's objective is rewritten in terms of copied variables.
+"""
+function copy_and_reformulate(
+    model::JuMP.AbstractModel,
+    decision_vars::Vector{<:JuMP.AbstractVariableRef},
+    reform_method::AbstractReformulationMethod,
+    method::AbstractReformulationMethod
+    )
+    copy, ref_map, _ = copy_gdp_model(model)
+    reformulate_model(copy, reform_method)
+    obj = JuMP.objective_function(model)
+    sense = JuMP.objective_sense(model)
+    V = JuMP.variable_ref_type(model)
+    orig_to_copy = Dict{V, V}(
+        v => ref_map[v] for v in decision_vars)
+    JuMP.@objective(copy, sense,
+        _replace_variables_in_constraint(obj, orig_to_copy)
+        )
+    fwd_map = Dict{V, Vector{V}}(v => [ref_map[v]] for v in decision_vars)
+    sub = GDPSubmodel(copy, decision_vars, fwd_map)
+    JuMP.set_optimizer(sub.model, method.optimizer)
+    JuMP.set_silent(sub.model)
+    return sub
+end
+
+"""
+    reformulate_and_relax(model, decision_vars, reform_method, method)
+
+Reformulate the model in-place with `reform_method` and relax
+integrality. Returns `(GDPSubmodel, undo_fn)` where `undo_fn`
+restores integrality. Extensions may override to copy and
+transcribe instead of modifying in-place.
+"""
+function reformulate_and_relax(
+    model::JuMP.AbstractModel,
+    decision_vars::Vector{<:JuMP.AbstractVariableRef},
+    reform_method::AbstractReformulationMethod,
+    method::AbstractReformulationMethod
+    )
+    reformulate_model(model, reform_method)
+    V = JuMP.variable_ref_type(model)
+    fwd_map = Dict{V, Vector{V}}(v => [v] for v in decision_vars)
+    sub = GDPSubmodel(model, decision_vars, fwd_map)
+    JuMP.set_optimizer(sub.model, method.optimizer)
+    JuMP.set_silent(sub.model)
+    undo_relax = JuMP.relax_integrality(model)
+    return sub, undo_relax
+end
+
 ################################################################################
 #                              ALL VARIABLES
 ################################################################################
