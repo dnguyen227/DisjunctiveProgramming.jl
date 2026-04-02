@@ -11,7 +11,7 @@ end
 # Build one cutting planes subproblem (SEP). dec_vars is the shared key space
 # (collected once from the clean model). Extensions may override for custom
 # subproblem construction.
-function build_cp_subproblem(
+function copy_and_reformulate(
     model::JuMP.AbstractModel,
     dec_vars::AbstractVector,
     reform_method::AbstractReformulationMethod,
@@ -33,13 +33,15 @@ function build_cp_subproblem(
     return sub
 end
 
-# Set up the rBM (relaxed Big-M) subproblem.
-function setup_rbm(
+# Reformulate and relax the model. Returns (GDPSubmodel, undo_fn).
+# Extensions may override to copy + transcribe instead of in-place.
+function reformulate_and_relax(
     model::JuMP.AbstractModel,
     dec_vars::AbstractVector,
+    reform_method::AbstractReformulationMethod,
     method::CuttingPlanes
     )
-    reformulate_model(model, BigM(method.M_value))
+    reformulate_model(model, reform_method)
     V = JuMP.variable_ref_type(model)
     fwd_map = Dict{V, Vector{V}}(v => [v] for v in dec_vars)
     sub = GDPSubmodel(model, dec_vars, fwd_map)
@@ -131,11 +133,12 @@ function reformulate_model(
     dec_vars = collect_cp_vars(model)
 
     # Build SEP subproblem first from the clean (unreformulated) model
-    sep = build_cp_subproblem(model, dec_vars, Hull(), method)
+    sep = copy_and_reformulate(model, dec_vars, Hull(), method)
     JuMP.relax_integrality(sep.model)
 
     # Set up rBM on the original model via in-place BigM reformulation
-    rBM, undo_relax = setup_rbm(model, dec_vars, method)
+    rBM, undo_relax = reformulate_and_relax(
+        model, dec_vars, BigM(method.M_value), method)
 
     # Cutting plane loop: rBM <-> SEP until convergence
     for iter in 1:method.max_iter

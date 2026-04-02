@@ -17,7 +17,7 @@ function test_CuttingPlanes_datatype()
     @test method.M_value == 1e6
 end
 
-function test_build_cp_subproblem()
+function test_copy_and_reformulate()
     model = GDPModel()
     @variable(model, 0 <= x <= 100)
     @variable(model, Y[1:2], Logical)
@@ -30,7 +30,7 @@ function test_build_cp_subproblem()
     dec_vars = DP.collect_cp_vars(model)
 
     # Build SEP subproblem (copy-based)
-    sep = DP.build_cp_subproblem(model, dec_vars,
+    sep = DP.copy_and_reformulate(model, dec_vars,
         Hull(), method)
 
     # GDPSubmodel with dec_vars and fwd_map map
@@ -50,7 +50,7 @@ function test_build_cp_subproblem()
     @test termination_status(sep.model) == MOI.OPTIMAL
 end
 
-function test_setup_rbm()
+function test_reformulate_and_relax()
     model = GDPModel()
     @variable(model, 0 <= x <= 100)
     @variable(model, Y[1:2], Logical)
@@ -63,7 +63,7 @@ function test_setup_rbm()
     dec_vars = DP.collect_cp_vars(model)
 
     # Setup rBM on original model (no copy)
-    rBM, undo = DP.setup_rbm(model, dec_vars, method)
+    rBM, undo = DP.reformulate_and_relax(model, dec_vars, BigM(method.M_value), method)
 
     # rBM wraps the original model
     @test rBM isa DP.GDPSubmodel
@@ -97,12 +97,12 @@ function test_cp_loop_helpers()
     dec_vars = DP.collect_cp_vars(model)
 
     # Build SEP first (from clean model)
-    sep = DP.build_cp_subproblem(model, dec_vars,
+    sep = DP.copy_and_reformulate(model, dec_vars,
         Hull(), method)
     JuMP.relax_integrality(sep.model)
 
     # Setup rBM on original model
-    rBM, undo = DP.setup_rbm(model, dec_vars, method)
+    rBM, undo = DP.reformulate_and_relax(model, dec_vars, BigM(method.M_value), method)
     optimize!(model, ignore_optimize_hook = true)
 
     # Extract solution
@@ -136,12 +136,12 @@ function test_cp_cut_generation()
     dec_vars = DP.collect_cp_vars(model)
 
     # Build SEP first (from clean model)
-    sep = DP.build_cp_subproblem(model, dec_vars,
+    sep = DP.copy_and_reformulate(model, dec_vars,
         Hull(), method)
     JuMP.relax_integrality(sep.model)
 
     # Setup rBM on original model, solve
-    rBM, undo = DP.setup_rbm(model, dec_vars, method)
+    rBM, undo = DP.reformulate_and_relax(model, dec_vars, BigM(method.M_value), method)
     optimize!(model, ignore_optimize_hook = true)
     rBM_sol = DP._extract_solution(rBM)
 
@@ -212,8 +212,8 @@ end
 
 @testset "Cutting Planes" begin
     test_CuttingPlanes_datatype()
-    test_build_cp_subproblem()
-    test_setup_rbm()
+    test_copy_and_reformulate()
+    test_reformulate_and_relax()
     test_cp_loop_helpers()
     test_cp_cut_generation()
     test_reformulate_model()
