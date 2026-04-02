@@ -33,8 +33,7 @@ function build_cp_subproblem(
     return sub
 end
 
-# Set up the rBM (relaxed Big-M) subproblem. Reformulates the model in-place
-# (no copy). Returns (rBM, undo_fn). Extensions may override for custom setup.
+# Set up the rBM (relaxed Big-M) subproblem.
 function setup_rbm(
     model::JuMP.AbstractModel,
     dec_vars::AbstractVector,
@@ -138,8 +137,7 @@ function reformulate_model(
     # Set up rBM on the original model via in-place BigM reformulation
     rBM, undo_relax = setup_rbm(model, dec_vars, method)
 
-    # Cutting plane loop: rBM <-> SEP until convergence (Trespalacios &
-    # Grossmann 2016, Prop. 3.4)
+    # Cutting plane loop: rBM <-> SEP until convergence
     for iter in 1:method.max_iter
         # 1. Solve the relaxed Big-M (rBM) master problem for current iterate
         JuMP.optimize!(rBM.model, ignore_optimize_hook = true)
