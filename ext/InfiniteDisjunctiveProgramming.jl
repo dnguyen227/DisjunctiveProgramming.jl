@@ -531,26 +531,44 @@ function DP.reformulate_and_relax(
     return rBM, nothing
 end
 
-# Integral cut on the original InfiniteModel. Separates infinite and
-# finite terms, wraps infinite part in InfiniteOpt.integral for a
-# single scalar constraint.
-function add_original_model_cut(
-    model::InfiniteOpt.InfiniteModel,
-    decision_vars::Vector{InfiniteOpt.GeneralVariableRef},
-    rBM_sol::Dict{InfiniteOpt.GeneralVariableRef, <:Vector{<:Number}},
-    sep_sol::Dict{InfiniteOpt.GeneralVariableRef, <:Vector{<:Number}}
+# Add separating cut for the infinite CP path. Adds the linear cut
+# to the flat transcribed rBM (so the next CP iteration benefits) AND
+# an integral cut to the original InfiniteModel (so the final
+# reformulation includes the cuts). Dispatched via the decision var
+# ref type of the GDPSubmodel.
+function DP._add_cut(
+    sub::DP.GDPSubmodel{<:Any, <:InfiniteOpt.GeneralVariableRef, <:Any},
+    rBM_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}},
+    sep_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}}
     )
-    prefs, sups = _collect_parameters(model)
+    # --- Linear cut on the flat rBM model ---
+    cut_expr = zero(JuMP.GenericAffExpr{
+        JuMP.value_type(typeof(sub.model)),
+        JuMP.variable_ref_type(sub.model)})
+    for var in sub.decision_vars
+        sub_vars = sub.fwd_map[var]
+        rbm_vals = rBM_sol[var]
+        sep_vals = sep_sol[var]
+        for k in 1:length(sub_vars)
+            xi = 2 * (sep_vals[k] - rbm_vals[k])
+            JuMP.add_to_expression!(cut_expr, xi, sub_vars[k])
+            JuMP.add_to_expression!(cut_expr, -xi * sep_vals[k])
+        end
+    end
+    JuMP.@constraint(sub.model, cut_expr >= 0)
+
+    # --- Integral cut on the original InfiniteModel ---
+    original = JuMP.owner_model(first(sub.decision_vars))
+    prefs, sups = _collect_parameters(original)
     inf_terms = Any[]
     cut_scalar = zero(JuMP.GenericAffExpr{
-        JuMP.value_type(typeof(model)),
-        JuMP.variable_ref_type(model)})
-
-    for var in decision_vars
+        JuMP.value_type(typeof(original)),
+        JuMP.variable_ref_type(original)})
+    for var in sub.decision_vars
+        #TODO: Candidate for dispatch?
         haskey(rBM_sol, var) || continue
         haskey(sep_sol, var) || continue
         vprefs = InfiniteOpt.parameter_refs(var)
-
         if isempty(vprefs)
             xi = 2 * (sep_sol[var][1] - rBM_sol[var][1])
             sp = sep_sol[var][1]
@@ -558,21 +576,21 @@ function add_original_model_cut(
         else
             xi_vals = 2 .* (sep_sol[var] .- rBM_sol[var])
             sp_vals = sep_sol[var]
-            xi_pf = condense_to_pf(model, xi_vals, vprefs, sups)
-            sp_pf = condense_to_pf(model, sp_vals, vprefs, sups)
+            xi_pf = condense_to_pf(original, xi_vals, vprefs, sups)
+            sp_pf = condense_to_pf(original, sp_vals, vprefs, sups)
             push!(inf_terms, xi_pf * var - xi_pf * sp_pf)
         end
     end
 
     if !isempty(inf_terms)
-        inf_expr = JuMP.@expression(model, sum(inf_terms))
+        inf_expr = JuMP.@expression(original, sum(inf_terms))
         for p in prefs
             inf_expr = InfiniteOpt.integral(inf_expr, p)
         end
         cut_scalar += inf_expr
     end
 
-    JuMP.@constraint(model, cut_scalar >= 0)
+    JuMP.@constraint(original, cut_scalar >= 0)
     return
 end
 
