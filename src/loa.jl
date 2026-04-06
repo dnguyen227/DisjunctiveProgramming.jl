@@ -3,7 +3,8 @@
 ################################################################################
 # Implementation of the LOA algorithm from:
 #   Türkay & Grossmann (1996), Comp. & Chem. Eng. 20(8), 959-978
-#   Trespalacios & Grossmann (2014), Review of MINLP & GDP Methods
+# With augmented-penalty OA master from:
+#   Viswanathan & Grossmann (1990), Comp. & Chem. Eng. 14(7), 769-782
 # Closely follows Pyomo's GDPopt LOA implementation.
 ################################################################################
 
@@ -15,11 +16,15 @@ Logic-based Outer Approximation solver for GDP models.
 **Fields**
 - `optimizer::O`: Optimizer for solving NLP subproblems and MILP
   master problems (required).
-- `max_iter::Int`: Maximum LOA iterations (default = `100`).
+- `max_iter::Int`: Maximum LOA iterations (default = `10`).
 - `atol::Float64`: Absolute convergence tolerance (default = `1e-6`).
 - `rtol::Float64`: Relative convergence tolerance (default = `1e-4`).
 - `M_value::Float64`: Big-M value for master reformulation
   (default = `1e9`).
+- `max_slack::Float64`: Upper bound on each OA cut slack
+  (default = `1000.0`).
+- `OA_penalty_factor::Float64`: Multiplier on the slack sum in
+  the augmented master objective (default = `1000.0`).
 """
 struct LOA{O} <: AbstractReformulationMethod
     optimizer::O
@@ -27,145 +32,126 @@ struct LOA{O} <: AbstractReformulationMethod
     atol::Float64
     rtol::Float64
     M_value::Float64
+    max_slack::Float64
+    OA_penalty_factor::Float64
     function LOA(
         optimizer::O;
-        max_iter::Int = 100,
+        max_iter::Int = 10,
         atol::Float64 = 1e-6,
         rtol::Float64 = 1e-4,
-        M_value::Float64 = 1e9
+        M_value::Float64 = 1e9,
+        max_slack::Float64 = 1000.0,
+        OA_penalty_factor::Float64 = 1000.0
         ) where {O}
-        new{O}(optimizer, max_iter, atol, rtol, M_value)
+        new{O}(optimizer, max_iter, atol, rtol, M_value,
+               max_slack, OA_penalty_factor)
     end
-end
-
-################################################################################
-#                           MAIN ALGORITHM
-################################################################################
-# Override reformulate_model for LOA (iterative method pattern,
-# same as cutting_planes).
-function reformulate_model(
-    model::JuMP.AbstractModel, method::LOA
-    )
-    _clear_reformulations(model)
-    info = _collect_disjunction_info(model)
-
-    # Step 1: Set covering initialization
-    combos = _set_covering_combos(info)
-
-    # Step 2: Solve init subproblems, collect solutions
-    z_upper = Inf
-    best_sol = nothing
-    init_results = _LOAIterationResult[]
-    for combo in combos
-        result = _solve_loa_subproblem(
-            model, combo, info, method)
-        push!(init_results, result)
-        if result.feasible && result.objective < z_upper
-            z_upper = result.objective
-            best_sol = result.x_values
-        end
-    end
-
-    # Step 3: Build MILP master
-    master, master_maps = _build_loa_master(
-        model, info, init_results, method)
-
-    # Step 4: Main LOA loop
-    z_lower = -Inf
-    for iter in 1:method.max_iter
-        JuMP.optimize!(master, ignore_optimize_hook = true)
-        if termination_status(master) != MOI.OPTIMAL &&
-            termination_status(master) != MOI.LOCALLY_SOLVED
-            break
-        end
-        z_lower = objective_value(master)
-        _loa_converged(z_upper, z_lower, method) && break
-
-        combo = _extract_combo_from_master(
-            master, master_maps, info)
-        result = _solve_loa_subproblem(
-            model, combo, info, method)
-        if result.feasible && result.objective < z_upper
-            z_upper = result.objective
-            best_sol = result.x_values
-        end
-
-        _add_oa_cuts_to_master!(
-            master, master_maps, result, info, method)
-        _add_no_good_cut_to_master!(
-            master, master_maps, combo)
-    end
-
-    # Step 5: Final reformulation — apply BigM so the original
-    # model is in a state JuMP can optimize
-    reformulate_model(model, BigM(method.M_value))
-    return
 end
 
 ################################################################################
 #                          DATA STRUCTURES
 ################################################################################
-# Store info about each disjunction and its disjuncts.
-struct _DisjunctionInfo
-    disjunction_indices::Vector{DisjunctionIndex}
-    # disjunction index => vector of indicator LogicalVariableRefs
-    indicators::Dict{DisjunctionIndex, Vector}
-    # LogicalVariableRef => vector of DisjunctConstraintRefs
-    disjunct_constraints::Dict{Any, Vector}
-end
-
 # Result from solving an NLP subproblem.
-struct _LOAIterationResult
-    combo::Dict{Any, Bool}   # indicator => true/false
-    x_values::Dict           # variable => value
+struct _LOAIterationResult{M <: JuMP.AbstractModel}
+    combo::Dict{LogicalVariableRef{M}, Bool}
+    x_values::Dict{JuMP.AbstractVariableRef, Float64}
+    duals::Dict{DisjunctConstraintRef{M}, Float64}
     objective::Float64
     feasible::Bool
-    B_set::Vector  # indicators that were True (infeasible only)
-    N_set::Vector  # indicators that were False (infeasible only)
+end
+
+# Master problem state.
+mutable struct _LOAMaster{M <: JuMP.AbstractModel}
+    model::M
+    ref_map::JuMP.GenericReferenceMap
+    # orig indicator → master binary variable (or nothing)
+    bin_map::Dict{LogicalVariableRef, Any}
+    slack_vars::Vector{JuMP.VariableRef}
+    original_obj::JuMP.AbstractJuMPScalar
+    obj_sense::_MOI.OptimizationSense
 end
 
 ################################################################################
-#                     DISJUNCTION INFO COLLECTION
+#                           MAIN ALGORITHM
 ################################################################################
-# Gather the disjunction structure from the GDP model.
-function _collect_disjunction_info(model::JuMP.AbstractModel)
-    disj_indices = DisjunctionIndex[]
-    indicators_map = Dict{DisjunctionIndex, Vector}()
-    dc_map = Dict{Any, Vector}()
-    ind_to_cons = _indicator_to_constraints(model)
+function reformulate_model(
+    model::JuMP.AbstractModel, method::LOA
+    )
+    _clear_reformulations(model)
 
-    for (idx, disj_data) in _disjunctions(model)
-        disj = disj_data.constraint
-        disj.nested && continue
-        push!(disj_indices, idx)
-        inds = collect(disj.indicators)
-        indicators_map[idx] = inds
-        for ind in inds
-            dc_map[ind] = [ref for ref in get(ind_to_cons, ind, [])
-                           if ref isa DisjunctConstraintRef]
+    # Step 1: Set covering initialization
+    combos = _set_covering_combos(model)
+
+    # Step 2: Solve init subproblems
+    z_upper = Inf
+    M = typeof(model)
+    init_results = _LOAIterationResult{M}[]
+    for combo in combos
+        result = _solve_loa_subproblem(model, combo, method)
+        push!(init_results, result)
+        if result.feasible && result.objective < z_upper
+            z_upper = result.objective
         end
     end
-    return _DisjunctionInfo(disj_indices, indicators_map, dc_map)
+
+    # Step 3: Build MILP master
+    master = _build_loa_master(model, init_results, method)
+
+    # Step 4: Main LOA loop
+    z_lower = -Inf
+    for iter in 1:method.max_iter
+        _update_augmented_objective!(master, method)
+
+        JuMP.optimize!(master.model, ignore_optimize_hook = true)
+        if !JuMP.is_solved_and_feasible(master.model)
+            break
+        end
+        z_lower = objective_value(master.model)
+        _loa_converged(z_upper, z_lower, method) && break
+
+        combo = _extract_combo_from_master(model, master)
+        result = _solve_loa_subproblem(model, combo, method)
+        if result.feasible && result.objective < z_upper
+            z_upper = result.objective
+        end
+
+        result.feasible && _add_oa_cuts!(
+            master, result, model, method)
+        _add_no_good_cut!(master, combo)
+    end
+
+    # Step 5: Final reformulation
+    reformulate_model(model, BigM(method.M_value))
+    return
 end
 
 ################################################################################
 #                      SET COVERING INITIALIZATION
 ################################################################################
 # Find a minimum set of disjunct combos such that every disjunct
-# appears True in at least one combo.
-# Following Türkay & Grossmann (1996) eq. 14.
-function _set_covering_combos(info::_DisjunctionInfo)
-    # Cartesian product via Iterators.product
-    per_disj = [[(idx, ind) for ind in info.indicators[idx]]
-                for idx in info.disjunction_indices]
-    all_combos = isempty(per_disj) ? [] :
-        [collect(c) for c in Iterators.product(per_disj...)]
+# appears True in at least one combo (Türkay & Grossmann 1996).
+function _set_covering_combos(model::JuMP.AbstractModel)
+    M = typeof(model)
+    per_disj = Vector{Tuple{DisjunctionIndex, LogicalVariableRef{M}}}[]
+    for (idx, disj_data) in _disjunctions(model)
+        disj_data.constraint.nested && continue
+        push!(per_disj,
+            [(idx, ind) for ind in disj_data.constraint.indicators])
+    end
+    isempty(per_disj) && return Dict{LogicalVariableRef{M}, Bool}[]
 
-    # Greedy set covering: pick combos covering most uncovered
-    uncovered = Set(ind for idx in info.disjunction_indices
-                        for ind in info.indicators[idx])
-    selected_combos = Dict{Any, Bool}[]
+    all_combos = [
+        Tuple{DisjunctionIndex, LogicalVariableRef{M}}[c...]
+        for c in Iterators.product(per_disj...)]
 
+    uncovered = Set{LogicalVariableRef{M}}()
+    for group in per_disj
+        for (_, ind) in group
+            push!(uncovered, ind)
+        end
+    end
+
+    selected = Dict{LogicalVariableRef{M}, Bool}[]
     while !isempty(uncovered)
         best_combo = nothing
         best_count = 0
@@ -177,31 +163,82 @@ function _set_covering_combos(info::_DisjunctionInfo)
             end
         end
         best_combo === nothing && break
-        combo_dict = Dict{Any, Bool}()
+        combo_dict = Dict{LogicalVariableRef{M}, Bool}()
         for (disj_idx, active_ind) in best_combo
-            for ind in info.indicators[disj_idx]
+            disj_data = _disjunctions(model)[disj_idx]
+            for ind in disj_data.constraint.indicators
                 combo_dict[ind] = (ind == active_ind)
             end
         end
-        push!(selected_combos, combo_dict)
+        push!(selected, combo_dict)
         for (_, active_ind) in best_combo
             delete!(uncovered, active_ind)
         end
     end
-    return selected_combos
+    return selected
 end
 
 ################################################################################
 #                     SUBPROBLEM HELPERS
 ################################################################################
-# Common setup: copy model, reformulate with BigM, fix binaries.
-function _setup_loa_submodel(model, combo, method)
-    sub, ref_map, lv_map = copy_gdp_model(model)
-    JuMP.set_optimizer(sub, method.optimizer)
-    JuMP.set_silent(sub)
-    reformulate_model(sub, BigM(method.M_value))
-    _fix_loa_binaries!(sub, combo, lv_map)
-    return sub, ref_map
+# Number of reformulated constraints BigM produces per disjunct
+# constraint. Matches reformulate_disjunct_constraint in bigm.jl.
+_num_reform_cons(::JuMP.ScalarConstraint{<:Any, <:_MOI.LessThan}) = 1
+_num_reform_cons(::JuMP.ScalarConstraint{<:Any, <:_MOI.GreaterThan}) = 1
+_num_reform_cons(::JuMP.ScalarConstraint{<:Any, <:_MOI.EqualTo}) = 2
+_num_reform_cons(::JuMP.ScalarConstraint{<:Any, <:_MOI.Interval}) = 2
+_num_reform_cons(::JuMP.VectorConstraint) = 1
+_num_reform_cons(::Any) = 0
+
+# Build mapping: sub DisjunctConstraintRef → Vector of BigM-
+# reformulated constraint refs.
+function _build_reform_map(sub::JuMP.AbstractModel)
+    ref_cons = _reformulation_constraints(sub)
+    mapping = Dict{DisjunctConstraintRef, Vector}()
+    idx = 1
+    for (_, disj_data) in _disjunctions(sub)
+        disj_data.constraint.nested && continue
+        for ind in disj_data.constraint.indicators
+            haskey(_indicator_to_constraints(sub), ind) || continue
+            for cref in _indicator_to_constraints(sub)[ind]
+                cref isa DisjunctConstraintRef || continue
+                con = JuMP.constraint_object(cref)
+                n = _num_reform_cons(con)
+                if n > 0 && idx + n - 1 <= length(ref_cons)
+                    mapping[cref] = ref_cons[idx:idx+n-1]
+                end
+                idx += n
+            end
+        end
+    end
+    return mapping
+end
+
+# Sum duals across reformulated constraint refs for one disjunct
+# constraint. Returns nothing if unavailable.
+function _sum_duals(reform_map, sub_cref)
+    haskey(reform_map, sub_cref) || return nothing
+    try
+        return sum(JuMP.dual(rc) for rc in reform_map[sub_cref])
+    catch
+        return nothing
+    end
+end
+
+# Build a direct orig indicator → master binary variable mapping.
+function _build_bin_map(master_model, lv_map)
+    ind_to_bin = _indicator_to_binary(master_model)
+    bin_map = Dict{LogicalVariableRef, Any}()
+    for (orig_ind, mapped_ind) in lv_map
+        if haskey(ind_to_bin, mapped_ind)
+            bv = ind_to_bin[mapped_ind]
+            bin_map[orig_ind] = bv isa JuMP.AbstractVariableRef ?
+                bv : nothing
+        else
+            bin_map[orig_ind] = nothing
+        end
+    end
+    return bin_map
 end
 
 # Fix binary variables according to a Boolean combo.
@@ -216,135 +253,150 @@ function _fix_loa_binaries!(sub, combo, lv_map)
     end
 end
 
-# Check if a solve terminated with a usable solution.
-function _loa_is_feasible(model)
-    s = termination_status(model)
-    s == MOI.OPTIMAL || s == MOI.LOCALLY_SOLVED || s == MOI.FEASIBLE_POINT
-end
-
-# Look up binary variable for an indicator, or return nothing.
-function _get_bin_var(ind_to_bin, mapped_ind)
-    haskey(ind_to_bin, mapped_ind) || return nothing
-    bv = ind_to_bin[mapped_ind]
-    return bv isa JuMP.AbstractVariableRef ? bv : nothing
-end
-
 ################################################################################
 #                      NLP SUBPROBLEM SOLVER
 ################################################################################
-# Build and solve the NLP subproblem for a fixed Boolean assignment.
-# Matches (sub-LBOA) from Trespalacios (2014).
-function _solve_loa_subproblem(model, combo, info, method)
-    sub, ref_map = _setup_loa_submodel(model, combo, method)
+function _solve_loa_subproblem(
+    model::M, combo::Dict{LogicalVariableRef{M}, Bool},
+    method::LOA
+    ) where {M <: JuMP.AbstractModel}
+    sub, ref_map, lv_map = copy_gdp_model(model)
+    JuMP.set_optimizer(sub, method.optimizer)
+    JuMP.set_silent(sub)
+    reformulate_model(sub, BigM(method.M_value))
+    reform_map = _build_reform_map(sub)
+    _fix_loa_binaries!(sub, combo, lv_map)
+
     JuMP.optimize!(sub, ignore_optimize_hook = true)
 
-    if _loa_is_feasible(sub)
-        x_vals = Dict{Any, Float64}(
-            var => JuMP.value(ref_map[var])
-            for var in collect_all_vars(model))
-        return _LOAIterationResult(
-            combo, x_vals, objective_value(sub), true, [], [])
-    else
-        return _solve_loa_feasibility(
-            model, combo, info, method)
+    if !JuMP.is_solved_and_feasible(sub)
+        return _LOAIterationResult{M}(
+            combo,
+            Dict{JuMP.AbstractVariableRef, Float64}(),
+            Dict{DisjunctConstraintRef{M}, Float64}(),
+            Inf, false)
     end
-end
 
-################################################################################
-#                    FEASIBILITY SUBPROBLEM
-################################################################################
-# Solve (feas-LBOA): minimize max constraint violation.
-function _solve_loa_feasibility(model, combo, info, method)
-    feas, ref_map = _setup_loa_submodel(model, combo, method)
+    x_vals = Dict{JuMP.AbstractVariableRef, Float64}(
+        var => JuMP.value(ref_map[var])
+        for var in collect_all_vars(model))
 
-    # Add slack variable and modify objective
-    @variable(feas, _loa_slack)
-    # TODO: Properly relax constraints by slack variable.
-    @objective(feas, Min, _loa_slack)
-    JuMP.optimize!(feas, ignore_optimize_hook = true)
-
-    # Extract solution if available, otherwise use zeros
-    x_vals = Dict{Any, Float64}()
-    has_sol = _loa_is_feasible(feas)
-    for var in collect_all_vars(model)
-        if has_sol
-            val = try JuMP.value(ref_map[var]) catch; 0.0 end
-            x_vals[var] = isnan(val) ? 0.0 : val
-        else
-            x_vals[var] = 0.0
+    duals = Dict{DisjunctConstraintRef{M}, Float64}()
+    for (ind, active) in combo
+        !active && continue
+        haskey(_indicator_to_constraints(model), ind) || continue
+        for orig_cref in _indicator_to_constraints(model)[ind]
+            orig_cref isa DisjunctConstraintRef || continue
+            sub_cref = DisjunctConstraintRef(sub, orig_cref.index)
+            d = _sum_duals(reform_map, sub_cref)
+            d !== nothing && (duals[orig_cref] = d)
         end
     end
 
-    B_set = [ind for (ind, active) in combo if active]
-    N_set = [ind for (ind, active) in combo if !active]
-    return _LOAIterationResult(
-        combo, x_vals, Inf, false, B_set, N_set)
+    return _LOAIterationResult{M}(
+        combo, x_vals, duals, objective_value(sub), true)
 end
 
 ################################################################################
 #                      MASTER PROBLEM BUILDER
 ################################################################################
-# Build the MILP master with initial OA + no-good cuts.
-function _build_loa_master(model, info, init_results, method)
-    master, ref_map, lv_map = copy_gdp_model(model)
-    JuMP.set_optimizer(master, method.optimizer)
-    JuMP.set_silent(master)
-    reformulate_model(master, BigM(method.M_value))
+function _build_loa_master(
+    model::M, init_results, method::LOA
+    ) where {M <: JuMP.AbstractModel}
+    master_model, ref_map, lv_map = copy_gdp_model(model)
+    JuMP.set_optimizer(master_model, method.optimizer)
+    JuMP.set_silent(master_model)
+    reformulate_model(master_model, BigM(method.M_value))
 
-    master_maps = (ref_map = ref_map, lv_map = lv_map,
-                   ind_to_bin = _indicator_to_binary(master))
+    master = _LOAMaster{typeof(master_model)}(
+        master_model, ref_map,
+        _build_bin_map(master_model, lv_map),
+        JuMP.VariableRef[],
+        JuMP.objective_function(master_model),
+        JuMP.objective_sense(master_model))
 
     for result in init_results
-        _add_oa_cuts_to_master!(
-            master, master_maps, result, info, method)
-        _add_no_good_cut_to_master!(
-            master, master_maps, result.combo)
+        result.feasible && _add_oa_cuts!(
+            master, result, model, method)
+        _add_no_good_cut!(master, result.combo)
     end
-    return master, master_maps
+    return master
+end
+
+# Rebuild the augmented penalty objective.
+function _update_augmented_objective!(
+    master::_LOAMaster, method::LOA
+    )
+    sign_adjust = master.obj_sense == _MOI.MIN_SENSE ? 1 : -1
+    penalty = zero(JuMP.AffExpr)
+    for s in master.slack_vars
+        JuMP.add_to_expression!(penalty, 1.0, s)
+    end
+    new_obj = master.original_obj +
+        sign_adjust * method.OA_penalty_factor * penalty
+    JuMP.set_objective_function(master.model, new_obj)
+    JuMP.set_objective_sense(master.model, master.obj_sense)
+    return
 end
 
 ################################################################################
 #                        OA CUT GENERATION
 ################################################################################
 # Add outer approximation cuts at solution point xk.
-#
-# For each disjunct constraint r_ki(x) <= 0 that was active:
-#   r_ki(xk) + ∇r_ki(xk)ᵀ(x - xk) <= M*(1 - y_ki)
-#
-# AffExpr: linearization = the constraint itself (exact).
-# QuadExpr: linearization is the first-order Taylor approx.
-function _add_oa_cuts_to_master!(
-    master, master_maps, result, info, method
-    )
-    ref_map = master_maps.ref_map
-    lv_map = master_maps.lv_map
-    ind_to_bin = master_maps.ind_to_bin
-    xk = result.x_values
+# Pyomo GDPopt cut form:
+#   sign(sign_adjust * λ) * [r(xk) - rhs + ∇r(xk)ᵀ(x - xk)]
+#     - slack <= M*(1 - y)
+function _add_oa_cuts!(
+    master::_LOAMaster,
+    result::_LOAIterationResult{M},
+    model::M,
+    method::LOA
+    ) where {M <: JuMP.AbstractModel}
+    sign_adjust = master.obj_sense == _MOI.MIN_SENSE ? -1 : 1
 
     for (ind, active) in result.combo
         !active && continue
-        !haskey(info.disjunct_constraints, ind) && continue
-        bin_var = _get_bin_var(ind_to_bin, lv_map[ind])
+        haskey(_indicator_to_constraints(model), ind) || continue
+        bin_var = get(master.bin_map, ind, nothing)
 
-        for con_ref in info.disjunct_constraints[ind]
-            con_data = _disjunct_constraints(
-                JuMP.owner_model(ind))[JuMP.index(con_ref)]
+        for orig_cref in _indicator_to_constraints(model)[ind]
+            orig_cref isa DisjunctConstraintRef || continue
+            con_data = _disjunct_constraints(model)[
+                JuMP.index(orig_cref)]
             con = con_data.constraint
-            lin_expr = _linearize_at(con.func, xk, ref_map)
+
+            con.func isa JuMP.GenericAffExpr && continue
+
+            dual_val = get(result.duals, orig_cref, nothing)
+            dual_val === nothing && continue
+
+            lin_expr = _linearize_at(
+                con.func, result.x_values, master.ref_map)
             rhs = _set_rhs(con.set)
+            s = sign(sign_adjust * dual_val)
+            s == 0 && continue
+
+            slack = @variable(master.model,
+                lower_bound = 0.0,
+                upper_bound = method.max_slack)
+            push!(master.slack_vars, slack)
 
             if bin_var !== nothing
-                @constraint(master,
-                    lin_expr <= rhs + method.M_value * (1 - bin_var))
+                @constraint(master.model,
+                    s * (lin_expr - rhs) - slack <=
+                    method.M_value * (1 - bin_var))
             else
-                @constraint(master, lin_expr <= rhs)
+                @constraint(master.model,
+                    s * (lin_expr - rhs) - slack <= 0)
             end
         end
     end
 end
 
-# Linearize an AffExpr at point xk (exact, no Taylor needed).
-function _linearize_at(func::JuMP.GenericAffExpr, xk::Dict, ref_map)
+# Linearize an AffExpr at point xk (exact).
+function _linearize_at(
+    func::JuMP.GenericAffExpr, xk::Dict, ref_map
+    )
     result = JuMP.AffExpr(func.constant)
     for (var, coef) in func.terms
         JuMP.add_to_expression!(result, coef, ref_map[var])
@@ -353,28 +405,26 @@ function _linearize_at(func::JuMP.GenericAffExpr, xk::Dict, ref_map)
 end
 
 # Linearize a QuadExpr at point xk (first-order Taylor).
-# f(xk) + ∇f(xk)ᵀ(x - xk)
-# = -xk'Q*xk + (2Q*xk + a)'x + b
-function _linearize_at(func::JuMP.GenericQuadExpr, xk::Dict, ref_map)
+function _linearize_at(
+    func::JuMP.GenericQuadExpr, xk::Dict, ref_map
+    )
     grad = Dict{Any, Float64}()
-
-    # Affine contribution: a_i
     for (var, coef) in func.aff.terms
         grad[var] = get(grad, var, 0.0) + coef
     end
-
-    # Quadratic contribution: 2*Q_ij*xk_j
     for (pair, coef) in func.terms
         vi, vj = pair.a, pair.b
         if vi == vj
-            grad[vi] = get(grad, vi, 0.0) + 2 * coef * get(xk, vi, 0.0)
+            grad[vi] = get(grad, vi, 0.0) +
+                2 * coef * get(xk, vi, 0.0)
         else
-            grad[vi] = get(grad, vi, 0.0) + coef * get(xk, vj, 0.0)
-            grad[vj] = get(grad, vj, 0.0) + coef * get(xk, vi, 0.0)
+            grad[vi] = get(grad, vi, 0.0) +
+                coef * get(xk, vj, 0.0)
+            grad[vj] = get(grad, vj, 0.0) +
+                coef * get(xk, vi, 0.0)
         end
     end
 
-    # Evaluate f(xk)
     f_xk = func.aff.constant
     for (var, coef) in func.aff.terms
         f_xk += coef * get(xk, var, 0.0)
@@ -384,7 +434,6 @@ function _linearize_at(func::JuMP.GenericQuadExpr, xk::Dict, ref_map)
                         get(xk, pair.b, 0.0)
     end
 
-    # Build: f(xk) + ∑ grad_i * (x_i - xk_i)
     constant = f_xk
     for (var, g) in grad
         constant -= g * get(xk, var, 0.0)
@@ -405,39 +454,32 @@ _set_rhs(::Any) = 0.0
 ################################################################################
 #                       NO-GOOD CUT GENERATION
 ################################################################################
-# Add no-good cut to prevent revisiting the same Boolean combo.
-# Cut: ∑(1 - y_i for i in B) + ∑(y_i for i in N) >= 1
-function _add_no_good_cut_to_master!(master, master_maps, combo)
-    ind_to_bin = master_maps.ind_to_bin
-    lv_map = master_maps.lv_map
+function _add_no_good_cut!(master::_LOAMaster, combo)
     cut_expr = JuMP.AffExpr(0.0)
-
     for (ind, active) in combo
-        bin_var = _get_bin_var(ind_to_bin, lv_map[ind])
+        bin_var = get(master.bin_map, ind, nothing)
         bin_var === nothing && continue
-        if active  # (1 - y_i) term
+        if active
             JuMP.add_to_expression!(cut_expr, -1.0, bin_var)
             JuMP.add_to_expression!(cut_expr, 1.0)
-        else  # y_i term
+        else
             JuMP.add_to_expression!(cut_expr, 1.0, bin_var)
         end
     end
-    @constraint(master, cut_expr >= 1.0)
+    @constraint(master.model, cut_expr >= 1.0)
 end
 
 ################################################################################
 #                     MASTER SOLUTION EXTRACTION
 ################################################################################
-# Read binary variable values from the master solution and
-# determine the active combo.
-function _extract_combo_from_master(master, master_maps, info)
-    ind_to_bin = master_maps.ind_to_bin
-    lv_map = master_maps.lv_map
-    combo = Dict{Any, Bool}()
-
-    for idx in info.disjunction_indices
-        for ind in info.indicators[idx]
-            bin_var = _get_bin_var(ind_to_bin, lv_map[ind])
+function _extract_combo_from_master(
+    model::M, master::_LOAMaster
+    ) where {M <: JuMP.AbstractModel}
+    combo = Dict{LogicalVariableRef{M}, Bool}()
+    for (_, disj_data) in _disjunctions(model)
+        disj_data.constraint.nested && continue
+        for ind in disj_data.constraint.indicators
+            bin_var = get(master.bin_map, ind, nothing)
             combo[ind] = bin_var !== nothing ?
                 JuMP.value(bin_var) > 0.5 : false
         end
@@ -448,10 +490,11 @@ end
 ################################################################################
 #                       CONVERGENCE CHECK
 ################################################################################
-function _loa_converged(z_upper, z_lower, method)
+function _loa_converged(z_upper, z_lower, method::LOA)
     gap = z_upper - z_lower
     gap <= method.atol && return true
-    abs(z_upper) > 1e-10 && gap / abs(z_upper) <= method.rtol && return true
+    abs(z_upper) > 1e-10 &&
+        gap / abs(z_upper) <= method.rtol && return true
     return false
 end
 

@@ -3,29 +3,22 @@ using HiGHS
 function test_loa_datatype()
     method = LOA(HiGHS.Optimizer)
     @test method.optimizer == HiGHS.Optimizer
-    @test method.max_iter == 100
+    @test method.max_iter == 10
     @test method.atol == 1e-6
     @test method.rtol == 1e-4
     @test method.M_value == 1e9
+    @test method.max_slack == 1000.0
+    @test method.OA_penalty_factor == 1000.0
 
-    method = LOA(HiGHS.Optimizer; max_iter = 50, atol = 1e-8, rtol = 1e-6, M_value = 1e6)
+    method = LOA(HiGHS.Optimizer; max_iter = 50, atol = 1e-8,
+        rtol = 1e-6, M_value = 1e6, max_slack = 500.0,
+        OA_penalty_factor = 200.0)
     @test method.max_iter == 50
     @test method.atol == 1e-8
     @test method.rtol == 1e-6
     @test method.M_value == 1e6
-end
-
-function test_collect_disjunction_info()
-    model = GDPModel()
-    @variable(model, x)
-    @variable(model, Y[1:2], Logical)
-    @constraint(model, x <= 3, Disjunct(Y[1]))
-    @constraint(model, x >= 5, Disjunct(Y[2]))
-    @disjunction(model, Y)
-
-    info = DP._collect_disjunction_info(model)
-    @test length(info.disjunction_indices) == 1
-    @test length(info.indicators[info.disjunction_indices[1]]) == 2
+    @test method.max_slack == 500.0
+    @test method.OA_penalty_factor == 200.0
 end
 
 function test_set_covering_combos()
@@ -36,20 +29,15 @@ function test_set_covering_combos()
     @constraint(model, x >= 5, Disjunct(Y[2]))
     @disjunction(model, Y)
 
-    info = DP._collect_disjunction_info(model)
-    method = LOA(HiGHS.Optimizer)
-    combos = DP._set_covering_combos(info)
+    combos = DP._set_covering_combos(model)
 
     # Should cover both Y[1] and Y[2]
     all_active = Set()
     for combo in combos
         for (ind, active) in combo
-            if active
-                push!(all_active, ind)
-            end
+            active && push!(all_active, ind)
         end
     end
-    # Both indicators should appear as active in at least one combo
     @test length(all_active) == 2
 end
 
@@ -61,40 +49,36 @@ function test_no_good_cut()
     @constraint(model, x >= 5, Disjunct(Y[2]))
     @disjunction(model, Y)
 
-    info = DP._collect_disjunction_info(model)
-    method = LOA(HiGHS.Optimizer)
+    master_model, ref_map, lv_map = DP.copy_gdp_model(model)
+    JuMP.set_optimizer(master_model, HiGHS.Optimizer)
+    DP.reformulate_model(master_model, BigM(1e9))
 
-    # Build a master and add a no-good cut
-    master, ref_map, lv_map = DP.copy_gdp_model(model)
-    JuMP.set_optimizer(master, HiGHS.Optimizer)
-    DP.reformulate_model(master, BigM(1e9))
+    master = DP._LOAMaster(
+        master_model, ref_map,
+        DP._build_bin_map(master_model, lv_map),
+        JuMP.VariableRef[],
+        JuMP.objective_function(master_model),
+        JuMP.objective_sense(master_model))
 
-    master_maps = (
-        ref_map = ref_map,
-        lv_map = lv_map,
-        ind_to_bin = DP._indicator_to_binary(master),
-    )
+    combo = Dict(Y[1] => true, Y[2] => false)
 
-    # Combo where Y[1] = true, Y[2] = false
-    combo = Dict{Any, Bool}(Y[1] => true, Y[2] => false)
+    num_cons_before = length(JuMP.all_constraints(
+        master_model;
+        include_variable_in_set_constraints = false))
+    DP._add_no_good_cut!(master, combo)
+    num_cons_after = length(JuMP.all_constraints(
+        master_model;
+        include_variable_in_set_constraints = false))
 
-    num_cons_before = length(JuMP.all_constraints(master; include_variable_in_set_constraints = false))
-    DP._add_no_good_cut_to_master!(master, master_maps, combo)
-    num_cons_after = length(JuMP.all_constraints(master; include_variable_in_set_constraints = false))
-
-    # Should have added exactly 1 constraint
     @test num_cons_after == num_cons_before + 1
 end
 
 function test_loa_convergence_check()
     method = LOA(HiGHS.Optimizer; atol = 1e-6, rtol = 1e-4)
 
-    # Should converge when gap is small
     @test DP._loa_converged(1.0, 1.0, method) == true
     @test DP._loa_converged(1.0, 0.9999, method) == true
     @test DP._loa_converged(1.0, 0.5, method) == false
-
-    # Absolute tolerance
     @test DP._loa_converged(1e-8, 0.0, method) == true
 end
 
@@ -110,7 +94,6 @@ function test_loa_reformulate_simple()
     method = LOA(HiGHS.Optimizer)
     DP.reformulate_model(model, method)
 
-    # After reformulation, model should be ready to optimize
     @test DP._ready_to_optimize(model)
 end
 
@@ -162,7 +145,6 @@ end
 
 @testset "LOA" begin
     test_loa_datatype()
-    test_collect_disjunction_info()
     test_set_covering_combos()
     test_no_good_cut()
     test_loa_convergence_check()
