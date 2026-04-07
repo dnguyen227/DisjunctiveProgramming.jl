@@ -63,6 +63,40 @@ function reformulate_and_relax(
 end
 
 ################################################################################
+#                          LOGICAL VARIABLE RELAXATION
+################################################################################
+# Relax logical (binary) variables to continuous [0,1].
+# Uses _indicator_to_binary to target only logical variables.
+# Returns the list of relaxed binary refs for later restoration.
+function relax_logical_vars(model::JuMP.AbstractModel)
+    V = JuMP.variable_ref_type(model)
+    binary_refs = V[]
+    for (_, bvar) in _indicator_to_binary(model)
+        v = bvar isa JuMP.AbstractVariableRef ? bvar : nothing
+        v === nothing && continue
+        JuMP.is_binary(v) || continue
+        push!(binary_refs, v)
+        JuMP.unset_binary(v)
+        if !JuMP.has_lower_bound(v)
+            JuMP.set_lower_bound(v, 0.0)
+        end
+        if !JuMP.has_upper_bound(v)
+            JuMP.set_upper_bound(v, 1.0)
+        end
+    end
+    return binary_refs
+end
+
+# Restore binary constraint on previously relaxed variables.
+function unrelax_logical_vars(
+    binary_refs::Vector{<:JuMP.AbstractVariableRef}
+    )
+    for v in binary_refs
+        JuMP.set_binary(v)
+    end
+end
+
+################################################################################
 #                              ALL VARIABLES
 ################################################################################
 """

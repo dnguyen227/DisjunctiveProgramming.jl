@@ -81,6 +81,34 @@ function JuMP.value(vref::DP.LogicalVariableRef{InfiniteOpt.InfiniteModel})
 end
 
 ################################################################################
+#                         LOGICAL VARIABLE RELAXATION
+################################################################################
+# Relax logical variables on the transformation backend. Maps each
+# indicator binary in the InfiniteModel to its transcribed flat
+# variable(s) via transformation_variable and relaxes those.
+function DP.relax_logical_vars(
+    model::InfiniteOpt.InfiniteModel
+    )
+    flat_refs = JuMP.VariableRef[]
+    for (_, bvar) in DP._indicator_to_binary(model)
+        bvar isa InfiniteOpt.GeneralVariableRef || continue
+        tvs = InfiniteOpt.transformation_variable(bvar)
+        for tv in (tvs isa AbstractArray ? tvs : [tvs])
+            JuMP.is_binary(tv) || continue
+            push!(flat_refs, tv)
+            JuMP.unset_binary(tv)
+            if !JuMP.has_lower_bound(tv)
+                JuMP.set_lower_bound(tv, 0.0)
+            end
+            if !JuMP.has_upper_bound(tv)
+                JuMP.set_upper_bound(tv, 1.0)
+            end
+        end
+    end
+    return flat_refs
+end
+
+################################################################################
 #                                CONSTRAINTS
 ################################################################################
 function JuMP.add_constraint(
@@ -397,6 +425,9 @@ function DP._raw_M(
     )
     M_vals = typeof(method.default_M)[]
     for obj_expr in objectives
+        for v in JuMP.all_variables(sub.model)
+            JuMP.set_start_value(v, nothing)
+        end
         JuMP.@objective(sub.model, Max, obj_expr)
         JuMP.optimize!(sub.model)
         if JuMP.is_solved_and_feasible(sub.model)
@@ -518,79 +549,52 @@ function DP.copy_and_reformulate(
     return sub
 end
 
-# rBM setup: build a separate transcribed copy (cannot reuse original
-# InfiniteModel in-place for solving).
-function DP.reformulate_and_relax(
-    model::InfiniteOpt.InfiniteModel,
-    decision_vars::Vector{InfiniteOpt.GeneralVariableRef},
-    reform_method::DP.AbstractReformulationMethod,
-    method::DP.CuttingPlanes
-    )
-    rBM = DP.copy_and_reformulate(model, decision_vars, reform_method, method)
-    JuMP.relax_integrality(rBM.model)
-    return rBM, nothing
+# Extract solution from a solved InfiniteModel via transformation
+# backend. Maps each decision var through transformation_variable.
+function DP._extract_solution(model::InfiniteOpt.InfiniteModel)
+    dvars = DP.collect_cutting_planes_vars(model)
+    V = eltype(dvars)
+    sol = Dict{V, Vector{Float64}}()
+    for v in dvars
+        tv = InfiniteOpt.transformation_variable(v)
+        if tv isa AbstractArray
+            sol[v] = Float64.(JuMP.value.(vec(tv)))
+        else
+            sol[v] = [Float64(JuMP.value(tv))]
+        end
+    end
+    return sol
 end
 
-# Add separating cut for the infinite CP path. Adds the linear cut
-# to the flat transcribed rBM (so the next CP iteration benefits) AND
-# an integral cut to the original InfiniteModel (so the final
-# reformulation includes the cuts). Dispatched via the decision var
-# ref type of the GDPSubmodel.
+# Add separating cut to the flat transformation backend.
+# After modifying the flat model, mark the backend as ready
+# so the next optimize! re-solves without rebuilding.
 function DP._add_cut(
-    sub::DP.GDPSubmodel{<:Any, <:InfiniteOpt.GeneralVariableRef, <:Any},
-    rBM_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}},
-    sep_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}}
+    model::InfiniteOpt.InfiniteModel,
+    decision_vars::Vector{InfiniteOpt.GeneralVariableRef},
+    rBM_sol::Dict{<:JuMP.AbstractVariableRef,
+        <:Vector{<:Number}},
+    separation_sol::Dict{<:JuMP.AbstractVariableRef,
+        <:Vector{<:Number}}
     )
-    # --- Linear cut on the flat rBM model ---
-    cut_expr = zero(JuMP.GenericAffExpr{
-        JuMP.value_type(typeof(sub.model)),
-        JuMP.variable_ref_type(sub.model)})
-    for var in sub.decision_vars
-        sub_vars = sub.fwd_map[var]
+    flat = InfiniteOpt.transformation_model(model)
+    cut_expr = zero(JuMP.GenericAffExpr{Float64,
+        JuMP.VariableRef})
+    for var in decision_vars
         rbm_vals = rBM_sol[var]
-        sep_vals = sep_sol[var]
-        for k in 1:length(sub_vars)
+        sep_vals = separation_sol[var]
+        tv = InfiniteOpt.transformation_variable(var)
+        flat_vars = tv isa AbstractArray ? vec(tv) : [tv]
+        for k in 1:length(flat_vars)
             xi = 2 * (sep_vals[k] - rbm_vals[k])
-            JuMP.add_to_expression!(cut_expr, xi, sub_vars[k])
-            JuMP.add_to_expression!(cut_expr, -xi * sep_vals[k])
+            JuMP.add_to_expression!(
+                cut_expr, xi, flat_vars[k])
+            JuMP.add_to_expression!(
+                cut_expr, -xi * sep_vals[k])
         end
     end
-    JuMP.@constraint(sub.model, cut_expr >= 0)
-
-    # --- Integral cut on the original InfiniteModel ---
-    original = JuMP.owner_model(first(sub.decision_vars))
-    prefs, sups = _collect_parameters(original)
-    inf_terms = Any[]
-    cut_scalar = zero(JuMP.GenericAffExpr{
-        JuMP.value_type(typeof(original)),
-        JuMP.variable_ref_type(original)})
-    for var in sub.decision_vars
-        #TODO: Candidate for dispatch?
-        haskey(rBM_sol, var) || continue
-        haskey(sep_sol, var) || continue
-        vprefs = InfiniteOpt.parameter_refs(var)
-        if isempty(vprefs)
-            xi = 2 * (sep_sol[var][1] - rBM_sol[var][1])
-            sp = sep_sol[var][1]
-            cut_scalar += xi * (var - sp)
-        else
-            xi_vals = 2 .* (sep_sol[var] .- rBM_sol[var])
-            sp_vals = sep_sol[var]
-            xi_pf = condense_to_pf(original, xi_vals, vprefs, sups)
-            sp_pf = condense_to_pf(original, sp_vals, vprefs, sups)
-            push!(inf_terms, xi_pf * var - xi_pf * sp_pf)
-        end
-    end
-
-    if !isempty(inf_terms)
-        inf_expr = JuMP.@expression(original, sum(inf_terms))
-        for p in prefs
-            inf_expr = InfiniteOpt.integral(inf_expr, p)
-        end
-        cut_scalar += inf_expr
-    end
-
-    JuMP.@constraint(original, cut_scalar >= 0)
+    JuMP.@constraint(flat, cut_expr >= 0)
+    InfiniteOpt.set_transformation_backend_ready(model, true)
     return
 end
 

@@ -141,9 +141,12 @@ function test_cp_cut_generation()
     JuMP.relax_integrality(separation.model)
 
     # Setup rBM on original model, solve
-    rBM, undo = DP.reformulate_and_relax(model, decision_vars, BigM(method.M_value), method)
+    DP.reformulate_model(model, BigM(method.M_value))
+    JuMP.set_optimizer(model, HiGHS.Optimizer)
+    JuMP.set_silent(model)
+    relaxed = DP.relax_logical_vars(model)
     optimize!(model, ignore_optimize_hook = true)
-    rBM_sol = DP._extract_solution(rBM)
+    rBM_sol = DP._extract_solution(model)
 
     # Solve SEP
     DP._set_separation_objective(separation, rBM_sol)
@@ -155,7 +158,7 @@ function test_cp_cut_generation()
         model;
         include_variable_in_set_constraints = false
     ))
-    DP._add_cut(rBM, rBM_sol, separation_sol)
+    DP._add_cut(model, decision_vars, rBM_sol, separation_sol)
     num_con_after = length(JuMP.all_constraints(
         model;
         include_variable_in_set_constraints = false
@@ -164,10 +167,10 @@ function test_cp_cut_generation()
 
     # Re-solve with cut → should tighten
     optimize!(model, ignore_optimize_hook = true)
-    rBM_sol2 = DP._extract_solution(rBM)
+    rBM_sol2 = DP._extract_solution(model)
     @test rBM_sol2[x][1] ≈ 4.0 atol = 0.1
 
-    undo()
+    DP.unrelax_logical_vars(relaxed)
 end
 
 function test_reformulate_model()

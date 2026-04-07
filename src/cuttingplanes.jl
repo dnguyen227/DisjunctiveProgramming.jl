@@ -8,7 +8,17 @@ function collect_cutting_planes_vars(model::JuMP.AbstractModel)
     return collect_all_vars(model)
 end
 
-# Extract solution from a solved subproblem, keyed by original decision_vars.
+# Extract solution from a solved model (in-place). Extensions
+# override for models where values live on a backend.
+function _extract_solution(model::JuMP.AbstractModel)
+    dvars = collect_cutting_planes_vars(model)
+    V = eltype(dvars)
+    T = JuMP.value_type(typeof(model))
+    return Dict{V, Vector{T}}(
+        v => [JuMP.value(v)] for v in dvars)
+end
+
+# Extract solution from a GDPSubmodel (SEP path).
 function _extract_solution(sub::GDPSubmodel)
     V = eltype(sub.decision_vars)
     T = JuMP.value_type(typeof(sub.model))
@@ -54,27 +64,29 @@ function _solve_separation(
     return separation_obj, separation_sol
 end
 
-# Add cut: Σ_var Σ_k 2*(separation_k - rBM_k)*(x_k - separation_k) ≥ 0
+# Add cut: Σ_var Σ_k 2*(sep_k - rBM_k)*(x_k - sep_k) ≥ 0
 function _add_cut(
-    sub::GDPSubmodel,
-    rBM_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}},
-    separation_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}}
+    model::JuMP.AbstractModel,
+    decision_vars::Vector{<:JuMP.AbstractVariableRef},
+    rBM_sol::Dict{<:JuMP.AbstractVariableRef,
+        <:Vector{<:Number}},
+    separation_sol::Dict{<:JuMP.AbstractVariableRef,
+        <:Vector{<:Number}}
     )
     cut_expr = zero(JuMP.GenericAffExpr{
-        JuMP.value_type(typeof(sub.model)),
-        JuMP.variable_ref_type(sub.model)}
-        )
-    for var in sub.decision_vars
-        sub_vars = sub.fwd_map[var]
+        JuMP.value_type(typeof(model)),
+        JuMP.variable_ref_type(model)})
+    for var in decision_vars
         rbm_vals = rBM_sol[var]
-        separation_vals = separation_sol[var]
-        for k in 1:length(sub_vars)
-            xi = 2 * (separation_vals[k] - rbm_vals[k])
-            JuMP.add_to_expression!(cut_expr, xi, sub_vars[k])
-            JuMP.add_to_expression!(cut_expr, -xi * separation_vals[k])
+        sep_vals = separation_sol[var]
+        for k in 1:length(rbm_vals)
+            xi = 2 * (sep_vals[k] - rbm_vals[k])
+            JuMP.add_to_expression!(cut_expr, xi, var)
+            JuMP.add_to_expression!(
+                cut_expr, -xi * sep_vals[k])
         end
     end
-    JuMP.@constraint(sub.model, cut_expr >= 0)
+    JuMP.@constraint(model, cut_expr >= 0)
     return
 end
 
@@ -90,38 +102,29 @@ function reformulate_model(
     decision_vars = collect_cutting_planes_vars(model)
 
     # Build separation subproblem from the clean (unreformulated) model
-    separation = copy_and_reformulate(
-        model, decision_vars, Hull(), method)
+    separation = copy_and_reformulate(model, decision_vars, Hull(), method)
     JuMP.relax_integrality(separation.model)
 
-    # Set up rBM on the original model via in-place BigM reformulation
-    rBM, undo_relax = reformulate_and_relax(
-        model, decision_vars, BigM(method.M_value), method)
+    # rBM: BigM in-place, relax logical vars
+    reformulate_model(model, BigM(method.M_value))
+    JuMP.set_optimizer(model, method.optimizer)
+    JuMP.set_silent(model)
+    relaxed_vars = relax_logical_vars(model)
 
     # Cutting plane loop: rBM <-> SEP until convergence
     for iter in 1:method.max_iter
-        # 1. Solve the relaxed Big-M (rBM) master problem for current iterate
-        JuMP.optimize!(rBM.model, ignore_optimize_hook = true)
-        rBM_sol = _extract_solution(rBM)
-
-        # 2. Solve the SEP (separation subproblem) using the rBM solution
-        separation_obj, separation_sol = _solve_separation(
-            separation, rBM_sol)
-
-        # 3. Check convergence: separation_obj ≈ 0 means rBM solution is already
-        # Hull-feasible, so no separating cut exists
+        JuMP.optimize!(model, ignore_optimize_hook = true)
+        rBM_sol = _extract_solution(model)
+        separation_obj, separation_sol =
+            _solve_separation(separation, rBM_sol)
         if separation_obj <= method.seperation_tolerance
             break
         end
-
-        # 4. Add separating cut to rBM
-        _add_cut(rBM, rBM_sol, separation_sol)
+        _add_cut(model, decision_vars,
+            rBM_sol, separation_sol)
     end
 
-    if undo_relax !== nothing
-        undo_relax()
-    end
-    
+    unrelax_logical_vars(relaxed_vars)
     _set_solution_method(model, method)
     _set_ready_to_optimize(model, true)
     return
