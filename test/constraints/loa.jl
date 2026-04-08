@@ -2,7 +2,8 @@ using HiGHS
 
 function test_loa_datatype()
     method = LOA(HiGHS.Optimizer)
-    @test method.optimizer == HiGHS.Optimizer
+    @test method.nlp_optimizer == HiGHS.Optimizer
+    @test method.mip_optimizer == HiGHS.Optimizer
     @test method.max_iter == 10
     @test method.atol == 1e-6
     @test method.rtol == 1e-4
@@ -65,7 +66,7 @@ function test_no_good_cut()
     num_cons_before = length(JuMP.all_constraints(
         master_model;
         include_variable_in_set_constraints = false))
-    DP._add_no_good_cut!(master, combo)
+    DP._add_no_good_cut(master, combo)
     num_cons_after = length(JuMP.all_constraints(
         master_model;
         include_variable_in_set_constraints = false))
