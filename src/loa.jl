@@ -87,7 +87,7 @@ function reformulate_model(
     M = typeof(model)
     init_results = _LOAIterationResult{M}[]
     for combo in combos
-        result = _solve_loa_subproblem(model, combo, method)
+        result = solve_loa_subproblem(model, combo, method)
         push!(init_results, result)
         if result.feasible && result.objective < z_upper
             z_upper = result.objective
@@ -106,16 +106,16 @@ function reformulate_model(
         if !JuMP.is_solved_and_feasible(master.model)
             break
         end
-        z_lower = objective_value(master.model)
+        z_lower = JuMP.objective_value(master.model)
         _loa_converged(z_upper, z_lower, method) && break
 
         combo = _extract_combo_from_master(model, master)
-        result = _solve_loa_subproblem(model, combo, method)
+        result = solve_loa_subproblem(model, combo, method)
         if result.feasible && result.objective < z_upper
             z_upper = result.objective
         end
 
-        result.feasible && _add_oa_cuts!(
+        result.feasible && add_oa_cuts(
             master, result, model, method)
         _add_no_good_cut!(master, combo)
     end
@@ -181,49 +181,6 @@ end
 ################################################################################
 #                     SUBPROBLEM HELPERS
 ################################################################################
-# Number of reformulated constraints BigM produces per disjunct
-# constraint. Matches reformulate_disjunct_constraint in bigm.jl.
-_num_reform_cons(::JuMP.ScalarConstraint{<:Any, <:_MOI.LessThan}) = 1
-_num_reform_cons(::JuMP.ScalarConstraint{<:Any, <:_MOI.GreaterThan}) = 1
-_num_reform_cons(::JuMP.ScalarConstraint{<:Any, <:_MOI.EqualTo}) = 2
-_num_reform_cons(::JuMP.ScalarConstraint{<:Any, <:_MOI.Interval}) = 2
-_num_reform_cons(::JuMP.VectorConstraint) = 1
-_num_reform_cons(::Any) = 0
-
-# Build mapping: sub DisjunctConstraintRef → Vector of BigM-
-# reformulated constraint refs.
-function _build_reform_map(sub::JuMP.AbstractModel)
-    ref_cons = _reformulation_constraints(sub)
-    mapping = Dict{DisjunctConstraintRef, Vector}()
-    idx = 1
-    for (_, disj_data) in _disjunctions(sub)
-        disj_data.constraint.nested && continue
-        for ind in disj_data.constraint.indicators
-            haskey(_indicator_to_constraints(sub), ind) || continue
-            for cref in _indicator_to_constraints(sub)[ind]
-                cref isa DisjunctConstraintRef || continue
-                con = JuMP.constraint_object(cref)
-                n = _num_reform_cons(con)
-                if n > 0 && idx + n - 1 <= length(ref_cons)
-                    mapping[cref] = ref_cons[idx:idx+n-1]
-                end
-                idx += n
-            end
-        end
-    end
-    return mapping
-end
-
-# Sum duals across reformulated constraint refs for one disjunct
-# constraint. Returns nothing if unavailable.
-function _sum_duals(reform_map, sub_cref)
-    haskey(reform_map, sub_cref) || return nothing
-    try
-        return sum(JuMP.dual(rc) for rc in reform_map[sub_cref])
-    catch
-        return nothing
-    end
-end
 
 # Build a direct orig indicator → master binary variable mapping.
 function _build_bin_map(master_model, lv_map)
@@ -241,35 +198,84 @@ function _build_bin_map(master_model, lv_map)
     return bin_map
 end
 
-# Fix binary variables according to a Boolean combo.
-function _fix_loa_binaries!(sub, combo, lv_map)
-    ind_to_bin = _indicator_to_binary(sub)
+# Collect the active disjunct constraint refs for a combo.
+function _active_constraints(
+    model::M, combo::Dict{LogicalVariableRef{M}, Bool}
+    ) where {M <: JuMP.AbstractModel}
+    crefs = DisjunctConstraintRef{M}[]
     for (ind, active) in combo
-        mapped_ind = lv_map[ind]
-        haskey(ind_to_bin, mapped_ind) || continue
-        bin_var = ind_to_bin[mapped_ind]
-        bin_var isa JuMP.AbstractVariableRef || continue
-        JuMP.fix(bin_var, active ? 1.0 : 0.0; force = true)
+        !active && continue
+        haskey(_indicator_to_constraints(model), ind) || continue
+        for cref in _indicator_to_constraints(model)[ind]
+            cref isa DisjunctConstraintRef || continue
+            push!(crefs, cref)
+        end
     end
+    return crefs
 end
 
 ################################################################################
-#                      NLP SUBPROBLEM SOLVER
+#                      NLP SUBPROBLEM
 ################################################################################
-function _solve_loa_subproblem(
+
+# Build a lightweight submodel with only the given constraints
+# + variable bounds + objective. Returns (GDPSubmodel, con_refs)
+# where con_refs are the submodel constraint refs in the same
+# order as the input constraints (for dual extraction).
+function copy_model_with_constraints(
+    model::JuMP.AbstractModel,
+    constraints::Vector{<:DisjunctConstraintRef},
+    method::LOA
+    )
+    var_type = JuMP.variable_ref_type(model)
+    sub_model = _copy_model(model)
+    dec_vars = collect_all_vars(model)
+    fwd_map = Dict{var_type, Vector{var_type}}()
+
+    for var in dec_vars
+        copy_var = variable_copy(sub_model, var)
+        fwd_map[var] = [copy_var]
+    end
+
+    flat_map = Dict(v => ws[1] for (v, ws) in fwd_map)
+
+    # Copy objective
+    obj = JuMP.objective_function(model)
+    sense = JuMP.objective_sense(model)
+    new_obj = _replace_variables_in_constraint(obj, flat_map)
+    JuMP.@objective(sub_model, sense, new_obj)
+
+    # Copy constraints, track refs for dual extraction
+    sub_crefs = JuMP.ConstraintRef[]
+    for cref in constraints
+        con = JuMP.constraint_object(cref)
+        expr = _replace_variables_in_constraint(
+            con.func, flat_map)
+        T = one(JuMP.value_type(typeof(sub_model)))
+        sub_cref = JuMP.@constraint(
+            sub_model, expr * T in con.set)
+        push!(sub_crefs, sub_cref)
+    end
+
+    JuMP.set_optimizer(sub_model, method.optimizer)
+    JuMP.set_silent(sub_model)
+
+    return GDPSubmodel(sub_model, dec_vars, fwd_map), sub_crefs
+end
+
+# Solve the NLP subproblem for a given combo. Builds a
+# lightweight model with only the active constraints.
+function solve_loa_subproblem(
     model::M, combo::Dict{LogicalVariableRef{M}, Bool},
     method::LOA
     ) where {M <: JuMP.AbstractModel}
-    sub, ref_map, lv_map = copy_gdp_model(model)
-    JuMP.set_optimizer(sub, method.optimizer)
-    JuMP.set_silent(sub)
-    reformulate_model(sub, BigM(method.M_value))
-    reform_map = _build_reform_map(sub)
-    _fix_loa_binaries!(sub, combo, lv_map)
+    active_crefs = _active_constraints(model, combo)
+    sub, sub_crefs = copy_model_with_constraints(
+        model, active_crefs, method)
 
-    JuMP.optimize!(sub, ignore_optimize_hook = true)
+    JuMP.optimize!(sub.model)
 
-    if !JuMP.is_solved_and_feasible(sub)
+    if !JuMP.is_solved_and_feasible(sub.model)
         return _LOAIterationResult{M}(
             combo,
             Dict{JuMP.AbstractVariableRef, Float64}(),
@@ -278,23 +284,21 @@ function _solve_loa_subproblem(
     end
 
     x_vals = Dict{JuMP.AbstractVariableRef, Float64}(
-        var => JuMP.value(ref_map[var])
-        for var in collect_all_vars(model))
+        var => JuMP.value(sub.fwd_map[var][1])
+        for var in sub.dec_vars)
 
+    # Duals directly from submodel constraints (no BigM indirection)
     duals = Dict{DisjunctConstraintRef{M}, Float64}()
-    for (ind, active) in combo
-        !active && continue
-        haskey(_indicator_to_constraints(model), ind) || continue
-        for orig_cref in _indicator_to_constraints(model)[ind]
-            orig_cref isa DisjunctConstraintRef || continue
-            sub_cref = DisjunctConstraintRef(sub, orig_cref.index)
-            d = _sum_duals(reform_map, sub_cref)
-            d !== nothing && (duals[orig_cref] = d)
+    has_d = JuMP.has_duals(sub.model)
+    for (orig_cref, sub_cref) in zip(active_crefs, sub_crefs)
+        if has_d
+            duals[orig_cref] = JuMP.dual(sub_cref)
         end
     end
 
     return _LOAIterationResult{M}(
-        combo, x_vals, duals, objective_value(sub), true)
+        combo, x_vals, duals,
+        JuMP.objective_value(sub.model), true)
 end
 
 ################################################################################
@@ -316,7 +320,7 @@ function _build_loa_master(
         JuMP.objective_sense(master_model))
 
     for result in init_results
-        result.feasible && _add_oa_cuts!(
+        result.feasible && add_oa_cuts(
             master, result, model, method)
         _add_no_good_cut!(master, result.combo)
     end
@@ -346,7 +350,7 @@ end
 # Pyomo GDPopt cut form:
 #   sign(sign_adjust * λ) * [r(xk) - rhs + ∇r(xk)ᵀ(x - xk)]
 #     - slack <= M*(1 - y)
-function _add_oa_cuts!(
+function add_oa_cuts(
     master::_LOAMaster,
     result::_LOAIterationResult{M},
     model::M,
@@ -376,32 +380,23 @@ function _add_oa_cuts!(
             s = sign(sign_adjust * dual_val)
             s == 0 && continue
 
-            slack = @variable(master.model,
+            slack = JuMP.@variable(master.model,
                 lower_bound = 0.0,
                 upper_bound = method.max_slack)
             push!(master.slack_vars, slack)
 
             if bin_var !== nothing
-                @constraint(master.model,
+                cref = JuMP.@constraint(master.model,
                     s * (lin_expr - rhs) - slack <=
                     method.M_value * (1 - bin_var))
             else
-                @constraint(master.model,
+                cref = JuMP.@constraint(master.model,
                     s * (lin_expr - rhs) - slack <= 0)
             end
+            push!(_reformulation_constraints(master.model),
+                cref)
         end
     end
-end
-
-# Linearize an AffExpr at point xk (exact).
-function _linearize_at(
-    func::JuMP.GenericAffExpr, xk::Dict, ref_map
-    )
-    result = JuMP.AffExpr(func.constant)
-    for (var, coef) in func.terms
-        JuMP.add_to_expression!(result, coef, ref_map[var])
-    end
-    return result
 end
 
 # Linearize a QuadExpr at point xk (first-order Taylor).
@@ -445,6 +440,85 @@ function _linearize_at(
     return result
 end
 
+################################################################################
+#                  NONLINEAR EXPRESSION LINEARIZATION
+################################################################################
+# Convert JuMP expression tree to Julia Expr with x[i]
+# variable references for MOI.Nonlinear evaluation.
+function _to_nlp_expr(expr::JuMP.GenericNonlinearExpr, idx::Dict)
+    args = Any[_to_nlp_expr(a, idx) for a in expr.args]
+    return Expr(:call, expr.head, args...)
+end
+
+function _to_nlp_expr(expr::JuMP.GenericAffExpr, idx::Dict)
+    parts = Any[expr.constant]
+    for (var, coef) in expr.terms
+        push!(parts, Expr(:call, :*, coef,
+            Expr(:ref, :x, idx[var])))
+    end
+    length(parts) == 1 && return parts[1]
+    return Expr(:call, :+, parts...)
+end
+
+function _to_nlp_expr(expr::JuMP.GenericQuadExpr, idx::Dict)
+    parts = Any[_to_nlp_expr(expr.aff, idx)]
+    for (pair, coef) in expr.terms
+        push!(parts, Expr(:call, :*, coef,
+            Expr(:ref, :x, idx[pair.a]),
+            Expr(:ref, :x, idx[pair.b])))
+    end
+    length(parts) == 1 && return parts[1]
+    return Expr(:call, :+, parts...)
+end
+
+function _to_nlp_expr(var::JuMP.AbstractVariableRef, idx::Dict)
+    return _MOI.VariableIndex(idx[var])
+end
+
+_to_nlp_expr(x::Number, ::Dict) = x
+
+# Linearize a GenericNonlinearExpr at point xk using
+# MOI.Nonlinear reverse-mode AD.
+function _linearize_at(func::JuMP.GenericNonlinearExpr, xk::Dict, ref_map)
+    vars = JuMP.AbstractVariableRef[]
+    _interrogate_variables(v -> push!(vars, v), func)
+    unique!(vars)
+    if isempty(vars)
+        return JuMP.AffExpr(JuMP.value(v -> 0.0, func))
+    end
+
+    n = length(vars)
+    T = JuMP.value_type(
+        typeof(JuMP.owner_model(vars[1])))
+    idx = Dict(vars[i] => i for i in 1:n)
+    nlp = _MOI.Nonlinear.Model()
+    _MOI.Nonlinear.set_objective(
+        nlp, _to_nlp_expr(func, idx))
+    ord = [_MOI.VariableIndex(i) for i in 1:n]
+    evaluator = _MOI.Nonlinear.Evaluator(
+        nlp, _MOI.Nonlinear.SparseReverseMode(), ord)
+    _MOI.initialize(evaluator, [:Grad])
+
+    xk_vec = [get(xk, v, zero(T)) for v in vars]
+    f_xk = _MOI.eval_objective(evaluator, xk_vec)
+    grad = zeros(T, n)
+    _MOI.eval_objective_gradient(
+        evaluator, grad, xk_vec)
+
+    constant = T(f_xk)
+    for i in 1:n
+        constant -= grad[i] * xk_vec[i]
+    end
+    V = typeof(ref_map[vars[1]])
+    result = JuMP.GenericAffExpr{T, V}(constant)
+    for i in 1:n
+        iszero(grad[i]) && continue
+        JuMP.add_to_expression!(
+            result, grad[i], ref_map[vars[i]])
+    end
+    return result
+end
+
 # Extract RHS value from an MOI set.
 _set_rhs(set::_MOI.LessThan) = set.upper
 _set_rhs(set::_MOI.GreaterThan) = set.lower
@@ -466,7 +540,8 @@ function _add_no_good_cut!(master::_LOAMaster, combo)
             JuMP.add_to_expression!(cut_expr, 1.0, bin_var)
         end
     end
-    @constraint(master.model, cut_expr >= 1.0)
+    cref = JuMP.@constraint(master.model, cut_expr >= 1.0)
+    push!(_reformulation_constraints(master.model), cref)
 end
 
 ################################################################################

@@ -143,6 +143,77 @@ function test_loa_error_fallback()
     @test_throws ErrorException DP.reformulate_model(42, method)
 end
 
+function test_linearize_nonlinear_exp()
+    # exp(x) + y at (1, 2):
+    # f = e + 2, ∇f = [e, 1]
+    # linear: e*(x-1) + 1*(y-2) + (e+2) = e*x + y
+    model = GDPModel()
+    @variable(model, x)
+    @variable(model, y)
+    func = @expression(model, exp(x) + y)
+    xk = Dict{JuMP.AbstractVariableRef, Float64}(
+        x => 1.0, y => 2.0)
+    id_map = Dict(x => x, y => y)
+    lin = DP._linearize_at(func, xk, id_map)
+    @test JuMP.constant(lin) ≈ 0.0 atol = 1e-8
+    @test JuMP.coefficient(lin, x) ≈ exp(1.0) atol = 1e-8
+    @test JuMP.coefficient(lin, y) ≈ 1.0 atol = 1e-8
+end
+
+function test_linearize_nonlinear_sin()
+    # sin(x) at x = π/6:
+    # f = 0.5, f' = cos(π/6) = √3/2
+    # linear: 0.5 + (√3/2)(x - π/6)
+    model = GDPModel()
+    @variable(model, x)
+    func = @expression(model, sin(x))
+    xk = Dict{JuMP.AbstractVariableRef, Float64}(
+        x => π / 6)
+    id_map = Dict(x => x)
+    lin = DP._linearize_at(func, xk, id_map)
+    expected_const = 0.5 - (√3 / 2) * (π / 6)
+    @test JuMP.constant(lin) ≈ expected_const atol = 1e-8
+    @test JuMP.coefficient(lin, x) ≈ √3 / 2 atol = 1e-8
+end
+
+function test_linearize_nonlinear_multivar()
+    # exp(x) * sin(y) at (1, π/2):
+    # f = e*1 = e, ∂f/∂x = e*sin(π/2) = e, ∂f/∂y = e*cos(π/2) = 0
+    # linear: e + e*(x-1) + 0*(y-π/2) = e*x
+    model = GDPModel()
+    @variable(model, x)
+    @variable(model, y)
+    func = @expression(model, exp(x) * sin(y))
+    xk = Dict{JuMP.AbstractVariableRef, Float64}(
+        x => 1.0, y => π / 2)
+    id_map = Dict(x => x, y => y)
+    lin = DP._linearize_at(func, xk, id_map)
+    @test JuMP.constant(lin) ≈ 0.0 atol = 1e-8
+    @test JuMP.coefficient(lin, x) ≈ exp(1.0) atol = 1e-8
+    @test JuMP.coefficient(lin, y) ≈ 0.0 atol = 1e-8
+end
+
+function test_to_nlp_expr()
+    model = GDPModel()
+    @variable(model, x)
+    @variable(model, y)
+    idx = Dict(x => 1, y => 2)
+
+    # NonlinearExpr
+    nl = @expression(model, exp(x))
+    e = DP._to_nlp_expr(nl, idx)
+    @test e == Expr(:call, :exp, MOI.VariableIndex(1))
+
+    # AffExpr
+    aff = @expression(model, 2x + 3y + 1)
+    e = DP._to_nlp_expr(aff, idx)
+    @test e isa Expr
+    @test e.head == :call && e.args[1] == :+
+
+    # Number
+    @test DP._to_nlp_expr(42, idx) == 42
+end
+
 @testset "LOA" begin
     test_loa_datatype()
     test_set_covering_combos()
@@ -152,4 +223,8 @@ end
     test_loa_solve_simple()
     test_loa_solve_two_disjunctions()
     test_loa_error_fallback()
+    test_linearize_nonlinear_exp()
+    test_linearize_nonlinear_sin()
+    test_linearize_nonlinear_multivar()
+    test_to_nlp_expr()
 end
