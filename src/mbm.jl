@@ -271,6 +271,10 @@ function _raw_M(
     objective::JuMP.AbstractJuMPScalar,
     method::_MBM
     )
+    # Clear primal starts to avoid NaN from prior solve
+    for var in JuMP.all_variables(sub.model)
+        JuMP.set_start_value(var, nothing)
+    end
     JuMP.@objective(sub.model, Max, objective)
     JuMP.optimize!(sub.model)
     if JuMP.is_solved_and_feasible(sub.model)

@@ -397,6 +397,10 @@ function DP._raw_M(
     )
     M_vals = typeof(method.default_M)[]
     for obj_expr in objectives
+        # Clear primal starts to avoid NaN from prior solve
+        for var in JuMP.all_variables(sub.model)
+            JuMP.set_start_value(var, nothing)
+        end
         JuMP.@objective(sub.model, Max, obj_expr)
         JuMP.optimize!(sub.model)
         if JuMP.is_solved_and_feasible(sub.model)
@@ -598,6 +602,86 @@ end
 #                        LOA FOR INFINITEMODEL
 ################################################################################
 
+# Remap an expression using ref_map, rebuilding
+# measures (integrals) on the target model.
+function _remap_expression(
+    expr::InfiniteOpt.GeneralVariableRef,
+    ref_map::Dict, target_model
+    )
+    if haskey(ref_map, expr)
+        return ref_map[expr]
+    end
+    dv = InfiniteOpt.dispatch_variable_ref(expr)
+    if dv isa InfiniteOpt.MeasureRef
+        mf = InfiniteOpt.measure_function(dv)
+        md = InfiniteOpt.measure_data(dv)
+        new_mf = _remap_expression(
+            mf, ref_map, target_model)
+        pref = InfiniteOpt.parameter_refs(md)
+        new_pref = ref_map[pref]
+        return InfiniteOpt.integral(
+            new_mf, new_pref)
+    end
+    return ref_map[expr]
+end
+
+function _remap_expression(
+    expr::JuMP.GenericAffExpr{C,
+        InfiniteOpt.GeneralVariableRef},
+    ref_map::Dict, target_model
+    ) where {C}
+    result = JuMP.GenericAffExpr{C,
+        InfiniteOpt.GeneralVariableRef}(
+        expr.constant)
+    for (var, coef) in expr.terms
+        new_var = _remap_expression(
+            var, ref_map, target_model)
+        JuMP.add_to_expression!(
+            result, coef, new_var)
+    end
+    return result
+end
+
+function _remap_expression(
+    expr::JuMP.GenericQuadExpr{C,
+        InfiniteOpt.GeneralVariableRef},
+    ref_map::Dict, target_model
+    ) where {C}
+    aff = _remap_expression(
+        expr.aff, ref_map, target_model)
+    result = JuMP.GenericQuadExpr(aff)
+    for (pair, coef) in expr.terms
+        va = _remap_expression(
+            pair.a, ref_map, target_model)
+        vb = _remap_expression(
+            pair.b, ref_map, target_model)
+        JuMP.add_to_expression!(
+            result, coef, va, vb)
+    end
+    return result
+end
+
+function _remap_expression(
+    expr::JuMP.GenericNonlinearExpr, ref_map::Dict,
+    target_model
+    )
+    new_args = Any[]
+    for a in expr.args
+        push!(new_args, _remap_expression(
+            a, ref_map, target_model))
+    end
+    return JuMP.GenericNonlinearExpr(
+        expr.head, new_args)
+end
+
+_remap_expression(x::Number, ::Dict, _) = x
+
+# Fallback: use _replace_variables_in_constraint
+function _remap_expression(expr, ref_map::Dict, _)
+    return DP._replace_variables_in_constraint(
+        expr, ref_map)
+end
+
 # Build a mini InfiniteModel NLP subproblem with only the
 # given disjunct constraints + all global constraints,
 # transcribe to flat JuMP model for solving.
@@ -661,11 +745,10 @@ function DP._copy_subproblem(
         ref_map[pf] = new_pf
     end
 
-    # 5. Copy objective
+    # 5. Copy objective (rebuild measures if present)
     obj = JuMP.objective_function(model)
     sense = JuMP.objective_sense(model)
-    new_obj = DP._replace_variables_in_constraint(
-        obj, ref_map)
+    new_obj = _remap_expression(obj, ref_map, mini)
     JuMP.@objective(mini, sense, new_obj)
 
     # 6. Copy global (non-disjunct) constraints
@@ -678,8 +761,8 @@ function DP._copy_subproblem(
             cref isa DP.DisjunctConstraintRef &&
                 continue
             con = JuMP.constraint_object(cref)
-            new_f = DP._replace_variables_in_constraint(
-                con.func, ref_map)
+            new_f = _remap_expression(
+                con.func, ref_map, mini)
             JuMP.@constraint(mini, new_f in con.set)
         end
     end
@@ -798,6 +881,10 @@ function DP._build_loa_master(
     # flat BigM-reformed copy. First strip nonlinear
     # disjuncts before reformulation.
     master_inf = InfiniteOpt.InfiniteModel()
+    master_inf.ext[:GDP] = DP.GDPData{
+        InfiniteOpt.InfiniteModel,
+        InfiniteOpt.GeneralVariableRef,
+        InfiniteOpt.InfOptConstraintRef}()
     ref_map = Dict{
         InfiniteOpt.GeneralVariableRef,
         InfiniteOpt.GeneralVariableRef}()
@@ -852,11 +939,11 @@ function DP._build_loa_master(
         ref_map[pf] = new_pf
     end
 
-    # Copy objective
+    # Copy objective (rebuild measures if present)
     obj = JuMP.objective_function(model)
     sense = JuMP.objective_sense(model)
-    new_obj = DP._replace_variables_in_constraint(
-        obj, ref_map)
+    new_obj = _remap_expression(
+        obj, ref_map, master_inf)
     JuMP.@objective(master_inf, sense, new_obj)
 
     # Copy global constraints
@@ -869,8 +956,8 @@ function DP._build_loa_master(
             cref isa DP.DisjunctConstraintRef &&
                 continue
             con = JuMP.constraint_object(cref)
-            new_f = DP._replace_variables_in_constraint(
-                con.func, ref_map)
+            new_f = _remap_expression(
+                con.func, ref_map, master_inf)
             JuMP.@constraint(
                 master_inf, new_f in con.set)
         end
@@ -884,10 +971,19 @@ function DP._build_loa_master(
     DP.reformulate_model(
         master_inf, DP.BigM(method.M_value))
 
-    # Transcribe to flat MILP
-    flat, tr_fwd = transcribe_to_flat(master_inf)
+    # Transcribe to flat MILP, copy to get
+    # independent model from InfiniteOpt backend
+    raw_flat, raw_fwd = transcribe_to_flat(master_inf)
+    flat, copy_map = JuMP.copy_model(raw_flat)
+    flat.ext[:GDP] = DP.GDPData{
+        JuMP.Model, JuMP.VariableRef,
+        JuMP.ConstraintRef}()
     JuMP.set_optimizer(flat, method.mip_optimizer)
     JuMP.set_silent(flat)
+    # Remap tr_fwd through copy_map
+    tr_fwd = Dict(
+        k => [copy_map[v] for v in vs]
+        for (k, vs) in raw_fwd)
 
     # Build bin_map: orig indicator → representative
     # flat binary (first support point)
@@ -1129,6 +1225,8 @@ function DP._finalize_model(
     if !DP._has_nonlinear_disjuncts(model)
         DP.reformulate_model(
             model, DP.BigM(method.M_value))
+        JuMP.set_optimizer(
+            model, method.mip_optimizer)
         return
     end
 

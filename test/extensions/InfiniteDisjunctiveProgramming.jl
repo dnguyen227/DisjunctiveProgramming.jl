@@ -696,6 +696,33 @@ function test_CuttingPlanes_multiparameter()
         [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
 end
 
+function test_loa_infinite_linear()
+    # Simple infinite GDP with linear disjuncts:
+    # min ∫x dt s.t. (x >= 5) OR (x <= 3), 0 <= x <= 10
+    # Optimal: Y2 active, x(t) = 0 for all t, obj = 0
+    model = InfiniteGDPModel(Ipopt.Optimizer)
+    set_silent(model)
+
+    @infinite_parameter(model, t ∈ [0, 1],
+        num_supports = 10)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+
+    @objective(model, Min, ∫(x, t))
+
+    optimize!(model,
+        gdp_method = LOA(Ipopt.Optimizer;
+            mip_optimizer = HiGHS.Optimizer,
+            max_iter = 10))
+    @test termination_status(model) in
+        [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
+    @test objective_value(model) ≈ 0.0 atol = 0.5
+end
+
 @testset "InfiniteDisjunctiveProgramming" begin
 
     @testset "Model" begin
@@ -760,5 +787,8 @@ end
         test_CuttingPlanes_multiparameter()
     end
 
+    @testset "LOA" begin
+        test_loa_infinite_linear()
+    end
 
 end
