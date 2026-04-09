@@ -265,9 +265,9 @@ function _copy_subproblem(
     )
     var_type = JuMP.variable_ref_type(model)
     sub_model = _copy_model(model)
-    dec_vars = collect_all_vars(model)
+    decision_vars = collect_all_vars(model)
     fwd_map = Dict{var_type, Vector{var_type}}()
-    for var in dec_vars
+    for var in decision_vars
         copy_var = variable_copy(sub_model, var)
         # Relax integrality for NLP subproblem
         if JuMP.is_binary(copy_var)
@@ -319,7 +319,7 @@ function _copy_subproblem(
         sub_model, method.nlp_optimizer)
     JuMP.set_silent(sub_model)
     return (
-        GDPSubmodel(sub_model, dec_vars, fwd_map),
+        GDPSubmodel(sub_model, decision_vars, fwd_map),
         sub_crefs
     )
 end
@@ -346,7 +346,7 @@ function _solve_loa_subproblem(
 
     x_vals = Dict{JuMP.AbstractVariableRef, Float64}(
         var => JuMP.value(sub.fwd_map[var][1])
-        for var in sub.dec_vars)
+        for var in sub.decision_vars)
 
     duals = Dict{DisjunctConstraintRef{M}, Float64}()
     has_d = JuMP.has_duals(sub.model)
