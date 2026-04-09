@@ -594,4 +594,581 @@ function DP._add_cut(
     return
 end
 
+################################################################################
+#                        LOA FOR INFINITEMODEL
+################################################################################
+
+# Build a mini InfiniteModel NLP subproblem with only the
+# given disjunct constraints + all global constraints,
+# transcribe to flat JuMP model for solving.
+function DP._copy_subproblem(
+    model::InfiniteOpt.InfiniteModel,
+    constraints::Vector{<:DP.DisjunctConstraintRef},
+    method::DP.LOA
+    )
+    mini = InfiniteOpt.InfiniteModel()
+    ref_map = Dict{
+        InfiniteOpt.GeneralVariableRef,
+        InfiniteOpt.GeneralVariableRef}()
+
+    # 1. Copy infinite parameters with supports
+    for p in InfiniteOpt.all_parameters(model)
+        domain = InfiniteOpt.infinite_domain(p)
+        sups = Float64.(InfiniteOpt.supports(p))
+        param = InfiniteOpt.build_parameter(
+            error, domain; supports = sups)
+        new_p = InfiniteOpt.add_parameter(
+            mini, param, JuMP.name(p))
+        ref_map[p] = new_p
+    end
+
+    # 2. Copy decision variables (relax integrality)
+    for v in JuMP.all_variables(model)
+        _is_parameter(v) && continue
+        prefs = InfiniteOpt.parameter_refs(v)
+        var_type = isempty(prefs) ? nothing :
+            InfiniteOpt.Infinite(
+                Tuple(ref_map[p] for p in prefs)...)
+        info = DP.get_variable_info(v;
+            has_binary = false, has_integer = false)
+        props = DP.VariableProperties(
+            info, "", nothing, var_type)
+        ref_map[v] = DP.create_variable(mini, props)
+    end
+
+    # 3. Copy derivatives with bounds
+    for d in InfiniteOpt.all_derivatives(model)
+        vref = InfiniteOpt.derivative_argument(d)
+        pref = InfiniteOpt.operator_parameter(d)
+        new_d = InfiniteOpt.deriv(
+            ref_map[vref], ref_map[pref])
+        info = DP.get_variable_info(d)
+        info.has_lb &&
+            JuMP.set_lower_bound(new_d, info.lower_bound)
+        info.has_ub &&
+            JuMP.set_upper_bound(new_d, info.upper_bound)
+        ref_map[d] = new_d
+    end
+
+    # 4. Copy parameter functions from all disjuncts
+    pf_set = _all_param_functions(model)
+    for pf in pf_set
+        fn = InfiniteOpt.raw_function(pf)
+        prefs = InfiniteOpt.parameter_refs(pf)
+        mapped = Tuple(ref_map[p] for p in prefs)
+        new_pf = _make_parameter_function(
+            mini, fn, mapped...)
+        ref_map[pf] = new_pf
+    end
+
+    # 5. Copy objective
+    obj = JuMP.objective_function(model)
+    sense = JuMP.objective_sense(model)
+    new_obj = DP._replace_variables_in_constraint(
+        obj, ref_map)
+    JuMP.@objective(mini, sense, new_obj)
+
+    # 6. Copy global (non-disjunct) constraints
+    for (F, S) in JuMP.list_of_constraint_types(model)
+        F <: Union{
+            JuMP.VariableRef, _MOI.VariableIndex,
+            InfiniteOpt.GeneralVariableRef
+        } && continue
+        for cref in JuMP.all_constraints(model, F, S)
+            cref isa DP.DisjunctConstraintRef &&
+                continue
+            con = JuMP.constraint_object(cref)
+            new_f = DP._replace_variables_in_constraint(
+                con.func, ref_map)
+            JuMP.@constraint(mini, new_f in con.set)
+        end
+    end
+
+    # 7. Copy active disjunct constraints (tracked for
+    #    dual extraction after transcription)
+    mini_crefs = InfiniteOpt.InfOptConstraintRef[]
+    for cref in constraints
+        con = JuMP.constraint_object(cref)
+        new_func = DP._replace_variables_in_constraint(
+            con.func, ref_map)
+        T = one(JuMP.value_type(typeof(mini)))
+        mini_cref = JuMP.@constraint(
+            mini, new_func * T in con.set)
+        push!(mini_crefs, mini_cref)
+    end
+
+    # 8. Transcribe to flat JuMP model
+    flat, tr_fwd = transcribe_to_flat(mini)
+
+    # 9. Build fwd_map: orig var → flat vars
+    fwd_map = Dict{
+        InfiniteOpt.GeneralVariableRef,
+        Vector{JuMP.VariableRef}}()
+    for (orig, mapped) in ref_map
+        _is_parameter(orig) && continue
+        haskey(tr_fwd, mapped) || continue
+        fwd_map[orig] = tr_fwd[mapped]
+    end
+
+    # 10. Map mini constraint refs to flat refs
+    sub_crefs = JuMP.ConstraintRef[]
+    for mc in mini_crefs
+        tc = InfiniteOpt.transformation_constraint(mc)
+        if tc isa AbstractVector
+            append!(sub_crefs, tc)
+        else
+            push!(sub_crefs, tc)
+        end
+    end
+
+    decision_vars = collect(keys(fwd_map))
+    JuMP.set_optimizer(flat, method.nlp_optimizer)
+    JuMP.set_silent(flat)
+    return (
+        DP.GDPSubmodel(flat, decision_vars, fwd_map),
+        sub_crefs
+    )
+end
+
+# Solve NLP subproblem for InfiniteModel. Extracts
+# per-support-point x-values and duals.
+function DP._solve_loa_subproblem(
+    model::InfiniteOpt.InfiniteModel,
+    combo::Dict{
+        DP.LogicalVariableRef{InfiniteOpt.InfiniteModel},
+        Bool},
+    method::DP.LOA
+    )
+    M = InfiniteOpt.InfiniteModel
+    active_crefs = DP._active_constraints(model, combo)
+    sub, sub_crefs = DP._copy_subproblem(
+        model, active_crefs, method)
+
+    JuMP.optimize!(sub.model)
+
+    XV = Vector{Float64}
+    if !JuMP.is_solved_and_feasible(sub.model)
+        return DP._LOAIterationResult{M, XV}(
+            combo,
+            Dict{JuMP.AbstractVariableRef, XV}(),
+            Dict{DP.DisjunctConstraintRef{M}, XV}(),
+            Inf, false)
+    end
+
+    # Per-support-point x values
+    x_vals = Dict{JuMP.AbstractVariableRef, XV}()
+    for var in sub.decision_vars
+        x_vals[var] = [
+            JuMP.value(fv) for fv in sub.fwd_map[var]]
+    end
+
+    # Per-support-point duals (flat constraints are
+    # ordered: K flat crefs per original constraint)
+    K = length(first(values(sub.fwd_map)))
+    n_orig = length(active_crefs)
+    duals = Dict{DP.DisjunctConstraintRef{M}, XV}()
+    has_d = JuMP.has_duals(sub.model)
+    if has_d && length(sub_crefs) == n_orig * K
+        for (i, orig) in enumerate(active_crefs)
+            duals[orig] = [
+                JuMP.dual(sub_crefs[(i-1)*K + k])
+                for k in 1:K]
+        end
+    elseif has_d
+        # Fallback: single dual per constraint
+        for (i, orig) in enumerate(active_crefs)
+            i <= length(sub_crefs) || break
+            duals[orig] = [JuMP.dual(sub_crefs[i])]
+        end
+    end
+
+    return DP._LOAIterationResult{M, XV}(
+        combo, x_vals, duals,
+        JuMP.objective_value(sub.model), true)
+end
+
+# Build the MILP master for InfiniteModel LOA.
+# Copies the model manually, strips nonlinear disjuncts,
+# BigM-reforms, then transcribes to flat MILP.
+function DP._build_loa_master(
+    model::InfiniteOpt.InfiniteModel,
+    init_results, method::DP.LOA
+    )
+    # Use copy_and_reformulate from CP path to get a
+    # flat BigM-reformed copy. First strip nonlinear
+    # disjuncts before reformulation.
+    master_inf = InfiniteOpt.InfiniteModel()
+    ref_map = Dict{
+        InfiniteOpt.GeneralVariableRef,
+        InfiniteOpt.GeneralVariableRef}()
+
+    # Copy parameters
+    for p in InfiniteOpt.all_parameters(model)
+        domain = InfiniteOpt.infinite_domain(p)
+        sups = Float64.(InfiniteOpt.supports(p))
+        param = InfiniteOpt.build_parameter(
+            error, domain; supports = sups)
+        new_p = InfiniteOpt.add_parameter(
+            master_inf, param, JuMP.name(p))
+        ref_map[p] = new_p
+    end
+
+    # Copy variables (keep binary/integer for BigM)
+    for v in JuMP.all_variables(model)
+        _is_parameter(v) && continue
+        prefs = InfiniteOpt.parameter_refs(v)
+        var_type = isempty(prefs) ? nothing :
+            InfiniteOpt.Infinite(
+                Tuple(ref_map[p] for p in prefs)...)
+        props = DP.VariableProperties(
+            DP.get_variable_info(v), JuMP.name(v),
+            nothing, var_type)
+        ref_map[v] = DP.create_variable(
+            master_inf, props)
+    end
+
+    # Copy derivatives
+    for d in InfiniteOpt.all_derivatives(model)
+        vref = InfiniteOpt.derivative_argument(d)
+        pref = InfiniteOpt.operator_parameter(d)
+        new_d = InfiniteOpt.deriv(
+            ref_map[vref], ref_map[pref])
+        info = DP.get_variable_info(d)
+        info.has_lb &&
+            JuMP.set_lower_bound(new_d, info.lower_bound)
+        info.has_ub &&
+            JuMP.set_upper_bound(new_d, info.upper_bound)
+        ref_map[d] = new_d
+    end
+
+    # Copy parameter functions
+    pf_set = _all_param_functions(model)
+    for pf in pf_set
+        fn = InfiniteOpt.raw_function(pf)
+        prefs = InfiniteOpt.parameter_refs(pf)
+        mapped = Tuple(ref_map[p] for p in prefs)
+        new_pf = _make_parameter_function(
+            master_inf, fn, mapped...)
+        ref_map[pf] = new_pf
+    end
+
+    # Copy objective
+    obj = JuMP.objective_function(model)
+    sense = JuMP.objective_sense(model)
+    new_obj = DP._replace_variables_in_constraint(
+        obj, ref_map)
+    JuMP.@objective(master_inf, sense, new_obj)
+
+    # Copy global constraints
+    for (F, S) in JuMP.list_of_constraint_types(model)
+        F <: Union{
+            JuMP.VariableRef, _MOI.VariableIndex,
+            InfiniteOpt.GeneralVariableRef
+        } && continue
+        for cref in JuMP.all_constraints(model, F, S)
+            cref isa DP.DisjunctConstraintRef &&
+                continue
+            con = JuMP.constraint_object(cref)
+            new_f = DP._replace_variables_in_constraint(
+                con.func, ref_map)
+            JuMP.@constraint(
+                master_inf, new_f in con.set)
+        end
+    end
+
+    # Copy GDP data manually
+    _copy_gdp_for_loa(model, master_inf, ref_map)
+
+    # Strip nonlinear disjuncts, BigM-reform
+    DP._remove_nonlinear_disjuncts(master_inf)
+    DP.reformulate_model(
+        master_inf, DP.BigM(method.M_value))
+
+    # Transcribe to flat MILP
+    flat, tr_fwd = transcribe_to_flat(master_inf)
+    JuMP.set_optimizer(flat, method.mip_optimizer)
+    JuMP.set_silent(flat)
+
+    # Build bin_map: orig indicator → representative
+    # flat binary (first support point)
+    lv_map = Dict{
+        DP.LogicalVariableRef{InfiniteOpt.InfiniteModel},
+        DP.LogicalVariableRef{InfiniteOpt.InfiniteModel}
+        }()
+    orig_gdp = DP.gdp_data(model)
+    copy_gdp = DP.gdp_data(master_inf)
+    for (idx, _) in orig_gdp.logical_variables
+        orig_lv = DP.LogicalVariableRef(model, idx)
+        copy_lv = DP.LogicalVariableRef(
+            master_inf, idx)
+        lv_map[orig_lv] = copy_lv
+    end
+    ind_to_bin = DP._indicator_to_binary(master_inf)
+    bin_map = Dict{DP.LogicalVariableRef, Any}()
+    for (orig_ind, copy_ind) in lv_map
+        if haskey(ind_to_bin, copy_ind)
+            bv = ind_to_bin[copy_ind]
+            if bv isa JuMP.AbstractVariableRef &&
+                    haskey(tr_fwd, bv)
+                # Representative: first flat binary
+                bin_map[orig_ind] = tr_fwd[bv][1]
+            else
+                bin_map[orig_ind] = nothing
+            end
+        else
+            bin_map[orig_ind] = nothing
+        end
+    end
+
+    # Build ref_map for OA cuts: orig var → flat vars
+    # Store tr_fwd keyed by original vars
+    oa_ref_map = Dict{
+        InfiniteOpt.GeneralVariableRef,
+        Vector{JuMP.VariableRef}}()
+    for (orig, copy) in ref_map
+        _is_parameter(orig) && continue
+        haskey(tr_fwd, copy) || continue
+        oa_ref_map[orig] = tr_fwd[copy]
+    end
+
+    master = DP._LOAMaster{
+        typeof(flat), typeof(oa_ref_map)}(
+        flat, oa_ref_map, bin_map,
+        JuMP.VariableRef[],
+        JuMP.objective_function(flat),
+        JuMP.objective_sense(flat))
+
+    for result in init_results
+        result.feasible && DP._add_oa_cuts(
+            master, result, model, method)
+        DP._add_no_good_cut(master, result.combo)
+    end
+    return master
+end
+
+# Copy GDP data (logical vars, disjunctions, disjunct
+# constraints, logical constraints) from model to copy
+# using ref_map for variable substitution.
+function _copy_gdp_for_loa(
+    model::InfiniteOpt.InfiniteModel,
+    copy::InfiniteOpt.InfiniteModel,
+    ref_map::Dict
+    )
+    orig_gdp = DP.gdp_data(model)
+    copy_gdp = DP.gdp_data(copy)
+
+    # Logical variables (reuse same indices)
+    lv_map = Dict{
+        DP.LogicalVariableRef{InfiniteOpt.InfiniteModel},
+        DP.LogicalVariableRef{InfiniteOpt.InfiniteModel}
+        }()
+    for (idx, var_data) in orig_gdp.logical_variables
+        new_data = DP.LogicalVariableData(
+            var_data.variable, var_data.name)
+        copy_gdp.logical_variables[idx] = new_data
+        orig_lv = DP.LogicalVariableRef(model, idx)
+        copy_lv = DP.LogicalVariableRef(copy, idx)
+        lv_map[orig_lv] = copy_lv
+        # Create binary backing variable
+        bvref = JuMP.@variable(copy,
+            base_name = var_data.name, binary = true)
+        DP._indicator_to_binary(copy)[copy_lv] = bvref
+    end
+
+    # Disjunct constraints
+    dc_map = Dict{
+        DP.DisjunctConstraintRef{
+            InfiniteOpt.InfiniteModel},
+        DP.DisjunctConstraintRef{
+            InfiniteOpt.InfiniteModel}}()
+    for (idx, dc_data) in orig_gdp.disjunct_constraints
+        old_con = dc_data.constraint
+        old_dc_ref = DP.DisjunctConstraintRef(
+            model, idx)
+        old_ind = orig_gdp.constraint_to_indicator[
+            old_dc_ref]
+        new_ind = lv_map[old_ind]
+        new_func = DP._replace_variables_in_constraint(
+            old_con.func, ref_map)
+        new_con = JuMP.build_constraint(
+            error, new_func, old_con.set,
+            DP.Disjunct(new_ind))
+        new_dc_ref = JuMP.add_constraint(
+            copy, new_con, dc_data.name)
+        dc_map[old_dc_ref] = new_dc_ref
+    end
+
+    # Disjunctions
+    disj_map = Dict{
+        DP.DisjunctionRef{InfiniteOpt.InfiniteModel},
+        DP.DisjunctionRef{InfiniteOpt.InfiniteModel}
+        }()
+    for (idx, disj_data) in orig_gdp.disjunctions
+        old_disj = disj_data.constraint
+        new_inds = [lv_map[ind]
+            for ind in old_disj.indicators]
+        new_disj = DP.Disjunction(
+            new_inds, old_disj.nested)
+        copy_gdp.disjunctions[idx] =
+            DP.ConstraintData(new_disj, disj_data.name)
+        disj_map[
+            DP.DisjunctionRef(model, idx)
+        ] = DP.DisjunctionRef(copy, idx)
+    end
+
+    # Exactly1 constraints
+    for (d_ref, lc_ref) in orig_gdp.exactly1_constraints
+        new_d = disj_map[d_ref]
+        # Create the exactly1 logical constraint
+        new_inds = [lv_map[ind]
+            for ind in orig_gdp.disjunctions[
+                JuMP.index(d_ref)
+            ].constraint.indicators]
+        copy_gdp.exactly1_constraints[new_d] =
+            DP.LogicalConstraintRef(copy,
+                DP.LogicalConstraintIndex(
+                    JuMP.index(lc_ref).value))
+    end
+
+    return lv_map
+end
+
+# Add per-support-point OA cuts on the flat master.
+function DP._add_oa_cuts(
+    master::DP._LOAMaster{
+        <:JuMP.AbstractModel,
+        <:Dict{InfiniteOpt.GeneralVariableRef,
+               Vector{JuMP.VariableRef}}},
+    result::DP._LOAIterationResult{
+        InfiniteOpt.InfiniteModel, Vector{Float64}},
+    model::InfiniteOpt.InfiniteModel,
+    method::DP.LOA
+    )
+    sgn = master.obj_sense ==
+        _MOI.MIN_SENSE ? -1 : 1
+    oa_fwd = master.ref_map
+
+    for (ind, active) in result.combo
+        !active && continue
+        haskey(DP._indicator_to_constraints(
+            model), ind) || continue
+        bin_var = get(master.bin_map, ind, nothing)
+
+        for orig_cref in DP._indicator_to_constraints(
+                model)[ind]
+            orig_cref isa DP.DisjunctConstraintRef ||
+                continue
+            con_data = DP._disjunct_constraints(
+                model)[JuMP.index(orig_cref)]
+            con = con_data.constraint
+            con.func isa JuMP.GenericAffExpr && continue
+
+            dual_vec = get(
+                result.duals, orig_cref, nothing)
+            dual_vec === nothing && continue
+
+            K = length(first(values(oa_fwd)))
+            rhs = DP._set_rhs(con.set)
+
+            for k in 1:K
+                dual_val = k <= length(dual_vec) ?
+                    dual_vec[k] : 0.0
+                s = sign(sgn * dual_val)
+                s == 0 && continue
+
+                # Build xk and ref_map for support k
+                xk_k = Dict{
+                    JuMP.AbstractVariableRef, Float64}()
+                ref_k = Dict{Any, Any}()
+                for (v, fvs) in oa_fwd
+                    haskey(result.x_values, v) ||
+                        continue
+                    xv = result.x_values[v]
+                    idx = min(k, length(xv))
+                    fidx = min(k, length(fvs))
+                    xk_k[fvs[fidx]] = xv[idx]
+                    ref_k[fvs[fidx]] = fvs[fidx]
+                end
+
+                # Linearize the constraint func at xk
+                # on flat variables
+                flat_func =
+                    DP._replace_variables_in_constraint(
+                        con.func,
+                        Dict(v => fvs[min(k,length(fvs))]
+                            for (v, fvs) in oa_fwd))
+                lin_expr = DP._linearize_at(
+                    flat_func, xk_k, ref_k)
+
+                slack = JuMP.@variable(master.model,
+                    lower_bound = 0.0,
+                    upper_bound = method.max_slack)
+                push!(master.slack_vars, slack)
+
+                lhs = s * (lin_expr - rhs) - slack
+                if bin_var !== nothing
+                    cref = JuMP.@constraint(
+                        master.model, lhs <=
+                        method.M_value * (1 - bin_var))
+                else
+                    cref = JuMP.@constraint(
+                        master.model, lhs <= 0)
+                end
+                push!(DP._reformulation_constraints(
+                    master.model), cref)
+            end
+        end
+    end
+end
+
+# Final model setup for InfiniteModel LOA.
+function DP._finalize_model(
+    model::InfiniteOpt.InfiniteModel,
+    best_result, method::DP.LOA
+    )
+    if !DP._has_nonlinear_disjuncts(model)
+        DP.reformulate_model(
+            model, DP.BigM(method.M_value))
+        return
+    end
+
+    # Collect active nonlinear constraints, fix
+    # indicators to best combo
+    nl_active = Tuple{Any, Any}[]
+    if best_result !== nothing
+        for (ind, active) in best_result.combo
+            bv = DP._indicator_to_binary(model)[ind]
+            if bv isa JuMP.AbstractVariableRef
+                JuMP.fix(bv, active ? 1.0 : 0.0;
+                    force = true)
+            end
+            !active && continue
+            haskey(DP._indicator_to_constraints(
+                model), ind) || continue
+            for cref in DP._indicator_to_constraints(
+                    model)[ind]
+                cref isa DP.DisjunctConstraintRef ||
+                    continue
+                c = DP._disjunct_constraints(model)[
+                    JuMP.index(cref)].constraint
+                DP._is_nonlinear(c.func) &&
+                    push!(nl_active, (c.func, c.set))
+            end
+        end
+    end
+
+    # BigM-reform only linear/quadratic disjuncts
+    DP._remove_nonlinear_disjuncts(model)
+    DP.reformulate_model(
+        model, DP.BigM(method.M_value))
+
+    # Re-add active nonlinear constraints directly
+    for (func, set) in nl_active
+        cref = JuMP.@constraint(model, func in set)
+        push!(
+            DP._reformulation_constraints(model), cref)
+    end
+    return
+end
+
 end
