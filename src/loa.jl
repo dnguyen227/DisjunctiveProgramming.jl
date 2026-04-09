@@ -62,18 +62,26 @@ end
 #                          DATA STRUCTURES
 ################################################################################
 # Result from solving an NLP subproblem.
-struct _LOAIterationResult{M <: JuMP.AbstractModel}
+# X is Float64 for finite models,
+# Vector{Float64} for infinite (per-support).
+struct _LOAIterationResult{
+    M <: JuMP.AbstractModel, X
+    }
     combo::Dict{LogicalVariableRef{M}, Bool}
-    x_values::Dict{JuMP.AbstractVariableRef, Float64}
-    duals::Dict{DisjunctConstraintRef{M}, Float64}
+    x_values::Dict{JuMP.AbstractVariableRef, X}
+    duals::Dict{DisjunctConstraintRef{M}, X}
     objective::Float64
     feasible::Bool
 end
 
 # Master problem state.
-mutable struct _LOAMaster{M <: JuMP.AbstractModel}
+# R is the ref_map type: GenericReferenceMap for
+# finite, Dict for infinite (flat transcribed).
+mutable struct _LOAMaster{
+    M <: JuMP.AbstractModel, R
+    }
     model::M
-    ref_map::JuMP.GenericReferenceMap
+    ref_map::R
     bin_map::Dict{LogicalVariableRef, Any}
     slack_vars::Vector{JuMP.VariableRef}
     original_obj::JuMP.AbstractJuMPScalar
@@ -95,7 +103,7 @@ function reformulate_model(
     z_upper = Inf
     M = typeof(model)
     best_result = nothing
-    init_results = _LOAIterationResult{M}[]
+    init_results = _LOAIterationResult[]
     for combo in combos
         result = _solve_loa_subproblem(
             model, combo, method)
@@ -329,7 +337,7 @@ function _solve_loa_subproblem(
     JuMP.optimize!(sub.model)
 
     if !JuMP.is_solved_and_feasible(sub.model)
-        return _LOAIterationResult{M}(
+        return _LOAIterationResult{M, Float64}(
             combo,
             Dict{JuMP.AbstractVariableRef, Float64}(),
             Dict{DisjunctConstraintRef{M}, Float64}(),
@@ -346,7 +354,7 @@ function _solve_loa_subproblem(
         has_d && (duals[orig] = JuMP.dual(sub_c))
     end
 
-    return _LOAIterationResult{M}(
+    return _LOAIterationResult{M, Float64}(
         combo, x_vals, duals,
         JuMP.objective_value(sub.model), true)
 end
@@ -405,7 +413,8 @@ function _build_loa_master(
     reformulate_model(
         master_model, BigM(method.M_value))
 
-    master = _LOAMaster{typeof(master_model)}(
+    master = _LOAMaster{
+        typeof(master_model), typeof(ref_map)}(
         master_model, ref_map,
         _build_bin_map(master_model, lv_map),
         JuMP.VariableRef[],
@@ -447,7 +456,7 @@ end
 #     - slack <= M*(1 - y)
 function _add_oa_cuts(
     master::_LOAMaster,
-    result::_LOAIterationResult{M},
+    result::_LOAIterationResult{M, <:Any},
     model::M,
     method::LOA
     ) where {M <: JuMP.AbstractModel}
