@@ -602,6 +602,59 @@ end
 #                        LOA FOR INFINITEMODEL
 ################################################################################
 
+# Collect all parameter functions referenced anywhere
+# in the model (objective, global constraints, and
+# disjunct constraints). Needed by LOA because the
+# subproblem and master copy the full model, not
+# just disjunct constraints.
+function _all_param_functions_full(
+    model::InfiniteOpt.InfiniteModel
+    )
+    pf_set = Set{InfiniteOpt.GeneralVariableRef}()
+
+    # Scan helper: walk an expression and collect pfs
+    _scan(expr) = begin
+        for v in InfiniteOpt.all_expression_variables(
+                expr)
+            dv = InfiniteOpt.dispatch_variable_ref(v)
+            if dv isa InfiniteOpt.ParameterFunctionRef
+                push!(pf_set, v)
+            elseif dv isa InfiniteOpt.MeasureRef
+                _scan(
+                    InfiniteOpt.measure_function(dv))
+            end
+        end
+    end
+
+    # Objective
+    _scan(JuMP.objective_function(model))
+
+    # All constraints (global + disjunct)
+    for (F, S) in JuMP.list_of_constraint_types(model)
+        F <: Union{
+            JuMP.VariableRef, _MOI.VariableIndex,
+            InfiniteOpt.GeneralVariableRef
+        } && continue
+        for cref in JuMP.all_constraints(model, F, S)
+            con = JuMP.constraint_object(cref)
+            _scan(con.func)
+        end
+    end
+
+    # Disjunct constraints
+    for (_, crefs) in DP._indicator_to_constraints(
+            model)
+        for cref in crefs
+            cref isa DP.DisjunctConstraintRef ||
+                continue
+            con = JuMP.constraint_object(cref)
+            _scan(con.func)
+        end
+    end
+
+    return pf_set
+end
+
 # Remap an expression using ref_map, rebuilding
 # measures (integrals) on the target model.
 function _remap_expression(
@@ -734,8 +787,9 @@ function DP._copy_subproblem(
         ref_map[d] = new_d
     end
 
-    # 4. Copy parameter functions from all disjuncts
-    pf_set = _all_param_functions(model)
+    # 4. Copy parameter functions from everywhere
+    # (objective, global cons, disjunct cons)
+    pf_set = _all_param_functions_full(model)
     for pf in pf_set
         fn = InfiniteOpt.raw_function(pf)
         prefs = InfiniteOpt.parameter_refs(pf)
@@ -928,8 +982,8 @@ function DP._build_loa_master(
         ref_map[d] = new_d
     end
 
-    # Copy parameter functions
-    pf_set = _all_param_functions(model)
+    # Copy parameter functions (full scan)
+    pf_set = _all_param_functions_full(model)
     for pf in pf_set
         fn = InfiniteOpt.raw_function(pf)
         prefs = InfiniteOpt.parameter_refs(pf)
