@@ -441,16 +441,23 @@ function _build_loa_master(
 end
 
 # Rebuild the augmented penalty objective.
-function _update_augmented_objective(master::_LOAMaster, method::LOA)
+function _update_augmented_objective(
+    master::_LOAMaster, method::LOA
+    )
     sgn = master.obj_sense == _MOI.MIN_SENSE ? 1 : -1
-    penalty = zero(JuMP.AffExpr)
+    T = JuMP.value_type(typeof(master.model))
+    V = JuMP.variable_ref_type(master.model)
+    penalty = zero(JuMP.GenericAffExpr{T, V})
     for s in master.slack_vars
-        JuMP.add_to_expression!(penalty, 1.0, s)
+        JuMP.add_to_expression!(
+            penalty, one(T), s)
     end
     new_obj = master.original_obj +
         sgn * method.OA_penalty_factor * penalty
-    JuMP.set_objective_function(master.model, new_obj)
-    JuMP.set_objective_sense(master.model, master.obj_sense)
+    JuMP.set_objective_function(
+        master.model, new_obj)
+    JuMP.set_objective_sense(
+        master.model, master.obj_sense)
     return
 end
 
@@ -676,24 +683,39 @@ _set_rhs(::Any) = 0.0
 #                       NO-GOOD CUT GENERATION
 ################################################################################
 function _add_no_good_cut(master::_LOAMaster, combo)
-    cut_expr = JuMP.AffExpr(0.0)
+    T = JuMP.value_type(typeof(master.model))
+    V = JuMP.variable_ref_type(master.model)
+    cut_expr = zero(JuMP.GenericAffExpr{T, V})
     for (ind, active) in combo
         bin_var = get(master.bin_map, ind, nothing)
         bin_var === nothing && continue
         if active
-            JuMP.add_to_expression!(cut_expr, -1.0, bin_var)
-            JuMP.add_to_expression!(cut_expr, 1.0)
+            JuMP.add_to_expression!(
+                cut_expr, -one(T), bin_var)
+            JuMP.add_to_expression!(
+                cut_expr, one(T))
         else
-            JuMP.add_to_expression!(cut_expr, 1.0, bin_var)
+            JuMP.add_to_expression!(
+                cut_expr, one(T), bin_var)
         end
     end
-    cref = JuMP.@constraint(master.model, cut_expr >= 1.0)
-    push!(_reformulation_constraints(master.model), cref)
+    cref = JuMP.@constraint(
+        master.model, cut_expr >= one(T))
+    push!(
+        _reformulation_constraints(master.model), cref)
 end
 
 ################################################################################
 #                     MASTER SOLUTION EXTRACTION
 ################################################################################
+# Extract mean binary value (handles both scalar
+# and per-support-point vector returns).
+function _mean_value(bv)
+    v = JuMP.value(bv)
+    return v isa AbstractVector ?
+        sum(v) / length(v) : Float64(v)
+end
+
 function _extract_combo(
     model::M, master::_LOAMaster
     ) where {M <: JuMP.AbstractModel}
@@ -702,8 +724,8 @@ function _extract_combo(
         disj_data.constraint.nested && continue
         for ind in disj_data.constraint.indicators
             bv = get(master.bin_map, ind, nothing)
-            combo[ind] =
-                bv !== nothing ? JuMP.value(bv) > 0.5 : false
+            combo[ind] = bv !== nothing ?
+                _mean_value(bv) > 0.5 : false
         end
     end
     return combo
