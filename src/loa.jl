@@ -258,11 +258,11 @@ end
 ################################################################################
 #                         NLP SUBPROBLEM
 ################################################################################
-# Build a submodel with only the given disjunct
-# constraints plus all global constraints. Returns
-# (GDPSubmodel, sub_crefs) where sub_crefs correspond
-# to the input constraints for dual extraction.
-function _copy_subproblem(
+# LOA dispatch of copy_model_with_constraints: builds
+# a submodel like MBM but also copies objective + global
+# constraints, relaxes integrality, and returns tracked
+# constraint refs for dual extraction.
+function copy_model_with_constraints(
     model::JuMP.AbstractModel,
     constraints::Vector{<:DisjunctConstraintRef},
     method::LOA
@@ -273,7 +273,6 @@ function _copy_subproblem(
     fwd_map = Dict{var_type, Vector{var_type}}()
     for var in decision_vars
         copy_var = variable_copy(sub_model, var)
-        # Relax integrality for NLP subproblem
         if JuMP.is_binary(copy_var)
             JuMP.unset_binary(copy_var)
         end
@@ -293,19 +292,7 @@ function _copy_subproblem(
     JuMP.@objective(sub_model, sense, new_obj)
 
     # Copy global (non-disjunct) constraints
-    for (F, S) in JuMP.list_of_constraint_types(model)
-        F <: Union{
-            JuMP.VariableRef, _MOI.VariableIndex
-        } && continue
-        for cref in JuMP.all_constraints(model, F, S)
-            cref isa DisjunctConstraintRef && continue
-            con = JuMP.constraint_object(cref)
-            new_f = _replace_variables_in_constraint(
-                con.func, flat_map)
-            JuMP.@constraint(
-                sub_model, new_f in con.set)
-        end
-    end
+    _copy_global_constraints(model, sub_model, flat_map)
 
     # Copy disjunct constraints (tracked for duals)
     sub_crefs = JuMP.ConstraintRef[]
@@ -328,6 +315,28 @@ function _copy_subproblem(
     )
 end
 
+# Copy all non-disjunct, non-variable-bound constraints
+# from model to sub_model using var_map for substitution.
+# Shared by LOA subproblem and master builders.
+function _copy_global_constraints(
+    model, sub_model, var_map
+    )
+    for (F, S) in JuMP.list_of_constraint_types(model)
+        F <: Union{
+            JuMP.VariableRef, _MOI.VariableIndex
+        } && continue
+        for cref in JuMP.all_constraints(model, F, S)
+            cref isa DisjunctConstraintRef && continue
+            con = JuMP.constraint_object(cref)
+            new_f = _replace_variables_in_constraint(
+                con.func, var_map)
+            JuMP.@constraint(
+                sub_model, new_f in con.set)
+        end
+    end
+    return
+end
+
 # Solve the NLP subproblem for a given combo.
 function _solve_loa_subproblem(
     model::M,
@@ -335,7 +344,7 @@ function _solve_loa_subproblem(
     method::LOA
     ) where {M <: JuMP.AbstractModel}
     active_crefs = _active_constraints(model, combo)
-    sub, sub_crefs = _copy_subproblem(
+    sub, sub_crefs = copy_model_with_constraints(
         model, active_crefs, method)
 
     JuMP.optimize!(sub.model)
@@ -367,11 +376,9 @@ end
 #                      NONLINEAR DISJUNCT HELPERS
 ################################################################################
 # True if a constraint function is nonlinear
-# (GenericNonlinearExpr or a QuadExpr with nonzero
-# quadratic terms).
+# (GenericNonlinearExpr only — quadratic constraints
+# are kept in the master for solvers that handle them).
 _is_nonlinear(::JuMP.GenericNonlinearExpr) = true
-_is_nonlinear(q::JuMP.GenericQuadExpr) =
-    !isempty(q.terms)
 _is_nonlinear(::Any) = false
 
 # True if model has any nonlinear disjunct constraints.

@@ -213,23 +213,56 @@ end
 
 # Collect all parameter function refs from all disjunct constraints in
 # the model.
+# Collect parameter functions from the model.
+# scan_all=false: only disjunct constraints (MBM/CP).
+# scan_all=true: also objective + global constraints
+# (LOA needs the full model).
 function _all_param_functions(
-    model::InfiniteOpt.InfiniteModel
+    model::InfiniteOpt.InfiniteModel;
+    scan_all::Bool = false
     )
     pf_set = Set{InfiniteOpt.GeneralVariableRef}()
-    for (_, crefs) in DP._indicator_to_constraints(model)
-        for cref in crefs
-            cref isa DP.DisjunctConstraintRef || continue
-            con = JuMP.constraint_object(cref)
-            for v in InfiniteOpt.all_expression_variables(
-                    con.func)
-                dv = InfiniteOpt.dispatch_variable_ref(v)
-                if dv isa InfiniteOpt.ParameterFunctionRef
-                    push!(pf_set, v)
-                end
+
+    _scan(expr) = begin
+        for v in InfiniteOpt.all_expression_variables(
+                expr)
+            dv = InfiniteOpt.dispatch_variable_ref(v)
+            if dv isa InfiniteOpt.ParameterFunctionRef
+                push!(pf_set, v)
+            elseif dv isa InfiniteOpt.MeasureRef
+                _scan(
+                    InfiniteOpt.measure_function(dv))
             end
         end
     end
+
+    if scan_all
+        _scan(JuMP.objective_function(model))
+        for (F, S) in JuMP.list_of_constraint_types(
+                model)
+            F <: Union{
+                JuMP.VariableRef, _MOI.VariableIndex,
+                InfiniteOpt.GeneralVariableRef
+            } && continue
+            for cref in JuMP.all_constraints(
+                    model, F, S)
+                con = JuMP.constraint_object(cref)
+                _scan(con.func)
+            end
+        end
+    end
+
+    # Always scan disjunct constraints
+    for (_, crefs) in DP._indicator_to_constraints(
+            model)
+        for cref in crefs
+            cref isa DP.DisjunctConstraintRef ||
+                continue
+            con = JuMP.constraint_object(cref)
+            _scan(con.func)
+        end
+    end
+
     return pf_set
 end
 
@@ -602,143 +635,56 @@ end
 #                        LOA FOR INFINITEMODEL
 ################################################################################
 
-# Collect all parameter functions referenced anywhere
-# in the model (objective, global constraints, and
-# disjunct constraints). Needed by LOA because the
-# subproblem and master copy the full model, not
-# just disjunct constraints.
-function _all_param_functions_full(
-    model::InfiniteOpt.InfiniteModel
+# InfiniteModel dispatch for _copy_global_constraints:
+# also skip GeneralVariableRef constraint types.
+function DP._copy_global_constraints(
+    model::InfiniteOpt.InfiniteModel,
+    sub_model, var_map
     )
-    pf_set = Set{InfiniteOpt.GeneralVariableRef}()
-
-    # Scan helper: walk an expression and collect pfs
-    _scan(expr) = begin
-        for v in InfiniteOpt.all_expression_variables(
-                expr)
-            dv = InfiniteOpt.dispatch_variable_ref(v)
-            if dv isa InfiniteOpt.ParameterFunctionRef
-                push!(pf_set, v)
-            elseif dv isa InfiniteOpt.MeasureRef
-                _scan(
-                    InfiniteOpt.measure_function(dv))
-            end
-        end
-    end
-
-    # Objective
-    _scan(JuMP.objective_function(model))
-
-    # All constraints (global + disjunct)
     for (F, S) in JuMP.list_of_constraint_types(model)
         F <: Union{
             JuMP.VariableRef, _MOI.VariableIndex,
             InfiniteOpt.GeneralVariableRef
         } && continue
         for cref in JuMP.all_constraints(model, F, S)
-            con = JuMP.constraint_object(cref)
-            _scan(con.func)
-        end
-    end
-
-    # Disjunct constraints
-    for (_, crefs) in DP._indicator_to_constraints(
-            model)
-        for cref in crefs
-            cref isa DP.DisjunctConstraintRef ||
+            cref isa DP.DisjunctConstraintRef &&
                 continue
             con = JuMP.constraint_object(cref)
-            _scan(con.func)
+            new_f = DP._replace_variables_in_constraint(
+                con.func, var_map)
+            JuMP.@constraint(
+                sub_model, new_f in con.set)
         end
     end
-
-    return pf_set
+    return
 end
 
-# Remap an expression using ref_map, rebuilding
-# measures (integrals) on the target model.
-function _remap_expression(
+# Extend _replace_variables_in_constraint to handle
+# InfiniteOpt measures (integrals). When a
+# GeneralVariableRef is a MeasureRef, rebuild the
+# integral with the remapped integrand and parameter.
+function DP._replace_variables_in_constraint(
     expr::InfiniteOpt.GeneralVariableRef,
-    ref_map::Dict, target_model
+    var_map::AbstractDict
     )
-    if haskey(ref_map, expr)
-        return ref_map[expr]
-    end
+    haskey(var_map, expr) && return var_map[expr]
     dv = InfiniteOpt.dispatch_variable_ref(expr)
     if dv isa InfiniteOpt.MeasureRef
         mf = InfiniteOpt.measure_function(dv)
         md = InfiniteOpt.measure_data(dv)
-        new_mf = _remap_expression(
-            mf, ref_map, target_model)
+        new_mf = DP._replace_variables_in_constraint(
+            mf, var_map)
         pref = InfiniteOpt.parameter_refs(md)
-        new_pref = ref_map[pref]
-        return InfiniteOpt.integral(
-            new_mf, new_pref)
+        new_pref = var_map[pref]
+        return InfiniteOpt.integral(new_mf, new_pref)
     end
-    return ref_map[expr]
-end
-
-function _remap_expression(
-    expr::JuMP.GenericAffExpr{C,
-        InfiniteOpt.GeneralVariableRef},
-    ref_map::Dict, target_model
-    ) where {C}
-    result = JuMP.GenericAffExpr{C,
-        InfiniteOpt.GeneralVariableRef}(
-        expr.constant)
-    for (var, coef) in expr.terms
-        new_var = _remap_expression(
-            var, ref_map, target_model)
-        JuMP.add_to_expression!(
-            result, coef, new_var)
-    end
-    return result
-end
-
-function _remap_expression(
-    expr::JuMP.GenericQuadExpr{C,
-        InfiniteOpt.GeneralVariableRef},
-    ref_map::Dict, target_model
-    ) where {C}
-    aff = _remap_expression(
-        expr.aff, ref_map, target_model)
-    result = JuMP.GenericQuadExpr(aff)
-    for (pair, coef) in expr.terms
-        va = _remap_expression(
-            pair.a, ref_map, target_model)
-        vb = _remap_expression(
-            pair.b, ref_map, target_model)
-        JuMP.add_to_expression!(
-            result, coef, va, vb)
-    end
-    return result
-end
-
-function _remap_expression(
-    expr::JuMP.GenericNonlinearExpr, ref_map::Dict,
-    target_model
-    )
-    new_args = Any[]
-    for a in expr.args
-        push!(new_args, _remap_expression(
-            a, ref_map, target_model))
-    end
-    return JuMP.GenericNonlinearExpr(
-        expr.head, new_args)
-end
-
-_remap_expression(x::Number, ::Dict, _) = x
-
-# Fallback: use _replace_variables_in_constraint
-function _remap_expression(expr, ref_map::Dict, _)
-    return DP._replace_variables_in_constraint(
-        expr, ref_map)
+    return var_map[expr]
 end
 
 # Build a mini InfiniteModel NLP subproblem with only the
 # given disjunct constraints + all global constraints,
 # transcribe to flat JuMP model for solving.
-function DP._copy_subproblem(
+function DP.copy_model_with_constraints(
     model::InfiniteOpt.InfiniteModel,
     constraints::Vector{<:DP.DisjunctConstraintRef},
     method::DP.LOA
@@ -790,7 +736,7 @@ function DP._copy_subproblem(
 
     # 4. Copy parameter functions from everywhere
     # (objective, global cons, disjunct cons)
-    pf_set = _all_param_functions_full(model)
+    pf_set = _all_param_functions(model; scan_all = true)
     for pf in pf_set
         fn = InfiniteOpt.raw_function(pf)
         prefs = InfiniteOpt.parameter_refs(pf)
@@ -803,24 +749,12 @@ function DP._copy_subproblem(
     # 5. Copy objective (rebuild measures if present)
     obj = JuMP.objective_function(model)
     sense = JuMP.objective_sense(model)
-    new_obj = _remap_expression(obj, ref_map, mini)
+    new_obj = DP._replace_variables_in_constraint(
+        obj, ref_map)
     JuMP.@objective(mini, sense, new_obj)
 
     # 6. Copy global (non-disjunct) constraints
-    for (F, S) in JuMP.list_of_constraint_types(model)
-        F <: Union{
-            JuMP.VariableRef, _MOI.VariableIndex,
-            InfiniteOpt.GeneralVariableRef
-        } && continue
-        for cref in JuMP.all_constraints(model, F, S)
-            cref isa DP.DisjunctConstraintRef &&
-                continue
-            con = JuMP.constraint_object(cref)
-            new_f = _remap_expression(
-                con.func, ref_map, mini)
-            JuMP.@constraint(mini, new_f in con.set)
-        end
-    end
+    DP._copy_global_constraints(model, mini, ref_map)
 
     # 7. Copy active disjunct constraints (tracked for
     #    dual extraction after transcription)
@@ -879,7 +813,7 @@ function DP._solve_loa_subproblem(
     )
     M = InfiniteOpt.InfiniteModel
     active_crefs = DP._active_constraints(model, combo)
-    sub, sub_crefs = DP._copy_subproblem(
+    sub, sub_crefs = DP.copy_model_with_constraints(
         model, active_crefs, method)
 
     JuMP.optimize!(sub.model)
@@ -991,7 +925,7 @@ function DP._build_loa_master(
     end
 
     # Copy parameter functions (full scan)
-    pf_set = _all_param_functions_full(model)
+    pf_set = _all_param_functions(model; scan_all = true)
     for pf in pf_set
         fn = InfiniteOpt.raw_function(pf)
         prefs = InfiniteOpt.parameter_refs(pf)
@@ -1004,26 +938,13 @@ function DP._build_loa_master(
     # Copy objective (rebuild measures if present)
     obj = JuMP.objective_function(model)
     sense = JuMP.objective_sense(model)
-    new_obj = _remap_expression(
-        obj, ref_map, master_inf)
+    new_obj = DP._replace_variables_in_constraint(
+        obj, ref_map)
     JuMP.@objective(master_inf, sense, new_obj)
 
     # Copy global constraints
-    for (F, S) in JuMP.list_of_constraint_types(model)
-        F <: Union{
-            JuMP.VariableRef, _MOI.VariableIndex,
-            InfiniteOpt.GeneralVariableRef
-        } && continue
-        for cref in JuMP.all_constraints(model, F, S)
-            cref isa DP.DisjunctConstraintRef &&
-                continue
-            con = JuMP.constraint_object(cref)
-            new_f = _remap_expression(
-                con.func, ref_map, master_inf)
-            JuMP.@constraint(
-                master_inf, new_f in con.set)
-        end
-    end
+    DP._copy_global_constraints(
+        model, master_inf, ref_map)
 
     # Copy GDP data manually
     _copy_gdp_for_loa(model, master_inf, ref_map)
