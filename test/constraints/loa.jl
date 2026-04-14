@@ -59,7 +59,8 @@ function test_no_good_cut()
         DP._build_bin_map(master_model, lv_map),
         JuMP.VariableRef[],
         JuMP.objective_function(master_model),
-        JuMP.objective_sense(master_model))
+        JuMP.objective_sense(master_model),
+        Tuple{Any, Any}[])
 
     combo = Dict(Y[1] => true, Y[2] => false)
 

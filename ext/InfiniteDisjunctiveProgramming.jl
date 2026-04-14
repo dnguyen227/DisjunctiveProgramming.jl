@@ -767,7 +767,8 @@ function DP._copy_subproblem(
             InfiniteOpt.Infinite(
                 Tuple(ref_map[p] for p in prefs)...)
         info = DP.get_variable_info(v;
-            has_binary = false, has_integer = false)
+            has_binary = false, has_integer = false,
+            has_start = false)
         props = DP.VariableProperties(
             info, "", nothing, var_type)
         ref_map[v] = DP.create_variable(mini, props)
@@ -931,6 +932,12 @@ function DP._build_loa_master(
     model::InfiniteOpt.InfiniteModel,
     init_results, method::DP.LOA
     )
+    # Capture nonlinear globals from original model
+    # (stored for OA cut generation; stripped from
+    # the master copy before BigM reformulation).
+    nl_globals = DP._nonlinear_global_constraints(
+        model)
+
     # Use copy_and_reformulate from CP path to get a
     # flat BigM-reformed copy. First strip nonlinear
     # disjuncts before reformulation.
@@ -961,9 +968,10 @@ function DP._build_loa_master(
         var_type = isempty(prefs) ? nothing :
             InfiniteOpt.Infinite(
                 Tuple(ref_map[p] for p in prefs)...)
+        info = DP.get_variable_info(
+            v; has_start = false)
         props = DP.VariableProperties(
-            DP.get_variable_info(v), JuMP.name(v),
-            nothing, var_type)
+            info, JuMP.name(v), nothing, var_type)
         ref_map[v] = DP.create_variable(
             master_inf, props)
     end
@@ -1020,8 +1028,10 @@ function DP._build_loa_master(
     # Copy GDP data manually
     _copy_gdp_for_loa(model, master_inf, ref_map)
 
-    # Strip nonlinear disjuncts, BigM-reform
+    # Strip nonlinear disjuncts and globals,
+    # then BigM-reform
     DP._remove_nonlinear_disjuncts(master_inf)
+    DP._remove_nonlinear_globals(master_inf)
     DP.reformulate_model(
         master_inf, DP.BigM(method.M_value))
 
@@ -1086,7 +1096,8 @@ function DP._build_loa_master(
         flat, oa_ref_map, bin_map,
         JuMP.VariableRef[],
         JuMP.objective_function(flat),
-        JuMP.objective_sense(flat))
+        JuMP.objective_sense(flat),
+        nl_globals)
 
     for result in init_results
         result.feasible && DP._add_oa_cuts(
@@ -1107,11 +1118,16 @@ function _copy_gdp_for_loa(
     orig_gdp = DP.gdp_data(model)
     copy_gdp = DP.gdp_data(copy)
 
-    # Logical variables (reuse same indices)
+    # Logical variables (reuse same indices).
+    # Create the binary backing variable with the
+    # same infinite parameters as the original
+    # logical var (if any) so transcription expands
+    # them per support point.
     lv_map = Dict{
         DP.LogicalVariableRef{InfiniteOpt.InfiniteModel},
         DP.LogicalVariableRef{InfiniteOpt.InfiniteModel}
         }()
+    orig_ind_to_bin = DP._indicator_to_binary(model)
     for (idx, var_data) in orig_gdp.logical_variables
         new_data = DP.LogicalVariableData(
             var_data.variable, var_data.name)
@@ -1119,9 +1135,32 @@ function _copy_gdp_for_loa(
         orig_lv = DP.LogicalVariableRef(model, idx)
         copy_lv = DP.LogicalVariableRef(copy, idx)
         lv_map[orig_lv] = copy_lv
-        # Create binary backing variable
-        bvref = JuMP.@variable(copy,
-            base_name = var_data.name, binary = true)
+        # Preserve infinite parameters of the
+        # original binary (if infinite logical).
+        orig_bv = orig_ind_to_bin[orig_lv]
+        var_type = nothing
+        if orig_bv isa
+                InfiniteOpt.GeneralVariableRef
+            prefs = InfiniteOpt.parameter_refs(
+                orig_bv)
+            if !isempty(prefs)
+                var_type = InfiniteOpt.Infinite(
+                    Tuple(ref_map[p] for p in prefs)...)
+            end
+        end
+        if var_type === nothing
+            bvref = JuMP.@variable(copy,
+                base_name = var_data.name,
+                binary = true)
+        else
+            info = JuMP.VariableInfo(
+                false, NaN, false, NaN, false, NaN,
+                false, NaN, true, false)
+            props = DP.VariableProperties(
+                info, var_data.name,
+                nothing, var_type)
+            bvref = DP.create_variable(copy, props)
+        end
         DP._indicator_to_binary(copy)[copy_lv] = bvref
     end
 
@@ -1166,14 +1205,23 @@ function _copy_gdp_for_loa(
         ] = DP.DisjunctionRef(copy, idx)
     end
 
-    # Exactly1 constraints
-    for (d_ref, lc_ref) in orig_gdp.exactly1_constraints
+    # Logical constraints (including exactly-1)
+    for (idx, lc_data) in orig_gdp.logical_constraints
+        old_con = lc_data.constraint
+        new_func =
+            DP._replace_variables_in_constraint(
+                old_con.func, lv_map)
+        new_con = JuMP.build_constraint(
+            error, new_func, old_con.set)
+        JuMP.add_constraint(
+            copy, new_con, lc_data.name)
+    end
+
+    # Exactly1 constraints mapping (reuse same index
+    # since logical_constraints were added in order)
+    for (d_ref, lc_ref) in
+            orig_gdp.exactly1_constraints
         new_d = disj_map[d_ref]
-        # Create the exactly1 logical constraint
-        new_inds = [lv_map[ind]
-            for ind in orig_gdp.disjunctions[
-                JuMP.index(d_ref)
-            ].constraint.indicators]
         copy_gdp.exactly1_constraints[new_d] =
             DP.LogicalConstraintRef(copy,
                 DP.LogicalConstraintIndex(
@@ -1269,6 +1317,50 @@ function DP._add_oa_cuts(
             end
         end
     end
+
+    # OA cuts for nonlinear global constraints.
+    # Per-support-point: linearize on flat vars.
+    K = isempty(oa_fwd) ? 0 :
+        length(first(values(oa_fwd)))
+    for (func, set) in master.nl_globals
+        rhs = DP._set_rhs(set)
+        signs = DP._oa_global_signs(set)
+        for k in 1:K
+            # Flat variable map at support k
+            flat_sub = Dict(
+                v => fvs[min(k, length(fvs))]
+                for (v, fvs) in oa_fwd)
+            # xk and identity ref_map on flat vars
+            xk_k = Dict{
+                JuMP.AbstractVariableRef, Float64}()
+            ref_k = Dict{Any, Any}()
+            for (v, fvs) in oa_fwd
+                haskey(result.x_values, v) || continue
+                xv = result.x_values[v]
+                idx = min(k, length(xv))
+                fidx = min(k, length(fvs))
+                xk_k[fvs[fidx]] = xv[idx]
+                ref_k[fvs[fidx]] = fvs[fidx]
+            end
+            flat_func =
+                DP._replace_variables_in_constraint(
+                    func, flat_sub)
+            lin_expr = DP._linearize_at(
+                flat_func, xk_k, ref_k)
+            for s in signs
+                slack = JuMP.@variable(master.model,
+                    lower_bound = 0.0,
+                    upper_bound = method.max_slack)
+                push!(master.slack_vars, slack)
+                lhs = s * (lin_expr - rhs) - slack
+                cref = JuMP.@constraint(
+                    master.model, lhs <= 0)
+                push!(
+                    DP._reformulation_constraints(
+                        master.model), cref)
+            end
+        end
+    end
 end
 
 # Final model setup for InfiniteModel LOA.
@@ -1276,7 +1368,10 @@ function DP._finalize_model(
     model::InfiniteOpt.InfiniteModel,
     best_result, method::DP.LOA
     )
-    if !DP._has_nonlinear_disjuncts(model)
+    has_nl = DP._has_nonlinear_disjuncts(model) ||
+        !isempty(
+            DP._nonlinear_global_constraints(model))
+    if !has_nl
         DP.reformulate_model(
             model, DP.BigM(method.M_value))
         JuMP.set_optimizer(
@@ -1288,8 +1383,10 @@ function DP._finalize_model(
     # indicators to best combo
     nl_active = Tuple{Any, Any}[]
     if best_result !== nothing
+        @info "FINALIZE combo: $(best_result.combo)"
         for (ind, active) in best_result.combo
             bv = DP._indicator_to_binary(model)[ind]
+            @info "  $ind => $active, bv=$bv"
             if bv isa JuMP.AbstractVariableRef
                 JuMP.fix(bv, active ? 1.0 : 0.0;
                     force = true)
@@ -1305,6 +1402,17 @@ function DP._finalize_model(
                     JuMP.index(cref)].constraint
                 DP._is_nonlinear(c.func) &&
                     push!(nl_active, (c.func, c.set))
+            end
+        end
+        # Set start values from best subproblem
+        # (per-support-point → InfiniteOpt vars)
+        for (v, vals) in best_result.x_values
+            JuMP.is_valid(model, v) || continue
+            vals isa AbstractVector || continue
+            isempty(vals) && continue
+            try
+                JuMP.set_start_value(v, vals[1])
+            catch
             end
         end
     end

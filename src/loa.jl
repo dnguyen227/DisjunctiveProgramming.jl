@@ -77,6 +77,9 @@ end
 # Master problem state.
 # R is the ref_map type: GenericReferenceMap for
 # finite, Dict for infinite (flat transcribed).
+# nl_globals holds (func, set) pairs from the
+# original model for nonlinear non-disjunct
+# constraints (stripped from master, OA-cut instead).
 mutable struct _LOAMaster{
     M <: JuMP.AbstractModel, R
     }
@@ -86,6 +89,7 @@ mutable struct _LOAMaster{
     slack_vars::Vector{JuMP.VariableRef}
     original_obj::JuMP.AbstractJuMPScalar
     obj_sense::_MOI.OptimizationSense
+    nl_globals::Vector{Tuple{Any, Any}}
 end
 
 ################################################################################
@@ -362,8 +366,12 @@ end
 ################################################################################
 #                      NONLINEAR DISJUNCT HELPERS
 ################################################################################
-# True if a constraint function is nonlinear.
+# True if a constraint function is nonlinear
+# (GenericNonlinearExpr or a QuadExpr with nonzero
+# quadratic terms).
 _is_nonlinear(::JuMP.GenericNonlinearExpr) = true
+_is_nonlinear(q::JuMP.GenericQuadExpr) =
+    !isempty(q.terms)
 _is_nonlinear(::Any) = false
 
 # True if model has any nonlinear disjunct constraints.
@@ -372,6 +380,46 @@ function _has_nonlinear_disjuncts(model)
         _is_nonlinear(dc.constraint.func) && return true
     end
     return false
+end
+
+# Nonlinear non-disjunct constraints as (func, set)
+# pairs from the original model. These need to be
+# linearized via OA cuts in the master.
+function _nonlinear_global_constraints(model)
+    result = Tuple{Any, Any}[]
+    for (F, S) in JuMP.list_of_constraint_types(model)
+        F <: Union{
+            JuMP.VariableRef, _MOI.VariableIndex
+        } && continue
+        for cref in JuMP.all_constraints(model, F, S)
+            cref isa DisjunctConstraintRef && continue
+            con = JuMP.constraint_object(cref)
+            _is_nonlinear(con.func) || continue
+            push!(result, (con.func, con.set))
+        end
+    end
+    return result
+end
+
+# Delete nonlinear non-disjunct constraints from model.
+# Used on the master copy before BigM reformulation.
+function _remove_nonlinear_globals(model)
+    to_delete = Any[]
+    for (F, S) in JuMP.list_of_constraint_types(model)
+        F <: Union{
+            JuMP.VariableRef, _MOI.VariableIndex
+        } && continue
+        for cref in JuMP.all_constraints(model, F, S)
+            cref isa DisjunctConstraintRef && continue
+            con = JuMP.constraint_object(cref)
+            _is_nonlinear(con.func) || continue
+            push!(to_delete, cref)
+        end
+    end
+    for cref in to_delete
+        JuMP.delete(model, cref)
+    end
+    return
 end
 
 # Remove nonlinear disjunct constraints from GDP data
@@ -404,12 +452,18 @@ end
 function _build_loa_master(
     model::M, init_results, method::LOA
     ) where {M <: JuMP.AbstractModel}
+    # Capture nonlinear globals from original model
+    # before copying (need original var refs so
+    # linearization maps via master.ref_map).
+    nl_globals = _nonlinear_global_constraints(model)
+
     master_model, ref_map, lv_map =
         copy_gdp_model(model)
     JuMP.set_optimizer(
         master_model, method.mip_optimizer)
     JuMP.set_silent(master_model)
     _remove_nonlinear_disjuncts(master_model)
+    _remove_nonlinear_globals(master_model)
     reformulate_model(
         master_model, BigM(method.M_value))
 
@@ -419,7 +473,8 @@ function _build_loa_master(
         _build_bin_map(master_model, lv_map),
         JuMP.VariableRef[],
         JuMP.objective_function(master_model),
-        JuMP.objective_sense(master_model))
+        JuMP.objective_sense(master_model),
+        nl_globals)
 
     for result in init_results
         result.feasible && _add_oa_cuts(
@@ -510,6 +565,47 @@ function _add_oa_cuts(
                     master.model), cref)
         end
     end
+
+    # OA cuts for nonlinear global constraints
+    # (unconditional: no indicator gating).
+    for (func, set) in master.nl_globals
+        _add_global_oa_cut(
+            master, func, set, result, method)
+    end
+end
+
+# Sign coefficients for global OA cuts based on
+# constraint set type. Equality needs both directions.
+_oa_global_signs(::_MOI.LessThan) = (1,)
+_oa_global_signs(::_MOI.GreaterThan) = (-1,)
+_oa_global_signs(::_MOI.EqualTo) = (1, -1)
+_oa_global_signs(::Any) = ()
+
+# Add unconditional OA cut(s) for a nonlinear global
+# constraint at the current subproblem solution.
+# Form: sign * (lin_expr - rhs) - slack <= 0
+function _add_global_oa_cut(
+    master::_LOAMaster,
+    func, set,
+    result::_LOAIterationResult,
+    method::LOA
+    )
+    lin_expr = _linearize_at(
+        func, result.x_values, master.ref_map)
+    rhs = _set_rhs(set)
+    for s in _oa_global_signs(set)
+        slack = JuMP.@variable(master.model,
+            lower_bound = 0.0,
+            upper_bound = method.max_slack)
+        push!(master.slack_vars, slack)
+        lhs = s * (lin_expr - rhs) - slack
+        cref = JuMP.@constraint(
+            master.model, lhs <= 0)
+        push!(
+            _reformulation_constraints(master.model),
+            cref)
+    end
+    return
 end
 
 ################################################################################
@@ -718,7 +814,10 @@ end
 # linear ones, then re-add the nonlinear constraints
 # directly with an NLP solver.
 function _finalize_model(model, best_result, method)
-    if !_has_nonlinear_disjuncts(model)
+    has_nl = _has_nonlinear_disjuncts(model) ||
+        !isempty(
+            _nonlinear_global_constraints(model))
+    if !has_nl
         # Pure linear/quadratic: standard BigM
         reformulate_model(model, BigM(method.M_value))
         return
