@@ -506,7 +506,9 @@ function _replace_variables_in_constraint(
     W = _var_ref_type(T, var_map)
     new_aff = zero(JuMP.GenericAffExpr{C, W})
     for (var, coef) in fun.terms
-        JuMP.add_to_expression!(new_aff, coef, var_map[var])
+        JuMP.add_to_expression!(new_aff, coef,
+            _replace_variables_in_constraint(
+                var, var_map))
     end
     new_aff.constant = new_aff.constant + fun.constant
     return new_aff
@@ -519,10 +521,15 @@ function _replace_variables_in_constraint(
     W = _var_ref_type(typeof(fun.aff), var_map)
     new_quad = zero(JuMP.GenericQuadExpr{C, W})
     for (vars, coef) in fun.terms
-        JuMP.add_to_expression!(new_quad,
-            coef * var_map[vars.a] * var_map[vars.b])
+        va = _replace_variables_in_constraint(
+            vars.a, var_map)
+        vb = _replace_variables_in_constraint(
+            vars.b, var_map)
+        JuMP.add_to_expression!(
+            new_quad, coef * va * vb)
     end
-    new_aff = _replace_variables_in_constraint(fun.aff, var_map)
+    new_aff = _replace_variables_in_constraint(
+        fun.aff, var_map)
     JuMP.add_to_expression!(new_quad, new_aff)
     return new_quad
 end
