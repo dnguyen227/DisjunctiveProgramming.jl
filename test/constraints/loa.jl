@@ -55,10 +55,7 @@ function test_no_good_cut()
     DP.reformulate_model(master_model, BigM(1e9))
 
     master = DP._LOAMaster(
-        master_model, ref_map,
-        DP._build_bin_map(master_model, lv_map),
-        JuMP.VariableRef[],
-        JuMP.objective_function(master_model),
+        master_model, ref_map, lv_map,
         JuMP.objective_sense(master_model),
         Tuple{Any, Any}[])
 
@@ -142,7 +139,7 @@ end
 
 function test_loa_error_fallback()
     method = LOA(HiGHS.Optimizer)
-    @test_throws ErrorException DP.reformulate_model(42, method)
+    @test_throws MethodError DP.reformulate_model(42, method)
 end
 
 function test_linearize_nonlinear_exp()

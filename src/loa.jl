@@ -67,15 +67,17 @@ struct _LOAIterationResult{M <: JuMP.AbstractModel, X}
 end
 
 # Master problem state. R is the ref_map type: GenericReferenceMap for
-# finite, Dict for infinite (flat transcribed). nl_globals holds
+# finite, Dict for infinite (flat transcribed). lv_map maps original
+# indicators to master indicators — use with `binary_variable` or
+# `JuMP.value` to access the master's binary/solution. nl_globals holds
 # (func, set) pairs from the original model for nonlinear non-disjunct
-# constraints (stripped from master, OA-cut instead).
+# constraints (stripped from master, OA-cut instead). The master's
+# objective is augmented incrementally by `_apply_slack_penalty!` as
+# slacks are created in `_add_oa_cuts`.
 mutable struct _LOAMaster{M <: JuMP.AbstractModel, R}
     model::M
     ref_map::R
-    bin_map::Dict{LogicalVariableRef, Any}
-    slack_vars::Vector{JuMP.VariableRef}
-    original_obj::JuMP.AbstractJuMPScalar
+    lv_map::Dict{LogicalVariableRef{M}, LogicalVariableRef{M}}
     obj_sense::_MOI.OptimizationSense
     nl_globals::Vector{Tuple{Any, Any}}
 end
@@ -109,7 +111,6 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
     # Step 4: Main LOA loop
     z_lower = -Inf
     for iter in 1:method.max_iter
-        _update_augmented_objective(master, method)
         JuMP.optimize!(master.model, ignore_optimize_hook = true)
         if !JuMP.is_solved_and_feasible(master.model)
             break
@@ -191,22 +192,6 @@ end
 ################################################################################
 #                        SUBPROBLEM HELPERS
 ################################################################################
-# Map from original indicator to master binary variable.
-function _build_bin_map(master_model, lv_map)
-    ind_to_bin = _indicator_to_binary(master_model)
-    bin_map = Dict{LogicalVariableRef, Any}()
-    for (orig_ind, mapped_ind) in lv_map
-        if haskey(ind_to_bin, mapped_ind)
-            bv = ind_to_bin[mapped_ind]
-            bin_map[orig_ind] =
-                bv isa JuMP.AbstractVariableRef ? bv : nothing
-        else
-            bin_map[orig_ind] = nothing
-        end
-    end
-    return bin_map
-end
-
 # Active disjunct constraint refs for a given combo.
 function _active_constraints(
     model::M,
@@ -238,17 +223,10 @@ function copy_model_with_constraints(
     var_type = JuMP.variable_ref_type(model)
     sub_model = _copy_model(model)
     decision_vars = collect_all_vars(model)
-    fwd_map = Dict{var_type, Vector{var_type}}()
-    for var in decision_vars
-        copy_var = variable_copy(sub_model, var)
-        if JuMP.is_binary(copy_var)
-            JuMP.unset_binary(copy_var)
-        end
-        if JuMP.is_integer(copy_var)
-            JuMP.unset_integer(copy_var)
-        end
-        fwd_map[var] = [copy_var]
-    end
+    fwd_map = Dict{var_type, Vector{var_type}}(
+        var => [variable_copy(sub_model, var)]
+        for var in decision_vars)
+    JuMP.relax_integrality(sub_model)
     flat_map = Dict(v => ws[1] for (v, ws) in fwd_map)
 
     # Copy objective
@@ -275,22 +253,6 @@ function copy_model_with_constraints(
     return (
         GDPSubmodel(sub_model, decision_vars, fwd_map), sub_crefs
     )
-end
-
-# Copy all non-disjunct, non-variable-bound constraints from model to
-# sub_model using var_map for substitution. Shared by LOA subproblem and
-# master builders.
-function _copy_global_constraints(model, sub_model, var_map)
-    for (F, S) in JuMP.list_of_constraint_types(model)
-        F <: Union{JuMP.VariableRef, _MOI.VariableIndex} && continue
-        for cref in JuMP.all_constraints(model, F, S)
-            cref isa DisjunctConstraintRef && continue
-            con = JuMP.constraint_object(cref)
-            new_f = _replace_variables_in_constraint(con.func, var_map)
-            JuMP.@constraint(sub_model, new_f in con.set)
-        end
-    end
-    return
 end
 
 # Solve the NLP subproblem for a given combo.
@@ -348,25 +310,11 @@ function _has_nonlinear_disjuncts(model)
     return false
 end
 
-# Nonlinear non-disjunct constraints as (func, set) pairs from the
-# original model. These need to be linearized via OA cuts in the master.
-function _nonlinear_global_constraints(model)
-    result = Tuple{Any, Any}[]
-    for (F, S) in JuMP.list_of_constraint_types(model)
-        F <: Union{JuMP.VariableRef, _MOI.VariableIndex} && continue
-        for cref in JuMP.all_constraints(model, F, S)
-            cref isa DisjunctConstraintRef && continue
-            con = JuMP.constraint_object(cref)
-            _is_nonlinear(con.func) || continue
-            push!(result, (con.func, con.set))
-        end
-    end
-    return result
-end
-
-# Delete nonlinear non-disjunct constraints from model. Used on the
-# master copy before BigM reformulation.
-function _remove_nonlinear_globals(model)
+# Nonlinear non-disjunct constraints as (func, set) pairs. If
+# `delete=true`, also removes them from the model (used on the master
+# copy before BigM reformulation).
+function _nonlinear_global_constraints(model; delete::Bool = false)
+    pairs = Tuple{Any, Any}[]
     to_delete = Any[]
     for (F, S) in JuMP.list_of_constraint_types(model)
         F <: Union{JuMP.VariableRef, _MOI.VariableIndex} && continue
@@ -374,13 +322,14 @@ function _remove_nonlinear_globals(model)
             cref isa DisjunctConstraintRef && continue
             con = JuMP.constraint_object(cref)
             _is_nonlinear(con.func) || continue
-            push!(to_delete, cref)
+            push!(pairs, (con.func, con.set))
+            delete && push!(to_delete, cref)
         end
     end
     for cref in to_delete
         JuMP.delete(model, cref)
     end
-    return
+    return pairs
 end
 
 # Remove nonlinear disjunct constraints from GDP data so that BigM only
@@ -421,14 +370,11 @@ function _build_loa_master(
     JuMP.set_optimizer(master_model, method.mip_optimizer)
     JuMP.set_silent(master_model)
     _remove_nonlinear_disjuncts(master_model)
-    _remove_nonlinear_globals(master_model)
+    _nonlinear_global_constraints(master_model; delete = true)
     reformulate_model(master_model, BigM(method.M_value))
 
     master = _LOAMaster{typeof(master_model), typeof(ref_map)}(
-        master_model, ref_map,
-        _build_bin_map(master_model, lv_map),
-        JuMP.VariableRef[],
-        JuMP.objective_function(master_model),
+        master_model, ref_map, lv_map,
         JuMP.objective_sense(master_model),
         nl_globals
     )
@@ -440,24 +386,16 @@ function _build_loa_master(
     return master
 end
 
-# Rebuild the augmented penalty objective.
-function _update_augmented_objective(
-    master::_LOAMaster, method::LOA
+# Add `sgn * OA_penalty_factor * slack` to the master objective, where
+# `sgn = +1` for MIN (penalty increases cost) and `-1` for MAX.
+function _apply_slack_penalty!(
+    master::_LOAMaster, method::LOA, slack
     )
     sgn = master.obj_sense == _MOI.MIN_SENSE ? 1 : -1
-    T = JuMP.value_type(typeof(master.model))
-    V = JuMP.variable_ref_type(master.model)
-    penalty = zero(JuMP.GenericAffExpr{T, V})
-    for s in master.slack_vars
-        JuMP.add_to_expression!(
-            penalty, one(T), s)
-    end
-    new_obj = master.original_obj +
-        sgn * method.OA_penalty_factor * penalty
     JuMP.set_objective_function(
-        master.model, new_obj)
-    JuMP.set_objective_sense(
-        master.model, master.obj_sense)
+        master.model,
+        JuMP.objective_function(master.model) +
+        sgn * method.OA_penalty_factor * slack)
     return
 end
 
@@ -478,13 +416,11 @@ function _add_oa_cuts(
     for (ind, active) in result.combo
         !active && continue
         haskey(_indicator_to_constraints(model), ind) || continue
-        bin_var = get(master.bin_map, ind, nothing)
+        bin_var = binary_variable(master.lv_map[ind])
 
         for orig_cref in _indicator_to_constraints(model)[ind]
             orig_cref isa DisjunctConstraintRef || continue
-            con_data = _disjunct_constraints(model)[
-                JuMP.index(orig_cref)
-            ]
+            con_data = _disjunct_constraints(model)[JuMP.index(orig_cref)]
             con = con_data.constraint
             # Skip linear constraints (no OA needed)
             con.func isa JuMP.GenericAffExpr && continue
@@ -504,25 +440,33 @@ function _add_oa_cuts(
                 lower_bound = 0.0,
                 upper_bound = method.max_slack
             )
-            push!(master.slack_vars, slack)
+            _apply_slack_penalty!(master, method, slack)
 
             lhs = s * (lin_expr - rhs) - slack
-            if bin_var !== nothing
-                cref = JuMP.@constraint(
-                    master.model,
-                    lhs <= method.M_value * (1 - bin_var)
-                )
-            else
-                cref = JuMP.@constraint(master.model, lhs <= 0)
-            end
+            cref = JuMP.@constraint(
+                master.model,
+                lhs <= method.M_value * (1 - bin_var)
+            )
             push!(_reformulation_constraints(master.model), cref)
         end
     end
 
-    # OA cuts for nonlinear global constraints (unconditional: no
-    # indicator gating).
+    # Unconditional OA cuts for nonlinear global constraints (no
+    # indicator gating, form: sign * (lin_expr - rhs) - slack <= 0).
+    # Equality sets get both signs; other sets get one.
     for (func, set) in master.nl_globals
-        _add_global_oa_cut(master, func, set, result, method)
+        lin_expr = _linearize_at(
+            func, result.x_values, master.ref_map)
+        rhs = _set_rhs(set)
+        for s in _oa_global_signs(set)
+            slack = JuMP.@variable(master.model,
+                lower_bound = 0.0,
+                upper_bound = method.max_slack)
+            _apply_slack_penalty!(master, method, slack)
+            lhs = s * (lin_expr - rhs) - slack
+            cref = JuMP.@constraint(master.model, lhs <= 0)
+            push!(_reformulation_constraints(master.model), cref)
+        end
     end
 end
 
@@ -532,32 +476,6 @@ _oa_global_signs(::_MOI.LessThan) = (1,)
 _oa_global_signs(::_MOI.GreaterThan) = (-1,)
 _oa_global_signs(::_MOI.EqualTo) = (1, -1)
 _oa_global_signs(::Any) = ()
-
-# Add unconditional OA cut(s) for a nonlinear global constraint at the
-# current subproblem solution. Form:
-#   sign * (lin_expr - rhs) - slack <= 0
-function _add_global_oa_cut(
-    master::_LOAMaster,
-    func,
-    set,
-    result::_LOAIterationResult,
-    method::LOA
-    )
-    lin_expr = _linearize_at(func, result.x_values, master.ref_map)
-    rhs = _set_rhs(set)
-    for s in _oa_global_signs(set)
-        slack = JuMP.@variable(
-            master.model,
-            lower_bound = 0.0,
-            upper_bound = method.max_slack
-        )
-        push!(master.slack_vars, slack)
-        lhs = s * (lin_expr - rhs) - slack
-        cref = JuMP.@constraint(master.model, lhs <= 0)
-        push!(_reformulation_constraints(master.model), cref)
-    end
-    return
-end
 
 ################################################################################
 #                       LINEARIZATION HELPERS
@@ -673,10 +591,10 @@ function _linearize_at(
     return result
 end
 
-# Extract RHS value from an MOI set.
-_set_rhs(set::_MOI.LessThan) = set.upper
-_set_rhs(set::_MOI.GreaterThan) = set.lower
-_set_rhs(set::_MOI.EqualTo) = set.value
+# Extract RHS value from an MOI set. Interval and other sets fall back
+# to 0.0 (unused by current OA cut dispatches).
+_set_rhs(set::Union{_MOI.LessThan, _MOI.GreaterThan, _MOI.EqualTo}) =
+    _MOI.constant(set)
 _set_rhs(::Any) = 0.0
 
 ################################################################################
@@ -687,8 +605,8 @@ function _add_no_good_cut(master::_LOAMaster, combo)
     V = JuMP.variable_ref_type(master.model)
     cut_expr = zero(JuMP.GenericAffExpr{T, V})
     for (ind, active) in combo
-        bin_var = get(master.bin_map, ind, nothing)
-        bin_var === nothing && continue
+        haskey(master.lv_map, ind) || continue
+        bin_var = binary_variable(master.lv_map[ind])
         if active
             JuMP.add_to_expression!(
                 cut_expr, -one(T), bin_var)
@@ -708,14 +626,6 @@ end
 ################################################################################
 #                     MASTER SOLUTION EXTRACTION
 ################################################################################
-# Extract mean binary value (handles both scalar
-# and per-support-point vector returns).
-function _mean_value(bv)
-    v = JuMP.value(bv)
-    return v isa AbstractVector ?
-        sum(v) / length(v) : Float64(v)
-end
-
 function _extract_combo(
     model::M, master::_LOAMaster
     ) where {M <: JuMP.AbstractModel}
@@ -723,9 +633,7 @@ function _extract_combo(
     for (_, disj_data) in _disjunctions(model)
         disj_data.constraint.nested && continue
         for ind in disj_data.constraint.indicators
-            bv = get(master.bin_map, ind, nothing)
-            combo[ind] = bv !== nothing ?
-                _mean_value(bv) > 0.5 : false
+            combo[ind] = JuMP.value(master.lv_map[ind])
         end
     end
     return combo
@@ -757,8 +665,7 @@ function _finalize_model(model, best_result, method)
         return
     end
 
-    # Collect active nonlinear constraints and fix all indicators before
-    # stripping.
+    # Fix indicators, collect active nonlinear constraints.
     nl_active = Tuple{Any, Any}[]
     if best_result !== nothing
         for (ind, active) in best_result.combo
@@ -766,16 +673,10 @@ function _finalize_model(model, best_result, method)
             if bv isa JuMP.AbstractVariableRef
                 JuMP.fix(bv, active ? 1.0 : 0.0; force = true)
             end
-            !active && continue
-            haskey(_indicator_to_constraints(model), ind) || continue
-            for cref in _indicator_to_constraints(model)[ind]
-                cref isa DisjunctConstraintRef || continue
-                c = _disjunct_constraints(model)[
-                    JuMP.index(cref)
-                ].constraint
-                _is_nonlinear(c.func) &&
-                    push!(nl_active, (c.func, c.set))
-            end
+        end
+        for cref in _active_constraints(model, best_result.combo)
+            c = _disjunct_constraints(model)[JuMP.index(cref)].constraint
+            _is_nonlinear(c.func) && push!(nl_active, (c.func, c.set))
         end
         for (var, val) in best_result.x_values
             JuMP.is_valid(model, var) &&
@@ -800,14 +701,4 @@ function _finalize_model(model, best_result, method)
         push!(_reformulation_constraints(model), cref)
     end
     return
-end
-
-################################################################################
-#                          ERROR FALLBACK
-################################################################################
-function reformulate_model(::M, ::LOA) where {M}
-    error(
-        "reformulate_model not implemented for " *
-        "model type `$(M)` with LOA."
-    )
 end

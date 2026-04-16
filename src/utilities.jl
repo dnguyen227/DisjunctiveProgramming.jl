@@ -62,6 +62,21 @@ function reformulate_and_relax(
     return sub, undo_relax
 end
 
+# Copy all non-disjunct, non-variable-bound constraints from model to
+# sub_model using var_map for variable substitution.
+function _copy_global_constraints(model, sub_model, var_map)
+    for (F, S) in JuMP.list_of_constraint_types(model)
+        F <: Union{JuMP.VariableRef, _MOI.VariableIndex} && continue
+        for cref in JuMP.all_constraints(model, F, S)
+            cref isa DisjunctConstraintRef && continue
+            con = JuMP.constraint_object(cref)
+            new_f = _replace_variables_in_constraint(con.func, var_map)
+            JuMP.@constraint(sub_model, new_f in con.set)
+        end
+    end
+    return
+end
+
 ################################################################################
 #                              ALL VARIABLES
 ################################################################################

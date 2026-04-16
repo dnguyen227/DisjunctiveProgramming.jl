@@ -888,7 +888,8 @@ function DP._build_loa_master(
 
     # Strip nonlinear disjuncts and globals, BigM-reform
     DP._remove_nonlinear_disjuncts(master_inf)
-    DP._remove_nonlinear_globals(master_inf)
+    DP._nonlinear_global_constraints(
+        master_inf; delete = true)
     DP.reformulate_model(
         master_inf, DP.BigM(method.M_value))
 
@@ -896,7 +897,7 @@ function DP._build_loa_master(
         master_inf, method.mip_optimizer)
     JuMP.set_silent(master_inf)
 
-    # Build bin_map: orig indicator → master binary
+    # Build lv_map: orig indicator → master indicator
     lv_map = Dict{
         DP.LogicalVariableRef{InfiniteOpt.InfiniteModel},
         DP.LogicalVariableRef{InfiniteOpt.InfiniteModel}
@@ -905,13 +906,6 @@ function DP._build_loa_master(
     for (idx, _) in orig_gdp.logical_variables
         lv_map[DP.LogicalVariableRef(model, idx)] =
             DP.LogicalVariableRef(master_inf, idx)
-    end
-    bin_map = Dict{DP.LogicalVariableRef, Any}()
-    ind_to_bin = DP._indicator_to_binary(master_inf)
-    for (orig_ind, copy_ind) in lv_map
-        bv = get(ind_to_bin, copy_ind, nothing)
-        bin_map[orig_ind] = bv isa
-            JuMP.AbstractVariableRef ? bv : nothing
     end
 
     # ref_map for OA cuts: orig var → master var
@@ -925,9 +919,7 @@ function DP._build_loa_master(
 
     master = DP._LOAMaster{
         typeof(master_inf), typeof(oa_ref_map)}(
-        master_inf, oa_ref_map, bin_map,
-        JuMP.VariableRef[],
-        JuMP.objective_function(master_inf),
+        master_inf, oa_ref_map, lv_map,
         JuMP.objective_sense(master_inf),
         nl_globals)
 
@@ -1119,7 +1111,7 @@ function DP._add_oa_cuts(
         !active && continue
         haskey(DP._indicator_to_constraints(
             model), ind) || continue
-        bin_var = get(master.bin_map, ind, nothing)
+        bin_var = DP.binary_variable(master.lv_map[ind])
 
         for orig_cref in DP._indicator_to_constraints(
                 model)[ind]
@@ -1146,17 +1138,12 @@ function DP._add_oa_cuts(
                 upper_bound = method.max_slack,
                 variable_type = InfiniteOpt.Infinite(
                     prefs...))
-            push!(master.slack_vars, slack)
+            DP._apply_slack_penalty!(master, method, slack)
 
             lhs = s * (lin_expr - rhs) - slack
-            if bin_var !== nothing
-                cref = JuMP.@constraint(
-                    master.model, lhs <=
-                    method.M_value * (1 - bin_var))
-            else
-                cref = JuMP.@constraint(
-                    master.model, lhs <= 0)
-            end
+            cref = JuMP.@constraint(
+                master.model, lhs <=
+                method.M_value * (1 - bin_var))
             push!(DP._reformulation_constraints(
                 master.model), cref)
         end
@@ -1172,7 +1159,7 @@ function DP._add_oa_cuts(
                 upper_bound = method.max_slack,
                 variable_type = InfiniteOpt.Infinite(
                     prefs...))
-            push!(master.slack_vars, slack)
+            DP._apply_slack_penalty!(master, method, slack)
             lhs = s * (lin_expr - rhs) - slack
             cref = JuMP.@constraint(
                 master.model, lhs <= 0)
@@ -1180,6 +1167,26 @@ function DP._add_oa_cuts(
                 master.model), cref)
         end
     end
+end
+
+# _extract_combo override: JuMP.value(lv) returns a
+# BitVector for InfiniteModel logicals (one entry per
+# support). Collapse via mean-threshold for the combo.
+function DP._extract_combo(
+    model::InfiniteOpt.InfiniteModel,
+    master::DP._LOAMaster
+    )
+    combo = Dict{
+        DP.LogicalVariableRef{InfiniteOpt.InfiniteModel},
+        Bool}()
+    for (_, disj_data) in DP._disjunctions(model)
+        disj_data.constraint.nested && continue
+        for ind in disj_data.constraint.indicators
+            vals = JuMP.value(master.lv_map[ind])
+            combo[ind] = sum(vals) / length(vals) > 0.5
+        end
+    end
+    return combo
 end
 
 # Final model setup for InfiniteModel LOA.
