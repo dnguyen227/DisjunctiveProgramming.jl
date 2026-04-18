@@ -64,7 +64,7 @@ function test_no_good_cut()
     num_cons_before = length(JuMP.all_constraints(
         master_model;
         include_variable_in_set_constraints = false))
-    DP._add_no_good_cut(master, combo)
+    DP._add_no_good_cut(model, master, combo)
     num_cons_after = length(JuMP.all_constraints(
         master_model;
         include_variable_in_set_constraints = false))

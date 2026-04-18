@@ -125,8 +125,8 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
             z_upper = result.objective
             best_result = result
         end
-        result.feasible && _add_oa_cuts(master, result, model, method)
-        _add_no_good_cut(master, combo)
+        result.feasible && _add_oa_cuts(model, master, result, method)
+        _add_no_good_cut(model, master, combo)
     end
 
     # Step 5: Final reformulation
@@ -145,9 +145,9 @@ function _set_covering_combos(model::JuMP.AbstractModel)
     per_disj = Vector{Tuple{DisjunctionIndex, LVR}}[]
     for (idx, disj_data) in _disjunctions(model)
         disj_data.constraint.nested && continue
-        push!(per_disj, [
-            (idx, ind) for ind in disj_data.constraint.indicators
-        ])
+        push!(per_disj,
+            [(idx, ind) for ind in disj_data.constraint.indicators]
+        )
     end
     isempty(per_disj) && return Dict{LVR, Bool}[]
 
@@ -250,9 +250,7 @@ function copy_model_with_constraints(
 
     JuMP.set_optimizer(sub_model, method.nlp_optimizer)
     JuMP.set_silent(sub_model)
-    return (
-        GDPSubmodel(sub_model, decision_vars, fwd_map), sub_crefs
-    )
+    return (GDPSubmodel(sub_model, decision_vars, fwd_map), sub_crefs)
 end
 
 # Solve the NLP subproblem for a given combo.
@@ -263,8 +261,7 @@ function _solve_loa_subproblem(
     ) where {M <: JuMP.AbstractModel}
     active_crefs = _active_constraints(model, combo)
     sub, sub_crefs = copy_model_with_constraints(
-        model, active_crefs, method
-    )
+        model, active_crefs, method)
 
     JuMP.optimize!(sub.model)
 
@@ -360,8 +357,7 @@ end
 #                      MASTER PROBLEM BUILDER
 ################################################################################
 function _build_loa_master(
-    model::M, init_results, method::LOA
-    ) where {M <: JuMP.AbstractModel}
+    model::M, init_results, method::LOA) where {M <: JuMP.AbstractModel}
     # Capture nonlinear globals from original model before copying (need
     # original var refs so linearization maps via master.ref_map).
     nl_globals = _nonlinear_global_constraints(model)
@@ -380,17 +376,15 @@ function _build_loa_master(
     )
 
     for result in init_results
-        result.feasible && _add_oa_cuts(master, result, model, method)
-        _add_no_good_cut(master, result.combo)
+        result.feasible && _add_oa_cuts(model, master, result, method)
+        _add_no_good_cut(model, master, result.combo)
     end
     return master
 end
 
 # Add `sgn * OA_penalty_factor * slack` to the master objective, where
 # `sgn = +1` for MIN (penalty increases cost) and `-1` for MAX.
-function _apply_slack_penalty!(
-    master::_LOAMaster, method::LOA, slack
-    )
+function _apply_slack_penalty!(master::_LOAMaster, method::LOA, slack)
     sgn = master.obj_sense == _MOI.MIN_SENSE ? 1 : -1
     JuMP.set_objective_function(
         master.model,
@@ -406,9 +400,9 @@ end
 # form:
 #   sign(s * λ) * [r(xk) - rhs + ∇r(xk)ᵀ(x - xk)] - slack <= M*(1 - y)
 function _add_oa_cuts(
+    model::M,
     master::_LOAMaster,
     result::_LOAIterationResult{M, <:Any},
-    model::M,
     method::LOA
     ) where {M <: JuMP.AbstractModel}
     sgn = master.obj_sense == _MOI.MIN_SENSE ? -1 : 1
@@ -429,8 +423,7 @@ function _add_oa_cuts(
             dual_val === nothing && continue
 
             lin_expr = _linearize_at(
-                con.func, result.x_values, master.ref_map
-            )
+                con.func, result.x_values, master.ref_map)
             rhs = _set_rhs(con.set)
             s = sign(sgn * dual_val)
             s == 0 && continue
@@ -455,11 +448,11 @@ function _add_oa_cuts(
     # indicator gating, form: sign * (lin_expr - rhs) - slack <= 0).
     # Equality sets get both signs; other sets get one.
     for (func, set) in master.nl_globals
-        lin_expr = _linearize_at(
-            func, result.x_values, master.ref_map)
+        lin_expr = _linearize_at(func, result.x_values, master.ref_map)
         rhs = _set_rhs(set)
         for s in _oa_global_signs(set)
-            slack = JuMP.@variable(master.model,
+            slack = JuMP.@variable(
+                master.model,
                 lower_bound = 0.0,
                 upper_bound = method.max_slack)
             _apply_slack_penalty!(master, method, slack)
@@ -481,9 +474,7 @@ _oa_global_signs(::Any) = ()
 #                       LINEARIZATION HELPERS
 ################################################################################
 # First-order Taylor linearization of QuadExpr at xk.
-function _linearize_at(
-    func::JuMP.GenericQuadExpr, xk::Dict, ref_map
-    )
+function _linearize_at(func::JuMP.GenericQuadExpr, xk::Dict, ref_map)
     grad = Dict{Any, Float64}()
     for (var, coef) in func.aff.terms
         grad[var] = get(grad, var, 0.0) + coef
@@ -552,9 +543,7 @@ _to_nlp_expr(x::Number, ::Dict) = x
 
 # Linearize a GenericNonlinearExpr at xk via MOI.Nonlinear reverse-mode
 # AD.
-function _linearize_at(
-    func::JuMP.GenericNonlinearExpr, xk::Dict, ref_map
-    )
+function _linearize_at(func::JuMP.GenericNonlinearExpr, xk::Dict, ref_map)
     vars = JuMP.AbstractVariableRef[]
     _interrogate_variables(v -> push!(vars, v), func)
     unique!(vars)
@@ -569,8 +558,7 @@ function _linearize_at(
     _MOI.Nonlinear.set_objective(nlp, _to_nlp_expr(func, idx))
     ord = [_MOI.VariableIndex(i) for i in 1:n]
     evaluator = _MOI.Nonlinear.Evaluator(
-        nlp, _MOI.Nonlinear.SparseReverseMode(), ord
-    )
+        nlp, _MOI.Nonlinear.SparseReverseMode(), ord)
     _MOI.initialize(evaluator, [:Grad])
 
     xk_vec = [get(xk, v, zero(T)) for v in vars]
@@ -600,7 +588,7 @@ _set_rhs(::Any) = 0.0
 ################################################################################
 #                       NO-GOOD CUT GENERATION
 ################################################################################
-function _add_no_good_cut(master::_LOAMaster, combo)
+function _add_no_good_cut(model, master::_LOAMaster, combo)
     T = JuMP.value_type(typeof(master.model))
     V = JuMP.variable_ref_type(master.model)
     cut_expr = zero(JuMP.GenericAffExpr{T, V})
@@ -608,27 +596,21 @@ function _add_no_good_cut(master::_LOAMaster, combo)
         haskey(master.lv_map, ind) || continue
         bin_var = binary_variable(master.lv_map[ind])
         if active
-            JuMP.add_to_expression!(
-                cut_expr, -one(T), bin_var)
-            JuMP.add_to_expression!(
-                cut_expr, one(T))
+            JuMP.add_to_expression!(cut_expr, -one(T), bin_var)
+            JuMP.add_to_expression!(cut_expr, one(T))
         else
-            JuMP.add_to_expression!(
-                cut_expr, one(T), bin_var)
+            JuMP.add_to_expression!(cut_expr, one(T), bin_var)
         end
     end
-    cref = JuMP.@constraint(
-        master.model, cut_expr >= one(T))
-    push!(
-        _reformulation_constraints(master.model), cref)
+    cref = JuMP.@constraint(master.model, cut_expr >= one(T))
+    push!(_reformulation_constraints(master.model), cref)
 end
 
 ################################################################################
 #                     MASTER SOLUTION EXTRACTION
 ################################################################################
 function _extract_combo(
-    model::M, master::_LOAMaster
-    ) where {M <: JuMP.AbstractModel}
+    model::M, master::_LOAMaster) where {M <: JuMP.AbstractModel}
     combo = Dict{LogicalVariableRef{M}, Bool}()
     for (_, disj_data) in _disjunctions(model)
         disj_data.constraint.nested && continue

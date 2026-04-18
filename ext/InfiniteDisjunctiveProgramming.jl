@@ -925,8 +925,8 @@ function DP._build_loa_master(
 
     for result in init_results
         result.feasible && DP._add_oa_cuts(
-            master, result, model, method)
-        DP._add_no_good_cut(master, result.combo)
+            model, master, result, method)
+        DP._add_no_good_cut(model, master, result.combo)
     end
     return master
 end
@@ -1039,11 +1039,11 @@ end
 # into parameter functions for linearization
 # coefficients, producing infinite OA constraints.
 function DP._add_oa_cuts(
+    model::InfiniteOpt.InfiniteModel,
     master::DP._LOAMaster{
         <:InfiniteOpt.InfiniteModel, <:Any},
     result::DP._LOAIterationResult{
         InfiniteOpt.InfiniteModel, Vector{Float64}},
-    model::InfiniteOpt.InfiniteModel,
     method::DP.LOA
     )
     sgn = master.obj_sense ==
