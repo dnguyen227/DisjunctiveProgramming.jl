@@ -380,5 +380,211 @@ function DP.add_cut(
     InfiniteOpt.set_transformation_backend_ready(model, true)
     return
 end
+################################################################################
+#                       LOA FOR INFINITEMODEL
+################################################################################
+# Dispatch overrides for InfiniteModel. The base LOA algorithm in src/loa.jl
+# is written for finite (scalar) models; these overrides handle transcription
+# to a flat master and per-support binary/variable indexing.
+
+# Helper: map an InfiniteOpt var to its flat master var(s) via transcription +
+# copy_map. Returns a vector for infinite vars, scalar for finite.
+function _tv_map(v, copy_map)
+    tv = InfiniteOpt.transformation_variable(v)
+    return tv isa AbstractArray ? [copy_map[fv] for fv in vec(tv)] : copy_map[tv]
+end
+
+# Convert InfiniteModel x_values to flat-var x_values (for objective OA cut).
+function _flat_xk(model::InfiniteOpt.InfiniteModel, x_values)
+    fxk = Dict{JuMP.VariableRef, Float64}()
+    for (v, val) in x_values
+        tv = InfiniteOpt.transformation_variable(v)
+        if tv isa AbstractArray
+            vals = val isa AbstractVector ? val : fill(Float64(val), length(tv))
+            for (i, fv) in enumerate(vec(tv))
+                fxk[fv] = vals[i]
+            end
+        else
+            fxk[tv] = val isa Number ? Float64(val) : Float64(first(val))
+        end
+    end
+    return fxk
+end
+
+#per-support dispatch methods: the base DP.jl LOA code calls scalar-form
+#helpers; these array methods let the same code path handle vector-valued
+#bin_map / var_map / x_values / active entries without any extra branches
+#in the base file.
+
+DP.fix_fv(bvs::AbstractArray, val::Bool) =
+    (for bv in bvs; DP.fix_fv(bv, val); end; return)
+DP.fix_fv(bvs::AbstractArray, val::AbstractArray) =
+    (for (bv, v) in zip(bvs, val); DP.fix_fv(bv, v); end; return)
+DP.unfix_fv(bvs::AbstractArray) =
+    (for bv in bvs; DP.unfix_fv(bv); end; return)
+
+DP.any_active(v::AbstractVector{Bool}) = any(v)
+
+#combo extraction: round per-support binary values to a Vector{Bool}
+DP.combo_val(bvs::AbstractArray) = Bool.(round.(JuMP.value.(bvs)))
+
+#no-good cut: fold one scalar term per (binary, active) pair. The scalar-
+#active method handles the set-covering phase where combos are Bool-valued.
+DP.add_ng_terms(cut, bvs::AbstractArray, active::Bool) =
+    DP.add_ng_terms(cut, bvs, fill(active, length(bvs)))
+function DP.add_ng_terms(cut, bvs::AbstractArray, actives::AbstractArray)
+    for (bv, a) in zip(bvs, actives)
+        DP.add_ng_terms(cut, bv, a)
+    end
+    return
+end
+
+#OA cut sites: one site per active support, with per-support restrictions
+#of `x_values` and `var_map`
+DP.cut_sites(bvs::AbstractArray, active::Bool, x_values, var_map, d) =
+    DP.cut_sites(bvs, fill(active, length(bvs)), x_values, var_map, d)
+function DP.cut_sites(
+    bvs::AbstractArray, actives::AbstractArray,
+    x_values, var_map, d
+    )
+    sites = Any[]
+    for k in 1:length(bvs)
+        actives[k] || continue
+        smap_k = Dict{Any, Any}(
+            v => (mv isa AbstractVector ? mv[k] : mv)
+            for (v, mv) in var_map)
+        x_k = Dict{Any, Any}(
+            v => (xv isa AbstractVector ? xv[k] : xv)
+            for (v, xv) in x_values)
+        d_k = d isa AbstractVector ? d[k] : d
+        push!(sites, (bvs[k], x_k, smap_k, d_k))
+    end
+    return sites
+end
+
+#detect number of supports from a bin_map; used below in `build_loa_master`
+function _detect_K(bin_map)
+    for (_, bvs) in bin_map
+        bvs isa AbstractVector && return length(bvs)
+    end
+    return 1
+end
+
+#transcribe the BigM'd InfiniteModel to flat, copy it, create alpha_oa.
+#Number of supports K is stashed in `master.model.ext[:_loa_K]` for the
+#per-support OA cut and combo overrides below.
+function DP.build_loa_master(model::InfiniteOpt.InfiniteModel, method::DP.LOA)
+    InfiniteOpt.build_transformation_backend!(model)
+    flat = InfiniteOpt.transformation_model(model)
+    orig_obj = JuMP.objective_function(flat)
+    master, copy_map = JuMP.copy_model(flat)
+    JuMP.set_optimizer(master, method.mip_optimizer)
+    JuMP.set_silent(master)
+    bin_map = Dict{DP.LogicalVariableRef, Any}()
+    for (ind, bv) in DP._indicator_to_binary(model)
+        bin_map[ind] = _tv_map(bv, copy_map)
+    end
+    var_map = Dict{InfiniteOpt.GeneralVariableRef, Any}()
+    for v in DP.collect_all_vars(model)
+        var_map[v] = _tv_map(v, copy_map)
+    end
+    #also store a flat→master copy_map for objective OA cuts
+    flat_copy_map = Dict{JuMP.VariableRef, JuMP.VariableRef}()
+    for v in JuMP.all_variables(flat)
+        flat_copy_map[v] = copy_map[v]
+    end
+    obj_sense = JuMP.objective_sense(master)
+    alpha_oa = JuMP.@variable(master, base_name = "alpha_oa")
+    JuMP.@objective(master, obj_sense, alpha_oa)
+    m = DP._LOAMaster(master, bin_map, var_map, obj_sense, orig_obj,
+        alpha_oa, flat_copy_map)
+    master.ext[:_loa_K] = _detect_K(bin_map)
+    master.ext[:_loa_flat_copy_map] = flat_copy_map
+    return m
+end
+
+#fix per-support via point equality constraints
+function DP.fix_combo_binaries(model::InfiniteOpt.InfiniteModel, combo)
+    crefs = InfiniteOpt.InfOptConstraintRef[]
+    for (ind, val) in combo
+        bv = DP._indicator_to_binary(model)[ind]
+        if val isa Bool
+            JuMP.fix(bv, val ? 1.0 : 0.0; force = true)
+        else
+            sups = InfiniteOpt.supports(first(InfiniteOpt.parameter_refs(bv)))
+            for (k, s) in enumerate(vec(sups))
+                push!(crefs,
+                    JuMP.@constraint(model, bv(s) == (val[k] ? 1.0 : 0.0)))
+            end
+        end
+    end
+    model.ext[:_loa_fix_crefs] = crefs
+end
+
+function DP.unfix_combo_binaries(model::InfiniteOpt.InfiniteModel, combo)
+    if haskey(model.ext, :_loa_fix_crefs)
+        for c in model.ext[:_loa_fix_crefs]
+            JuMP.is_valid(model, c) && JuMP.delete(model, c)
+        end
+        delete!(model.ext, :_loa_fix_crefs)
+    end
+    for (ind, val) in combo
+        val isa Bool || continue
+        bv = DP._indicator_to_binary(model)[ind]
+        JuMP.is_fixed(bv) && JuMP.unfix(bv)
+    end
+end
+
+#Transcribe the BigM'd InfiniteModel, then hand off to the base
+#`copy_model_with_constraints` on the flat model. fwd_map is rekeyed to
+#InfiniteModel vars for use by `_extract_*_x_values`; obj_ref_map stays
+#keyed by flat vars (the flat-level objective OA cut lives there).
+function DP.copy_model_with_constraints(
+    model::InfiniteOpt.InfiniteModel, method::DP.LOA
+    )
+    InfiniteOpt.build_transformation_backend!(model)
+    flat = InfiniteOpt.transformation_model(model)
+    base = DP.copy_model_with_constraints(flat, method)
+    fwd_map = Dict{InfiniteOpt.GeneralVariableRef, Any}()
+    for v in DP.collect_all_vars(model)
+        fwd_map[v] = _tv_map(v, base.fwd_map)
+    end
+    return DP._LOAFeasSubmodel(base.model, fwd_map, base.fwd_map)
+end
+
+#read per-support JuMP values from either a vector of flat vars or a
+#single scalar. Dispatch handles both transformation_variable (may be
+#N-dim) and fwd_map (already flat) shapes.
+_read_values(v::AbstractArray) = Float64[JuMP.value(fv) for fv in vec(v)]
+_read_values(v) = Float64(JuMP.value(v))
+
+#extract per-support x-values from the InfiniteModel NLP; objective
+#x-values are keyed by the flat transcription vars for the objective cut
+function DP.extract_primary_x_values(model::InfiniteOpt.InfiniteModel)
+    x_vals = Dict{JuMP.AbstractVariableRef, Any}()
+    for v in DP.collect_all_vars(model)
+        JuMP.is_fixed(v) && continue
+        x_vals[v] = _read_values(InfiniteOpt.transformation_variable(v))
+    end
+    return x_vals, _flat_xk(model, x_vals)
+end
+
+#extract per-support x-values from the flat feas submodel. x_vals keys are
+#InfiniteModel vars (via fwd_map); obj_x_values keys are flat vars.
+function DP.extract_feas_x_values(
+    model::InfiniteOpt.InfiniteModel, feas::DP._LOAFeasSubmodel
+    )
+    x_vals = Dict{JuMP.AbstractVariableRef, Any}()
+    for v in DP.collect_all_vars(model)
+        JuMP.is_fixed(v) && continue
+        haskey(feas.fwd_map, v) || continue
+        x_vals[v] = _read_values(feas.fwd_map[v])
+    end
+    obj_xv = Dict{JuMP.VariableRef, Float64}()
+    for (flat_v, feas_v) in feas.obj_ref_map
+        obj_xv[flat_v] = Float64(JuMP.value(feas_v))
+    end
+    return x_vals, obj_xv
+end
 
 end
