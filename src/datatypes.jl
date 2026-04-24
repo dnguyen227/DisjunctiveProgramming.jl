@@ -473,25 +473,24 @@ end
 """
     GDPSubmodel{M, V, W}
 
-A unified submodel wrapper used by MBM and cutting plane
-reformulations. It encapsulates a flat JuMP optimization
-submodel built from a single disjunct's feasible region,
-along with mappings back to the original model's variables.
+A JuMP submodel paired with the parent model's decision variables
+and a map from each parent variable to its submodel representation.
 
 ## Fields
-- `model::M`: The JuMP submodel representing a disjunct's
-   feasible region (constraints and variable bounds).
-- `decision_vars::Vector{V}`: Ordered decision variables in
-   the submodel, matching the original model's ordering.
-- `fwd_map::Dict{V, Vector{W}}`: Forward map from original
-   model variables to their submodel counterparts.
+- `model::M`: The JuMP submodel.
+- `decision_vars::Vector{V}`: Parent-model decision variables in
+   the order used by the submodel.
+- `fwd_map::Dict{V, W}`: Map from each parent-model variable to
+   its submodel counterpart. `W` can be a single variable
+   reference (1:1 copy) or a collection of references (e.g. one
+   per transcription support).
 """
 struct GDPSubmodel{M <: JuMP.AbstractModel,
                    V <: JuMP.AbstractVariableRef,
-                   W <: JuMP.AbstractVariableRef}
+                   W}
     model::M
     decision_vars::Vector{V}
-    fwd_map::Dict{V, Vector{W}}
+    fwd_map::Dict{V, W}
 end
 
 """

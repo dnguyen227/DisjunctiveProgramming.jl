@@ -435,9 +435,9 @@ end
 
 #OA cut sites: one site per active support, with per-support restrictions
 #of `x_values` and `var_map`
-DP.cut_sites(bvs::AbstractArray, active::Bool, x_values, var_map, d) =
-    DP.cut_sites(bvs, fill(active, length(bvs)), x_values, var_map, d)
-function DP.cut_sites(
+DP.cut_info(bvs::AbstractArray, active::Bool, x_values, var_map, d) =
+    DP.cut_info(bvs, fill(active, length(bvs)), x_values, var_map, d)
+function DP.cut_info(
     bvs::AbstractArray, actives::AbstractArray,
     x_values, var_map, d
     )
@@ -490,8 +490,9 @@ function DP.build_loa_master(model::InfiniteOpt.InfiniteModel, method::DP.LOA)
     obj_sense = JuMP.objective_sense(master)
     alpha_oa = JuMP.@variable(master, base_name = "alpha_oa")
     JuMP.@objective(master, obj_sense, alpha_oa)
-    m = DP._LOAMaster(master, bin_map, var_map, obj_sense, orig_obj,
-        alpha_oa, flat_copy_map)
+    m = (model = master, bin_map = bin_map, var_map = var_map,
+        obj_sense = obj_sense, orig_obj = orig_obj,
+        alpha_oa = alpha_oa, obj_ref_map = flat_copy_map)
     master.ext[:_loa_K] = _detect_K(bin_map)
     master.ext[:_loa_flat_copy_map] = flat_copy_map
     return m
@@ -530,20 +531,30 @@ function DP.unfix_combo_binaries(model::InfiniteOpt.InfiniteModel, combo)
 end
 
 #Transcribe the BigM'd InfiniteModel, then hand off to the base
-#`copy_model_with_constraints` on the flat model. fwd_map is rekeyed to
-#InfiniteModel vars for use by `_extract_*_x_values`; obj_ref_map stays
-#keyed by flat vars (the flat-level objective OA cut lives there).
+#`copy_model_with_constraints` on the flat model. `disjunct_crefs`
+#are InfiniteModel-level refs; for the InfiniteOpt path we pass an
+#empty Vector and the base includes every non-bound flat constraint
+#(flat has no GDPData so no reformulation-constraint set to skip),
+#giving us the whole transcribed+BigM'd model. Per-combo flat pruning
+#is deferred. fwd_map is rekeyed to InfiniteModel vars for use by
+#`read_*_solution`; obj_ref_map stays keyed by flat vars (the
+#flat-level objective OA cut lives there).
 function DP.copy_model_with_constraints(
-    model::InfiniteOpt.InfiniteModel, method::DP.LOA
+    model::InfiniteOpt.InfiniteModel,
+    disjunct_crefs::Vector{<:DP.DisjunctConstraintRef},
+    method::DP.LOA
     )
     InfiniteOpt.build_transformation_backend!(model)
     flat = InfiniteOpt.transformation_model(model)
-    base = DP.copy_model_with_constraints(flat, method)
+    flat_crefs = DP.DisjunctConstraintRef{typeof(flat)}[]
+    base = DP.copy_model_with_constraints(flat, flat_crefs, method)
     fwd_map = Dict{InfiniteOpt.GeneralVariableRef, Any}()
-    for v in DP.collect_all_vars(model)
-        fwd_map[v] = _tv_map(v, base.fwd_map)
+    decision_vars = DP.collect_all_vars(model)
+    for v in decision_vars
+        fwd_map[v] = _tv_map(v, base.sub.fwd_map)
     end
-    return DP._LOAFeasSubmodel(base.model, fwd_map, base.fwd_map)
+    return (sub = DP.GDPSubmodel(base.sub.model, decision_vars, fwd_map),
+        obj_ref_map = base.sub.fwd_map)
 end
 
 #read per-support JuMP values from either a vector of flat vars or a
@@ -554,7 +565,7 @@ _read_values(v) = Float64(JuMP.value(v))
 
 #extract per-support x-values from the InfiniteModel NLP; objective
 #x-values are keyed by the flat transcription vars for the objective cut
-function DP.extract_primary_x_values(model::InfiniteOpt.InfiniteModel)
+function DP.read_primary_solution(model::InfiniteOpt.InfiniteModel)
     x_vals = Dict{JuMP.AbstractVariableRef, Any}()
     for v in DP.collect_all_vars(model)
         JuMP.is_fixed(v) && continue
@@ -565,15 +576,10 @@ end
 
 #extract per-support x-values from the flat feas submodel. x_vals keys are
 #InfiniteModel vars (via fwd_map); obj_x_values keys are flat vars.
-function DP.extract_feas_x_values(
-    model::InfiniteOpt.InfiniteModel, feas::DP._LOAFeasSubmodel
+function DP.read_feas_solution(
+    model::InfiniteOpt.InfiniteModel, feas
     )
-    x_vals = Dict{JuMP.AbstractVariableRef, Any}()
-    for v in DP.collect_all_vars(model)
-        JuMP.is_fixed(v) && continue
-        haskey(feas.fwd_map, v) || continue
-        x_vals[v] = _read_values(feas.fwd_map[v])
-    end
+    x_vals = DP.extract_solution(feas.sub)
     obj_xv = Dict{JuMP.VariableRef, Float64}()
     for (flat_v, feas_v) in feas.obj_ref_map
         obj_xv[flat_v] = Float64(JuMP.value(feas_v))

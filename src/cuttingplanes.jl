@@ -18,17 +18,6 @@ function extract_solution(model::JuMP.AbstractModel)
         v => [JuMP.value(v)] for v in dvars)
 end
 
-# Extract solution from a GDPSubmodel (SEP path).
-function extract_solution(sub::GDPSubmodel)
-    V = eltype(sub.decision_vars)
-    T = JuMP.value_type(typeof(sub.model))
-    sol = Dict{V, Vector{T}}()
-    for var in sub.decision_vars
-        sol[var] = JuMP.value.(sub.fwd_map[var])
-    end
-    return sol
-end
-
 # Set quadratic separation objective: min Σ (x_k - rBM_k)².
 function _set_separation_objective(
     sub::GDPSubmodel,
