@@ -51,7 +51,7 @@ function test_no_good_cut()
     @disjunction(model, Y)
 
     DP.reformulate_model(model, BigM(1e9))
-    master = DP._build_loa_master(
+    master = DP.build_loa_master(
         model, LOA(HiGHS.Optimizer))
     master_model = master.model
 

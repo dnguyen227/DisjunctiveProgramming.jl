@@ -35,40 +35,6 @@ struct LOA{O, P} <: AbstractReformulationMethod
 end
 
 ################################################################################
-#                          DATA STRUCTURES
-################################################################################
-# Master MILP state. orig_obj is the original objective (for OA cuts);
-# alpha_oa replaces it (Türkay & Grossmann 1996). obj_ref_map maps the
-# variables in orig_obj to master variables.
-mutable struct _LOAMaster{M <: JuMP.AbstractModel, B, V}
-    model::M
-    bin_map::B
-    var_map::V
-    obj_sense::_MOI.OptimizationSense
-    orig_obj::Any
-    alpha_oa::Any
-    obj_ref_map::Any
-end
-
-# Feasibility-restoration submodel (Viswanathan & Grossmann 1990, NLPF).
-# Standalone model with a shared scalar slack `u` embedded into every JuMP
-# constraint and `min u` as the objective. When the primary NLP is
-# infeasible, binaries are fixed here and the submodel is solved to
-# produce a least-infeasible point for OA cut generation. Keeping it
-# separate leaves the original NLP model clean (no `u`, no slackened
-# constraints).
-#
-# fwd_map: original-model var -> feas var, used for binary fixing and
-# value extraction.
-# obj_ref_map: original-objective var -> feas var, used to linearize the
-# original objective at the feas point.
-struct _LOAFeasSubmodel{M <: JuMP.AbstractModel}
-    model::M
-    fwd_map::Any
-    obj_ref_map::Any
-end
-
-################################################################################
 #                           MAIN ALGORITHM
 ################################################################################
 function reformulate_model(model::JuMP.AbstractModel, method::LOA)
@@ -76,16 +42,8 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
     combos = _set_covering_combos(model)
     reformulate_model(model, BigM(method.M_value))
 
-    #build the feasibility-restoration submodel as a separate copy, then
-    #embed the shared scalar slack `u` in every constraint (V&G 1990,
-    #NLPF). The original model stays clean: no slacks, no integrality
-    #relaxation, no objective change.
-    feas = copy_model_with_constraints(model, method)
-    _embed_feas_slack(feas)
-
     master = build_loa_master(model, method)
     reform_map = _build_reform_map(model)
-    JuMP.relax_integrality(model)
     JuMP.set_optimizer(model, method.nlp_optimizer)
     JuMP.set_silent(model)
 
@@ -93,8 +51,12 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
     best_obj = _worst_obj(sense_token)
     is_better(o) = _is_better(sense_token, o, best_obj)
     best_result = nothing
+
+    #Initialization Procedure (Türkay & Grossmann 1996 §2.2): solve the
+    #set-covering NLPs to seed the master with at least one OA cut per
+    #disjunct before the main iteration.
     for combo in combos
-        result = _solve_nlp(model, combo, method, reform_map, feas)
+        result = _solve_nlp(model, combo, method, reform_map)
         _add_no_good_cut(model, master, combo)
         _add_oa_cuts(model, master, result, method)
         if result.feasible && is_better(result.objective)
@@ -110,7 +72,7 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
         master_bound = JuMP.objective_value(master.model)
         _loa_converged(best_obj, master_bound, sense_token, method) && break
         combo = _extract_combo(model, master)
-        result = _solve_nlp(model, combo, method, reform_map, feas)
+        result = _solve_nlp(model, combo, method, reform_map)
         _add_no_good_cut(model, master, combo)
         _add_oa_cuts(model, master, result, method)
         if result.feasible && is_better(result.objective)
@@ -120,6 +82,8 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
     end
 
     _finalize_model(model, best_result)
+    _set_solution_method(model, method)
+    _set_ready_to_optimize(model, true)
     return
 end
 
@@ -137,7 +101,20 @@ end
 ################################################################################
 #                      EXTENSION POINTS
 ################################################################################
-#build master MILP from the BigM-reformulated original
+"""
+    build_loa_master(model::JuMP.AbstractModel, method::LOA)
+
+Build the LOA master MILP as a deep copy of the BigM-reformulated
+`model`, install the `alpha_oa` objective auxiliary, and wire up
+`method.mip_optimizer`. OA and no-good cuts are added to the returned
+master each iteration of the main LOA loop.
+
+## Returns
+- `NamedTuple` with `model` (master MILP), `bin_map`
+  (indicator→binary), `var_map` (original→master var),
+  `obj_sense`, `orig_obj`, `alpha_oa`, and `obj_ref_map`
+  (objective-side map for linearization).
+"""
 function build_loa_master(model::JuMP.AbstractModel, method::LOA)
     orig_obj = JuMP.objective_function(model)
     master, copy_map = JuMP.copy_model(model)
@@ -151,101 +128,132 @@ function build_loa_master(model::JuMP.AbstractModel, method::LOA)
     obj_sense = JuMP.objective_sense(master)
     alpha_oa = JuMP.@variable(master, base_name = "alpha_oa")
     JuMP.@objective(master, obj_sense, alpha_oa)
-    return _LOAMaster(
-        master, bin_map, copy_map, obj_sense, orig_obj, alpha_oa, copy_map)
+    return (model = master, bin_map = bin_map, var_map = copy_map,
+        obj_sense = obj_sense, orig_obj = orig_obj,
+        alpha_oa = alpha_oa, obj_ref_map = copy_map)
 end
 
 """
-    copy_model_with_constraints(model, method::LOA)
+    copy_model_with_constraints(
+        model::JuMP.AbstractModel,
+        disjunct_crefs::Vector{<:DisjunctConstraintRef},
+        method::LOA
+        )
 
-Build an LOA feas submodel: a fresh deep copy of `model` with every
-non-bound constraint copied over, wired up with `method.nlp_optimizer`.
-The returned submodel is a raw copy; slack embedding and the `min u`
-objective are applied separately via [`_embed_feas_slack`]. Shares the
-dispatch entry point with MBM's [`copy_model_with_constraints`](@ref),
-which instead takes an explicit subset of disjunct constraints.
+Build a raw feasibility-restoration submodel by deep-copying `model`'s
+decision variables, then including only the problem's global
+constraints (those not added by BigM reformulation) and the original
+pre-BigM constraints of `disjunct_crefs`. The shared slack `u` and
+`min u` objective are applied separately by [`_embed_feas_slack`](@ref).
+Mirrors MBM's subset-taking [`copy_model_with_constraints`](@ref).
+
+## Returns
+- `NamedTuple` with `sub::GDPSubmodel` (copied model and
+  original→copy forward map) and `obj_ref_map` (objective-side
+  reference map for linearizing the original objective at the feas
+  point).
 """
 function copy_model_with_constraints(
-    model::JuMP.AbstractModel, method::LOA
+    model::JuMP.AbstractModel,
+    disjunct_crefs::Vector{<:DisjunctConstraintRef},
+    method::LOA
     )
-    var_type = JuMP.variable_ref_type(model)
+    V = JuMP.variable_ref_type(model)
     sub_model = _copy_model(model)
-    fwd_map = Dict{var_type, var_type}()
-    for var in collect_all_vars(model)
+    decision_vars = collect_all_vars(model)
+    fwd_map = Dict{V, V}()
+    for var in decision_vars
         fwd_map[var] = variable_copy(sub_model, var)
     end
     VT = JuMP.variable_ref_type(typeof(model))
+    reform_set = is_gdp_model(model) ?
+        Set(_reformulation_constraints(model)) : Set()
     for (F, S) in JuMP.list_of_constraint_types(model)
         F === VT && continue
         for cref in JuMP.all_constraints(model, F, S)
+            cref in reform_set && continue
             con = JuMP.constraint_object(cref)
             expr = _replace_variables_in_constraint(con.func, fwd_map)
             JuMP.@constraint(sub_model, expr in con.set)
         end
     end
+    for cref in disjunct_crefs
+        con = JuMP.constraint_object(cref)
+        expr = _replace_variables_in_constraint(con.func, fwd_map)
+        JuMP.@constraint(sub_model, expr in con.set)
+    end
     JuMP.set_optimizer(sub_model, method.nlp_optimizer)
     JuMP.set_silent(sub_model)
-    return _LOAFeasSubmodel(sub_model, fwd_map, fwd_map)
+    return (sub = GDPSubmodel(sub_model, decision_vars, fwd_map),
+        obj_ref_map = fwd_map)
 end
 
-#embed shared scalar slack `u` into every constraint of the feas
-#submodel, relax integrality, and set `min u` as the objective. Converts
-#the raw copy produced by `copy_model_with_constraints` into a V&G 1990
-#NLPF feasibility-restoration problem.
-function _embed_feas_slack(feas::_LOAFeasSubmodel)
-    u = JuMP.@variable(feas.model, base_name = "_loa_u", lower_bound = 0.0)
-    _slacken_model_constraints(feas.model, u)
-    JuMP.relax_integrality(feas.model)
-    JuMP.@objective(feas.model, Min, u)
-    return
-end
-
-#replace every JuMP constraint in `model` (excluding variable bounds) with
-#its slackened counterpart via `_slacken`. Shared by finite and InfiniteOpt
-#feas submodel builders.
-function _slacken_model_constraints(model, u)
-    VT = JuMP.variable_ref_type(typeof(model))
+# Convert the raw copy from `copy_model_with_constraints` into a V&G 1990
+# NLPF problem: shared slack `u` embedded in every constraint via
+# `_slacken`, integrality relaxed, `min u` as the objective.
+function _embed_feas_slack(feas)
+    m = feas.sub.model
+    u = JuMP.@variable(m, base_name = "_loa_u", lower_bound = 0.0)
+    VT = JuMP.variable_ref_type(typeof(m))
     to_slacken = Any[]
-    for (F, S) in JuMP.list_of_constraint_types(model)
+    for (F, S) in JuMP.list_of_constraint_types(m)
         F === VT && continue
-        for cref in JuMP.all_constraints(model, F, S)
+        for cref in JuMP.all_constraints(m, F, S)
             push!(to_slacken, cref)
         end
     end
     for cref in to_slacken
-        JuMP.is_valid(model, cref) || continue
+        JuMP.is_valid(m, cref) || continue
         con = JuMP.constraint_object(cref)
         for (sf, ss) in _slacken(con.func, con.set, u)
-            JuMP.@constraint(model, sf in ss)
+            JuMP.@constraint(m, sf in ss)
         end
-        JuMP.delete(model, cref)
+        JuMP.delete(m, cref)
     end
+    JuMP.relax_integrality(m)
+    JuMP.@objective(m, Min, u)
     return
 end
 
-#fix/unfix indicator binaries on the original model
+"""
+    fix_combo_binaries(model::JuMP.AbstractModel, combo)::Nothing
+
+Fix every indicator binary in `combo` to its active / inactive value
+on `model`. Complement indicators (stored as `1 - other_bv`) are
+handled by fixing the underlying variable to the complement value via
+[`fix_fv`](@ref).
+"""
 function fix_combo_binaries(model, combo)
     for (ind, active) in combo
-        bv = _indicator_to_binary(model)[ind]
-        JuMP.fix(bv, active ? 1.0 : 0.0; force = true)
+        fix_fv(_indicator_to_binary(model)[ind], active)
     end
 end
+
+"""
+    unfix_combo_binaries(model::JuMP.AbstractModel, combo)::Nothing
+
+Undo the effect of [`fix_combo_binaries`](@ref): unfix every indicator
+binary in `combo` on `model`.
+"""
 function unfix_combo_binaries(model, combo)
     for (ind, _) in combo
-        bv = _indicator_to_binary(model)[ind]
-        JuMP.is_fixed(bv) && JuMP.unfix(bv)
+        unfix_fv(_indicator_to_binary(model)[ind])
     end
 end
 
 ################################################################################
 #                      SET COVERING INITIALIZATION
 ################################################################################
+#Türkay & Grossmann (1996) §2.2: pick a minimal set of combos that
+#activates every indicator at least once, so the master starts with an
+#OA cut for each disjunct. We enumerate nested disjunctions alongside
+#top-level ones — inconsistent combos (nested active under inactive
+#parent) are handled by feasibility restoration at NLP-solve time.
 function _set_covering_combos(model::JuMP.AbstractModel)
     M = typeof(model)
     LVR = LogicalVariableRef{M}
     per_disj = Vector{Tuple{DisjunctionIndex, LVR}}[]
     for (idx, disj_data) in _disjunctions(model)
-        disj_data.constraint.nested && continue
         push!(per_disj, [(idx, ind) for ind in disj_data.constraint.indicators])
     end
     isempty(per_disj) && return Dict{LVR, Bool}[]
@@ -287,78 +295,65 @@ end
 ################################################################################
 #                      NLP SUBPROBLEM
 ################################################################################
-# Termination tokens. `_solve_nlp` and `_run_feas_restoration` dispatch on
-# these to build the result tuple without inspecting the solver status at
-# multiple call sites.
-struct _Feasible end
-struct _Infeasible end
-_nlp_status(model) = JuMP.is_solved_and_feasible(model) ?
-    _Feasible() : _Infeasible()
-
-#solve primary NLP for a fixed combo; on infeasibility, dispatch to the
-#feasibility-restoration submodel (min u) to get a least-infeasible point
-#for OA cut generation (Viswanathan & Grossmann 1990)
+# Solve the primary NLP for a fixed combo. If infeasible, build a fresh
+# V&G 1990 NLPF submodel (globals + active-disjunct originals, with
+# shared slack `u` and `min u` objective), solve it for a least-
+# infeasible point to generate OA cuts from, then discard it. Returns
+# a named tuple with
+# `combo / x_values / duals / objective / feasible / obj_x_values`.
 function _solve_nlp(
-    model::M, combo, method::LOA, reform_map, feas::_LOAFeasSubmodel
+    model::M, combo, method::LOA, reform_map
     ) where {M <: JuMP.AbstractModel}
+    DCRef = DisjunctConstraintRef{M}
+    empty_duals = Dict{DCRef, Any}()
     fix_combo_binaries(model, combo)
     JuMP.optimize!(model, ignore_optimize_hook = true)
-    result = _nlp_primary_result(
-        _nlp_status(model), model, combo, reform_map, feas)
+    if JuMP.is_solved_and_feasible(model)
+        x_vals, obj_xv = read_primary_solution(model)
+        duals = _collect_nlp_duals(model, combo, reform_map)
+        obj_val = JuMP.objective_value(model)
+        unfix_combo_binaries(model, combo)
+        return (combo = combo, x_values = x_vals, duals = duals,
+            objective = obj_val, feasible = true, obj_x_values = obj_xv)
+    end
     unfix_combo_binaries(model, combo)
-    return result
+    # Build a fresh per-combo NLPF: only the active-disjunct originals
+    # + globals, slackened with a shared `u`. Discarded after solve.
+    active_crefs = _active_disjunct_crefs(model, combo)
+    feas = copy_model_with_constraints(model, active_crefs, method)
+    _embed_feas_slack(feas)
+    feas_fwd = feas.sub.fwd_map
+    for (ind, val) in combo
+        orig_bv = _indicator_to_binary(model)[ind]
+        haskey(feas_fwd, orig_bv) || continue
+        fix_fv(feas_fwd[orig_bv], val)
+    end
+    JuMP.optimize!(feas.sub.model)
+    feas_ok = JuMP.is_solved_and_feasible(feas.sub.model)
+    x_vals = feas_ok ? first(read_feas_solution(model, feas)) :
+        Dict{JuMP.AbstractVariableRef, Any}()
+    return (combo = combo, x_values = x_vals, duals = empty_duals,
+        objective = Inf, feasible = false, obj_x_values = x_vals)
 end
 
-#feasible primary NLP: pack up x-values, duals, objective
-function _nlp_primary_result(
-    ::_Feasible, model::M, combo, reform_map, feas
-    ) where {M <: JuMP.AbstractModel}
-    x_vals, obj_xv = extract_primary_x_values(model)
-    duals = _collect_nlp_duals(model, combo, reform_map)
-    return (combo = combo, x_values = x_vals, duals = duals,
-        objective = JuMP.objective_value(model), feasible = true,
-        obj_x_values = obj_xv)
+# Collect the `DisjunctConstraintRef`s of every active indicator in
+# `combo`. Used to feed `copy_model_with_constraints` the minimal
+# per-combo subset for NLPF construction.
+function _active_disjunct_crefs(model::M, combo) where {M}
+    crefs = DisjunctConstraintRef{M}[]
+    for (ind, active) in combo
+        any_active(active) || continue
+        haskey(_indicator_to_constraints(model), ind) || continue
+        for cref in _indicator_to_constraints(model)[ind]
+            cref isa DisjunctConstraintRef || continue
+            push!(crefs, cref)
+        end
+    end
+    return crefs
 end
 
-#infeasible primary NLP: hand off to the feas-restoration submodel
-function _nlp_primary_result(
-    ::_Infeasible, model, combo, reform_map, feas
-    )
-    return _run_feas_restoration(model, feas, combo)
-end
-
-#fix binaries on the feas submodel, solve min u, and dispatch on outcome
-function _run_feas_restoration(
-    model::M, feas::_LOAFeasSubmodel, combo
-    ) where {M <: JuMP.AbstractModel}
-    _fix_feas_combo_binaries(feas, model, combo)
-    JuMP.optimize!(feas.model)
-    result = _nlp_feas_result(_nlp_status(feas.model), model, feas, combo)
-    _unfix_feas_combo_binaries(feas, model, combo)
-    return result
-end
-
-#feas submodel solved: return the least-infeasible point for OA cuts
-function _nlp_feas_result(
-    ::_Feasible, model::M, feas, combo
-    ) where {M <: JuMP.AbstractModel}
-    x_vals, obj_xv = extract_feas_x_values(model, feas)
-    return (combo = combo, x_values = x_vals,
-        duals = Dict{DisjunctConstraintRef{M}, Any}(),
-        objective = Inf, feasible = false, obj_x_values = obj_xv)
-end
-
-#feas submodel also infeasible: return empty result (no OA cut)
-function _nlp_feas_result(
-    ::_Infeasible, model::M, feas, combo
-    ) where {M <: JuMP.AbstractModel}
-    empty = Dict{JuMP.AbstractVariableRef, Any}()
-    return (combo = combo, x_values = empty,
-        duals = Dict{DisjunctConstraintRef{M}, Any}(),
-        objective = Inf, feasible = false, obj_x_values = empty)
-end
-
-#collect duals of reformulated disjunct constraints for active disjuncts
+# Sum the duals of BigM-reformulated constraints for each active
+# disjunct's original constraint ref. Used for OA cut generation.
 function _collect_nlp_duals(
     model::M, combo, reform_map
     ) where {M <: JuMP.AbstractModel}
@@ -375,10 +370,16 @@ function _collect_nlp_duals(
     return duals
 end
 
-#extract x-values from the primary NLP. Returns (x_vals, obj_x_values)
-#where obj_x_values is keyed by whatever variables the original objective
-#uses (same as x_vals for finite; flat-transcription vars for infinite).
-function extract_primary_x_values(model::JuMP.AbstractModel)
+"""
+    read_primary_solution(model::JuMP.AbstractModel)::Tuple{Dict, Dict}
+
+Read the primal solution of the primary NLP after a feasible solve.
+Returns `(x_values, obj_x_values)` where both dicts are keyed by
+variable reference; `obj_x_values` matches `x_values` for finite
+models. The InfiniteOpt extension overrides this to return the
+flat-transcription dict as the second element.
+"""
+function read_primary_solution(model::JuMP.AbstractModel)
     x_vals = Dict{JuMP.AbstractVariableRef, Any}()
     for v in JuMP.all_variables(model)
         JuMP.is_fixed(v) && continue
@@ -387,42 +388,50 @@ function extract_primary_x_values(model::JuMP.AbstractModel)
     return x_vals, x_vals
 end
 
-#extract x-values from the feasibility submodel, keyed by original-model
-#variables via `feas.fwd_map`. Same return contract as the primary path.
-function extract_feas_x_values(
-    model::JuMP.AbstractModel, feas::_LOAFeasSubmodel
-    )
-    x_vals = Dict{JuMP.AbstractVariableRef, Any}()
-    for v in JuMP.all_variables(model)
-        JuMP.is_fixed(v) && continue
-        haskey(feas.fwd_map, v) || continue
-        x_vals[v] = JuMP.value(feas.fwd_map[v])
-    end
+"""
+    read_feas_solution(
+        model::JuMP.AbstractModel, feas
+        )::Tuple{Dict, Dict}
+
+Read the primal solution of the feasibility-restoration NLPF after a
+feasible solve, keyed by original-model variables via `extract_solution`
+on `feas.sub`. Same return contract as [`read_primary_solution`](@ref).
+"""
+function read_feas_solution(model::JuMP.AbstractModel, feas)
+    x_vals = extract_solution(feas.sub)
     return x_vals, x_vals
 end
 
-#fix/unfix indicator binaries on the feas submodel via fwd_map. Dispatches
-#through `fix_fv`/`unfix_fv` to handle scalar feas vars (finite) and
-#per-support vectors (InfiniteOpt flat transcription).
-function _fix_feas_combo_binaries(feas::_LOAFeasSubmodel, model, combo)
-    for (ind, val) in combo
-        orig_bv = _indicator_to_binary(model)[ind]
-        haskey(feas.fwd_map, orig_bv) || continue
-        fix_fv(feas.fwd_map[orig_bv], val)
-    end
-end
-function _unfix_feas_combo_binaries(feas::_LOAFeasSubmodel, model, combo)
-    for (ind, _) in combo
-        orig_bv = _indicator_to_binary(model)[ind]
-        haskey(feas.fwd_map, orig_bv) || continue
-        unfix_fv(feas.fwd_map[orig_bv])
-    end
+"""
+    fix_fv(bv, val::Bool)::Nothing
+
+Fix a binary indicator reference `bv` to `val`. Dispatches on:
+- `AbstractVariableRef`: calls `JuMP.fix(bv, val ? 1.0 : 0.0; force = true)`.
+- `GenericAffExpr`: the complement-indicator form `1 - other_bv`; fix
+  `other_bv` to the complement of `val`.
+
+The InfiniteOpt extension adds an `AbstractArray` dispatch for
+per-support indicator vectors.
+"""
+fix_fv(bv, val::Bool) = JuMP.fix(bv, val ? 1.0 : 0.0; force = true)
+function fix_fv(bv::JuMP.GenericAffExpr, val::Bool)
+    under, coeff = only(bv.terms)
+    JuMP.fix(under, val ? 0.0 : 1.0; force = true)
 end
 
-#fix/unfix a feas-submodel binary variable at a scalar Bool value
-fix_fv(bv, val::Bool) = JuMP.fix(bv, val ? 1.0 : 0.0; force = true)
+"""
+    unfix_fv(bv)::Nothing
+
+Undo [`fix_fv`](@ref) on `bv`. No-op if `bv` is not currently fixed.
+For complement AffExprs, unfixes the underlying variable.
+"""
 function unfix_fv(bv)
     JuMP.is_fixed(bv) && JuMP.unfix(bv)
+    return
+end
+function unfix_fv(bv::JuMP.GenericAffExpr)
+    under = only(keys(bv.terms))
+    JuMP.is_fixed(under) && JuMP.unfix(under)
     return
 end
 
@@ -436,7 +445,6 @@ function _build_reform_map(model::M) where {M <: JuMP.AbstractModel}
     rmap = Dict{DisjunctConstraintRef{M}, Vector{CRT}}()
     idx = 1
     for (_, disj_data) in _disjunctions(model)
-        disj_data.constraint.nested && continue
         for ind in disj_data.constraint.indicators
             haskey(_indicator_to_constraints(model), ind) || continue
             for cref in _indicator_to_constraints(model)[ind]
@@ -478,11 +486,10 @@ end
 #extract combo from master solution. `combo_val` dispatches on scalar vs
 #array bin_map values (extension adds the array method for per-support).
 function _extract_combo(
-    model::M, master::_LOAMaster
+    model::M, master
     ) where {M <: JuMP.AbstractModel}
     combo = Dict{LogicalVariableRef{M}, Any}()
     for (_, disj_data) in _disjunctions(model)
-        disj_data.constraint.nested && continue
         for ind in disj_data.constraint.indicators
             haskey(master.bin_map, ind) || continue
             combo[ind] = combo_val(master.bin_map[ind])
@@ -490,11 +497,16 @@ function _extract_combo(
     end
     return combo
 end
+"""
+    combo_val(bv)::Bool
+
+Round the master's current binary solution for indicator ref `bv` to a
+`Bool`. The InfiniteOpt extension adds an `AbstractArray` dispatch
+that returns a `Vector{Bool}` per support.
+"""
 combo_val(bv) = round(JuMP.value(bv)) > 0.5
 
-#no-good cut on the master excluding the current combo. `add_ng_terms`
-#dispatches on scalar vs array bin_map / active values.
-function _add_no_good_cut(model, master::_LOAMaster, combo)
+function _add_no_good_cut(model, master, combo)
     cut_expr = JuMP.AffExpr(0.0)
     for (ind, active) in combo
         haskey(master.bin_map, ind) || continue
@@ -502,6 +514,16 @@ function _add_no_good_cut(model, master::_LOAMaster, combo)
     end
     JuMP.@constraint(master.model, cut_expr >= 1.0)
 end
+
+"""
+    add_ng_terms(cut, bv, active::Bool)::Nothing
+
+Assemble one indicator's contribution to the no-good cut `cut_expr >=
+1`: add `1 - y_j` if the indicator was active in the excluded combo,
+or `y_j` otherwise. The InfiniteOpt extension adds an
+`AbstractArray`/`AbstractArray{Bool}` dispatch that folds per-support
+contributions.
+"""
 function add_ng_terms(cut, bv, active::Bool)
     if active
         JuMP.add_to_expression!(cut, -1.0, bv)
@@ -512,8 +534,13 @@ function add_ng_terms(cut, bv, active::Bool)
     return
 end
 
-#predicate used by OA cut generation: is there any active indicator in
-#this combo entry? Scalar Bool case; extension adds `AbstractVector{Bool}`
+"""
+    any_active(active)::Bool
+
+Return `true` if any indicator value in `active` is truthy. The base
+dispatch is the trivial scalar `Bool` case; the InfiniteOpt extension
+adds an `AbstractVector{Bool}` dispatch for per-support indicators.
+"""
 any_active(active::Bool) = active
 
 ################################################################################
@@ -543,8 +570,9 @@ _slacken(f, set, u) = [(f, set)]
 ################################################################################
 #                        OA CUT GENERATION
 ################################################################################
-#sense-dependent coefficients dispatched on Val(obj_sense). See usage in
-#`_add_objective_oa_cut` and `_add_disjunct_oa_cuts`.
+# Sense-dependent coefficients for OA and convergence calls. Dispatched
+# on `Val(master.obj_sense)` so downstream call sites can read like
+# regular Julia without branching on the sense.
 _disjunct_cut_coeffs(::Val{_MOI.MIN_SENSE}) = (-1, 1)
 _disjunct_cut_coeffs(::Val{_MOI.MAX_SENSE}) = (1, -1)
 _worst_obj(::Val{_MOI.MIN_SENSE}) = Inf
@@ -556,16 +584,16 @@ _gap(::Val{_MOI.MAX_SENSE}, best, bound) = bound - best
 _flip_sense(::Val{_MOI.MIN_SENSE}) = Val(_MOI.MAX_SENSE)
 _flip_sense(::Val{_MOI.MAX_SENSE}) = Val(_MOI.MIN_SENSE)
 
-function _add_oa_cuts(model, master::_LOAMaster, result, method::LOA)
+function _add_oa_cuts(model, master, result, method::LOA)
     isempty(result.x_values) && return
     _add_objective_oa_cut(master, result)
     _add_disjunct_oa_cuts(model, master, result, method)
     return
 end
 
-#linearize the original objective at `result.obj_x_values` and add it as
-#a cut on `alpha_oa` with direction determined by `master.obj_sense`
-function _add_objective_oa_cut(master::_LOAMaster, result)
+# Linearize the original objective at the NLP's solution and add the
+# bounding cut `lin ≤ α` (min) or `lin ≥ α` (max) on the master.
+function _add_objective_oa_cut(master, result)
     lin = _linearize_at(
         master.orig_obj, result.obj_x_values, master.obj_ref_map)
     _add_obj_cut(Val(master.obj_sense), master, lin)
@@ -576,11 +604,11 @@ _add_obj_cut(::Val{_MOI.MIN_SENSE}, master, lin) =
 _add_obj_cut(::Val{_MOI.MAX_SENSE}, master, lin) =
     JuMP.@constraint(master.model, lin >= master.alpha_oa)
 
-#add V&G 1990 augmented-penalty OA cuts for each active disjunct's
-#nonlinear constraints. `cut_sites` yields the per-cut tuples: 1 site
-#for finite, K sites for the InfiniteOpt case (extension override).
+# Add V&G 1990 augmented-penalty OA cuts for each active disjunct's
+# nonlinear constraints: fresh per-cut slack `σ_ik` with a penalty term
+# in the master objective, and cut body `s (lin - rhs) - σ ≤ M(1 - y)`.
 function _add_disjunct_oa_cuts(
-    model, master::_LOAMaster, result, method::LOA
+    model, master, result, method::LOA
     )
     sgn, pen = _disjunct_cut_coeffs(Val(master.obj_sense))
     for (ind, active) in result.combo
@@ -594,46 +622,43 @@ function _add_disjunct_oa_cuts(
             con.func isa JuMP.GenericAffExpr && continue
             d = get(result.duals, orig_cref, nothing)
             d === nothing && continue
-            for (bv, xk, smap, d_k) in cut_sites(
+            rhs = _set_rhs(con.set)
+            for (bv, xk, smap, d_k) in cut_info(
                 master.bin_map[ind], active,
                 result.x_values, master.var_map, d)
-                dv = _dv(d_k)
-                s = sign(sgn * dv)
+                s = sign(sgn * _dv(d_k))
                 s == 0 && continue
-                _add_one_disjunct_oa_cut(
-                    master, con, method, bv, xk, smap, s, pen)
+                lin_expr = _linearize_at(con.func, xk, smap)
+                slack = JuMP.@variable(master.model,
+                    lower_bound = 0.0, upper_bound = method.max_slack)
+                JuMP.set_objective_function(master.model,
+                    JuMP.objective_function(master.model) +
+                    pen * method.OA_penalty_factor * slack)
+                JuMP.@constraint(master.model,
+                    s * (lin_expr - rhs) - slack <=
+                    method.M_value * (1 - bv))
             end
         end
     end
 end
 
-#one OA cut site: (binary, x_values, var_map, dual). Scalar case yields
-#a single-element tuple collection; extension's array dispatch yields
-#K per-support sites with sliced x_values and var_map.
-cut_sites(bv, active::Bool, x_values, var_map, d) =
+"""
+    cut_info(bv, active, x_values, var_map, d)
+
+Yield the inputs `(bv, xk, smap, d_k)` needed to emit each OA cut for
+one active disjunct constraint. The scalar base returns one tuple
+(one cut per constraint). The InfiniteOpt extension adds an
+`AbstractArray` dispatch that yields K tuples with per-support-sliced
+`x_values`, `var_map`, and dual (one cut per active support).
+"""
+cut_info(bv, active::Bool, x_values, var_map, d) =
     ((bv, x_values, var_map, d),)
 
-#extract a scalar dual value from a dual "cell" that may be a vector
-#(from a vector-valued reform constraint in the infinite case)
+# Collapse a dual value (scalar for a single reformulated constraint,
+# vector for reform constraints that produced multiple JuMP constraints
+# like Interval / EqualTo / Zeros) to a scalar sign-carrier.
 _dv(d::Number) = d
 _dv(d) = sum(d)
-
-#add a single disjunct OA cut with augmented-penalty slack
-function _add_one_disjunct_oa_cut(
-    master::_LOAMaster, con, method, bv, x_values, var_map, s, pen
-    )
-    lin_expr = _linearize_at(con.func, x_values, var_map)
-    rhs = _set_rhs(con.set)
-    slack = JuMP.@variable(master.model,
-        lower_bound = 0.0, upper_bound = method.max_slack)
-    JuMP.set_objective_function(master.model,
-        JuMP.objective_function(master.model) +
-        pen * method.OA_penalty_factor * slack)
-    JuMP.@constraint(master.model,
-        s * (lin_expr - rhs) - slack <=
-        method.M_value * (1 - bv))
-    return
-end
 
 ################################################################################
 #                       CONVERGENCE CHECK
