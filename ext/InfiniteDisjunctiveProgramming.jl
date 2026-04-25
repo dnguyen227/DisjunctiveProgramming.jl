@@ -405,57 +405,6 @@ function _flat_xk(model::InfiniteOpt.InfiniteModel, x_values)
     return fxk
 end
 
-#per-support dispatch methods: the base DP.jl LOA code calls scalar-form
-#helpers; these array methods let the same code path handle vector-valued
-#bin_map / var_map / x_values / active entries without any extra branches
-#in the base file.
-
-DP.fix_fv(bvs::AbstractArray, val::Bool) =
-    (for bv in bvs; DP.fix_fv(bv, val); end; return)
-DP.fix_fv(bvs::AbstractArray, val::AbstractArray) =
-    (for (bv, v) in zip(bvs, val); DP.fix_fv(bv, v); end; return)
-DP.unfix_fv(bvs::AbstractArray) =
-    (for bv in bvs; DP.unfix_fv(bv); end; return)
-
-DP.any_active(v::AbstractVector{Bool}) = any(v)
-
-#combo extraction: round per-support binary values to a Vector{Bool}
-DP.combo_val(bvs::AbstractArray) = Bool.(round.(JuMP.value.(bvs)))
-
-#no-good cut: fold one scalar term per (binary, active) pair. The scalar-
-#active method handles the set-covering phase where combos are Bool-valued.
-DP.add_ng_terms(cut, bvs::AbstractArray, active::Bool) =
-    DP.add_ng_terms(cut, bvs, fill(active, length(bvs)))
-function DP.add_ng_terms(cut, bvs::AbstractArray, actives::AbstractArray)
-    for (bv, a) in zip(bvs, actives)
-        DP.add_ng_terms(cut, bv, a)
-    end
-    return
-end
-
-#OA cut sites: one site per active support, with per-support restrictions
-#of `x_values` and `var_map`
-DP.cut_info(bvs::AbstractArray, active::Bool, x_values, var_map, d) =
-    DP.cut_info(bvs, fill(active, length(bvs)), x_values, var_map, d)
-function DP.cut_info(
-    bvs::AbstractArray, actives::AbstractArray,
-    x_values, var_map, d
-    )
-    sites = Any[]
-    for k in 1:length(bvs)
-        actives[k] || continue
-        smap_k = Dict{Any, Any}(
-            v => (mv isa AbstractVector ? mv[k] : mv)
-            for (v, mv) in var_map)
-        x_k = Dict{Any, Any}(
-            v => (xv isa AbstractVector ? xv[k] : xv)
-            for (v, xv) in x_values)
-        d_k = d isa AbstractVector ? d[k] : d
-        push!(sites, (bvs[k], x_k, smap_k, d_k))
-    end
-    return sites
-end
-
 #detect number of supports from a bin_map; used below in `build_loa_master`
 function _detect_K(bin_map)
     for (_, bvs) in bin_map

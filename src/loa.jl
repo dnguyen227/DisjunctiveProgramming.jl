@@ -409,15 +409,18 @@ Fix a binary indicator reference `bv` to `val`. Dispatches on:
 - `AbstractVariableRef`: calls `JuMP.fix(bv, val ? 1.0 : 0.0; force = true)`.
 - `GenericAffExpr`: the complement-indicator form `1 - other_bv`; fix
   `other_bv` to the complement of `val`.
-
-The InfiniteOpt extension adds an `AbstractArray` dispatch for
-per-support indicator vectors.
+- `AbstractArray`: iterate elementwise over `bvs` (and `vals` if also
+  array). Used by per-support InfiniteOpt indicators.
 """
 fix_fv(bv, val::Bool) = JuMP.fix(bv, val ? 1.0 : 0.0; force = true)
 function fix_fv(bv::JuMP.GenericAffExpr, val::Bool)
     under, coeff = only(bv.terms)
     JuMP.fix(under, val ? 0.0 : 1.0; force = true)
 end
+fix_fv(bvs::AbstractArray, val::Bool) =
+    (for bv in bvs; fix_fv(bv, val); end; return)
+fix_fv(bvs::AbstractArray, vals::AbstractArray) =
+    (for (bv, v) in zip(bvs, vals); fix_fv(bv, v); end; return)
 
 """
     unfix_fv(bv)::Nothing
@@ -434,6 +437,8 @@ function unfix_fv(bv::JuMP.GenericAffExpr)
     JuMP.is_fixed(under) && JuMP.unfix(under)
     return
 end
+unfix_fv(bvs::AbstractArray) =
+    (for bv in bvs; unfix_fv(bv); end; return)
 
 ################################################################################
 #                       REFORM MAP (BigM constraint index)
@@ -501,10 +506,11 @@ end
     combo_val(bv)::Bool
 
 Round the master's current binary solution for indicator ref `bv` to a
-`Bool`. The InfiniteOpt extension adds an `AbstractArray` dispatch
-that returns a `Vector{Bool}` per support.
+`Bool`. Scalar form returns `Bool`; `AbstractArray` form returns
+`Vector{Bool}` per support for InfiniteOpt indicators.
 """
 combo_val(bv) = round(JuMP.value(bv)) > 0.5
+combo_val(bvs::AbstractArray) = Bool.(round.(JuMP.value.(bvs)))
 
 function _add_no_good_cut(model, master, combo)
     cut_expr = JuMP.AffExpr(0.0)
@@ -520,9 +526,8 @@ end
 
 Assemble one indicator's contribution to the no-good cut `cut_expr >=
 1`: add `1 - y_j` if the indicator was active in the excluded combo,
-or `y_j` otherwise. The InfiniteOpt extension adds an
-`AbstractArray`/`AbstractArray{Bool}` dispatch that folds per-support
-contributions.
+or `y_j` otherwise. `AbstractArray` forms (with Bool or per-support
+Vector) fold per-support contributions for InfiniteOpt indicators.
 """
 function add_ng_terms(cut, bv, active::Bool)
     if active
@@ -533,15 +538,24 @@ function add_ng_terms(cut, bv, active::Bool)
     end
     return
 end
+add_ng_terms(cut, bvs::AbstractArray, active::Bool) =
+    add_ng_terms(cut, bvs, fill(active, length(bvs)))
+function add_ng_terms(cut, bvs::AbstractArray, actives::AbstractArray)
+    for (bv, a) in zip(bvs, actives)
+        add_ng_terms(cut, bv, a)
+    end
+    return
+end
 
 """
     any_active(active)::Bool
 
-Return `true` if any indicator value in `active` is truthy. The base
-dispatch is the trivial scalar `Bool` case; the InfiniteOpt extension
-adds an `AbstractVector{Bool}` dispatch for per-support indicators.
+Return `true` if any indicator value in `active` is truthy. Scalar
+`Bool` returns itself; `AbstractVector{Bool}` reduces with `any` for
+per-support InfiniteOpt indicators.
 """
 any_active(active::Bool) = active
+any_active(actives::AbstractVector{Bool}) = any(actives)
 
 ################################################################################
 #                       LINEARIZATION HELPERS
@@ -646,13 +660,33 @@ end
     cut_info(bv, active, x_values, var_map, d)
 
 Yield the inputs `(bv, xk, smap, d_k)` needed to emit each OA cut for
-one active disjunct constraint. The scalar base returns one tuple
-(one cut per constraint). The InfiniteOpt extension adds an
-`AbstractArray` dispatch that yields K tuples with per-support-sliced
-`x_values`, `var_map`, and dual (one cut per active support).
+one active disjunct constraint. The scalar form returns one tuple
+(one cut per constraint). The `AbstractArray` form yields K tuples
+with per-support-sliced `x_values`, `var_map`, and dual (one cut per
+active support, used for InfiniteOpt indicators).
 """
 cut_info(bv, active::Bool, x_values, var_map, d) =
     ((bv, x_values, var_map, d),)
+cut_info(bvs::AbstractArray, active::Bool, x_values, var_map, d) =
+    cut_info(bvs, fill(active, length(bvs)), x_values, var_map, d)
+function cut_info(
+    bvs::AbstractArray, actives::AbstractArray,
+    x_values, var_map, d
+    )
+    sites = Any[]
+    for k in 1:length(bvs)
+        actives[k] || continue
+        smap_k = Dict{Any, Any}(
+            v => (mv isa AbstractVector ? mv[k] : mv)
+            for (v, mv) in var_map)
+        x_k = Dict{Any, Any}(
+            v => (xv isa AbstractVector ? xv[k] : xv)
+            for (v, xv) in x_values)
+        d_k = d isa AbstractVector ? d[k] : d
+        push!(sites, (bvs[k], x_k, smap_k, d_k))
+    end
+    return sites
+end
 
 # Collapse a dual value (scalar for a single reformulated constraint,
 # vector for reform constraints that produced multiple JuMP constraints
