@@ -615,6 +615,6 @@ function set_start_values(
     ::JuMP.AbstractModel, linearization_point::AbstractDict
     )
     for (variable, value) in linearization_point
-        JuMP.set_start_value(variable, value)
+        JuMP.set_start_value(variable, _unwrap_scalar(value))
     end
 end
