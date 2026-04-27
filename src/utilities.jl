@@ -84,7 +84,7 @@ end
 
 Read the primal solution of `sub.model` after a solve, keyed by the
 parent-model decision variables via `sub.fwd_map`. Shape follows
-`fwd_map` values: `Vector`-valued fwd_maps (MBM/CP) yield per-support
+`fwd_map` values: `Vector`-valued fwd_maps (CP/MBM) yield per-support
 `Vector`s; scalar fwd_maps (LOA feas) yield scalars.
 """
 function extract_solution(sub::GDPSubmodel)
