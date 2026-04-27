@@ -52,7 +52,7 @@ function test__replace_variables_quad_numeric_map()
     @test result3.aff.terms[y] ≈ 3.0
 end
 
-function test_replace_variables_in_constraint()
+function testreplace_variables_in_constraint()
     model = Model()
     sub_model = Model()
     @variable(model, x[1:3])
@@ -809,7 +809,7 @@ end
     test_mbm()
     test__var_ref_type_numeric_map()
     test__replace_variables_quad_numeric_map()
-    test_replace_variables_in_constraint()
+    testreplace_variables_in_constraint()
     test_prepare_max_M_objective()
     test_raw_M()
     test_maximize_M()

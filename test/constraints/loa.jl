@@ -30,7 +30,7 @@ function test_set_covering_combos()
     @constraint(model, x >= 5, Disjunct(Y[2]))
     @disjunction(model, Y)
 
-    combos = DP._set_covering_combos(model)
+    combos = DP._set_covering_combinations(model)
 
     # Should cover both Y[1] and Y[2]
     all_active = Set()
@@ -60,7 +60,7 @@ function test_no_good_cut()
     num_cons_before = length(JuMP.all_constraints(
         master_model;
         include_variable_in_set_constraints = false))
-    DP._add_no_good_cut(model, master, combo)
+    DP.avoid_combination(master.model, combo, master.binary_map)
     num_cons_after = length(JuMP.all_constraints(
         master_model;
         include_variable_in_set_constraints = false))
@@ -71,10 +71,11 @@ end
 function test_loa_convergence_check()
     method = LOA(HiGHS.Optimizer; atol = 1e-6, rtol = 1e-4)
 
-    @test DP._loa_converged(1.0, 1.0, method) == true
-    @test DP._loa_converged(1.0, 0.9999, method) == true
-    @test DP._loa_converged(1.0, 0.5, method) == false
-    @test DP._loa_converged(1e-8, 0.0, method) == true
+    sense = Val(MOI.MIN_SENSE)
+    @test DP._loa_converged(1.0, 1.0, sense, method) == true
+    @test DP._loa_converged(1.0, 0.9999, sense, method) == true
+    @test DP._loa_converged(1.0, 0.5, sense, method) == false
+    @test DP._loa_converged(1e-8, 0.0, sense, method) == true
 end
 
 function test_loa_reformulate_simple()
