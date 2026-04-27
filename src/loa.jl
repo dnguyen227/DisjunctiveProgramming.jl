@@ -485,6 +485,7 @@ function _add_oa_cuts(
     linearization = _linearize_at(master.original_objective,
         result.linearization_point, master.objective_ref_map)
     _add_objective_cut(Val(master.objective_sense), master, linearization)
+    _add_global_oa_cuts(model, master, result, method)
     add_disjunct_oa_cuts(model, master, result, method)
     return
 end
@@ -494,6 +495,44 @@ _add_objective_cut(::Val{_MOI.MIN_SENSE}, master, lin) =
     JuMP.@constraint(master.model, lin <= master.alpha_oa)
 _add_objective_cut(::Val{_MOI.MAX_SENSE}, master, lin) =
     JuMP.@constraint(master.model, lin >= master.alpha_oa)
+
+# WIP: finite-only. InfiniteOpt's `_add_oa_cuts(::InfiniteModel, ...)`
+# override skips the call to this — globals over infinite vars yield
+# per-support `Vector` values that the scalar-only `_linearize_at` AD
+# path can't consume. A per-support-aware variant is the next step.
+#
+# Add the OA cut `g(x^l) + ∇g(x^l)^T (x − x^l) in con.set` for every
+# nonlinear global constraint of `model` — the third cut class in
+# Türkay & Grossmann (1996, eq. 12) alongside the objective and the
+# disjunct cuts. Walks `JuMP.list_of_constraint_types`, skipping
+# variable bounds, linear functions (already in the master), and
+# BigM-reformulated forms (in `_reformulation_constraints`).
+# `LessThan` and `GreaterThan` are supported; equalities and vector
+# constraints are passed through to `JuMP.@constraint` as-is —
+# valid for affine-after-linearization sets.
+function _add_global_oa_cuts(
+    model::JuMP.AbstractModel,
+    master::NamedTuple,
+    result::NamedTuple,
+    method::LOA
+    )
+    variable_type = JuMP.variable_ref_type(typeof(model))
+    reform_set = is_gdp_model(model) ?
+        Set(_reformulation_constraints(model)) : Set()
+    for (F, S) in JuMP.list_of_constraint_types(model)
+        F === variable_type && continue
+        _is_linear_F(F) && continue
+        for cref in JuMP.all_constraints(model, F, S)
+            cref in reform_set && continue
+            con = JuMP.constraint_object(cref)
+            con isa JuMP.ScalarConstraint || continue
+            linearization = _linearize_at(con.func,
+                result.linearization_point, master.variable_map)
+            JuMP.@constraint(master.model, linearization in con.set)
+        end
+    end
+    return
+end
 
 # OVERRIDABLE. Add V&G 1990 augmented-penalty OA cuts for each active
 # disjunct's nonlinear constraints: fresh per-cut slack `σ_ik` with a
