@@ -8,6 +8,23 @@ function _copy_model(
     return M()
 end
 
+# OVERRIDABLE. Copy `source`'s decision variables into `target` (with
+# bounds and integrality) and return a `source → target` ref map.
+# Constraints and objective are NOT copied — the caller adds whichever
+# subset it wants. InfiniteOpt overrides to additionally copy
+# parameters, derivatives, and parameter functions.
+function copy_variables_onto_model(
+    target::JuMP.AbstractModel,
+    source::JuMP.AbstractModel
+    )
+    V = JuMP.variable_ref_type(typeof(source))
+    ref_map = Dict{V, V}()
+    for variable in JuMP.all_variables(source)
+        ref_map[variable] = variable_copy(target, variable)
+    end
+    return ref_map
+end
+
 """
     copy_and_reformulate(model, decision_vars, reform_method, method)
 
@@ -30,7 +47,7 @@ function copy_and_reformulate(
     orig_to_copy = Dict{V, V}(
         v => ref_map[v] for v in decision_vars)
     JuMP.@objective(copy, sense,
-        _replace_variables_in_constraint(obj, orig_to_copy)
+        replace_variables_in_constraint(obj, orig_to_copy)
         )
     fwd_map = Dict{V, Vector{V}}(v => [ref_map[v]] for v in decision_vars)
     sub = GDPSubmodel(copy, decision_vars, fwd_map)
@@ -73,6 +90,107 @@ parent-model decision variables via `sub.fwd_map`. Shape follows
 function extract_solution(sub::GDPSubmodel)
     return Dict(
         var => JuMP.value.(sub.fwd_map[var]) for var in sub.decision_vars)
+end
+
+################################################################################
+#                          INDICATOR FIXING
+################################################################################
+"""
+    fix_indicator(model, indicator::LogicalVariableRef, value::Bool)
+    fix_indicator(binary_ref, value::Bool)
+
+Fix a logical indicator's binary backing variable to `value` (true →
+1.0, false → 0.0). The 3-arg form is the user-facing API: pass the
+model and the `LogicalVariableRef`. The 2-arg form takes the binary
+backing reference directly (or its complement-form expression
+`1 - other_binary` when the indicator was declared as a complement).
+
+Mirrors [`relax_logical_vars`](@ref) for selectively fixing rather
+than relaxing.
+"""
+fix_indicator(model::JuMP.AbstractModel,
+    indicator::LogicalVariableRef, value::Bool) =
+    fix_indicator(_indicator_to_binary(model)[indicator], value)
+fix_indicator(binary_ref::JuMP.AbstractVariableRef, value::Bool) =
+    JuMP.fix(binary_ref, value ? 1.0 : 0.0; force = true)
+function fix_indicator(
+    binary_ref::JuMP.GenericAffExpr, value::Bool
+    )
+    underlying, _ = only(binary_ref.terms)
+    JuMP.fix(underlying, value ? 0.0 : 1.0; force = true)
+    return
+end
+
+"""
+    unfix_indicator(model, indicator::LogicalVariableRef)
+    unfix_indicator(binary_ref)
+
+Undo [`fix_indicator`](@ref). No-op if not currently fixed.
+"""
+unfix_indicator(model::JuMP.AbstractModel,
+    indicator::LogicalVariableRef) =
+    unfix_indicator(_indicator_to_binary(model)[indicator])
+function unfix_indicator(binary_ref)
+    JuMP.is_fixed(binary_ref) && JuMP.unfix(binary_ref)
+    return
+end
+function unfix_indicator(binary_ref::JuMP.GenericAffExpr)
+    underlying = only(keys(binary_ref.terms))
+    JuMP.is_fixed(underlying) && JuMP.unfix(underlying)
+    return
+end
+
+################################################################################
+#                          NO-GOOD CUTS
+################################################################################
+"""
+    avoid_combination(model, combination)
+    avoid_combination(model, combination, binary_map)
+
+Add a no-good cut to `model` excluding `combination` from any future
+solution. The added constraint
+    Σ_{j active} (1 - y_j) + Σ_{j inactive} y_j ≥ 1
+forces at least one indicator to differ from `combination`.
+
+`combination` maps `LogicalVariableRef` → `Bool` (whether each
+indicator was active). The 3-arg form lets you supply an explicit
+`binary_map` (defaulting to `_indicator_to_binary(model)`) when the
+binaries used in the cut belong to a copy of the original model
+(e.g. an LOA master).
+
+Returns the constraint reference of the added cut.
+"""
+avoid_combination(model::JuMP.AbstractModel, combination) =
+    avoid_combination(
+        model, combination, _indicator_to_binary(model))
+function avoid_combination(model::JuMP.AbstractModel,
+    combination, binary_map
+    )
+    V = JuMP.variable_ref_type(typeof(model))
+    T = JuMP.value_type(typeof(model))
+    cut = JuMP.GenericAffExpr{T, V}(zero(T))
+    for (indicator, active) in combination
+        haskey(binary_map, indicator) || continue
+        add_no_good_terms(cut, binary_map[indicator], active)
+    end
+    return JuMP.@constraint(model, cut >= one(T))
+end
+
+"""
+    add_no_good_terms(cut, binary_ref, active::Bool)
+
+Append one indicator's contribution to a no-good cut expression:
+adds `1 - y_j` if the indicator was active in the excluded
+combination, or `y_j` otherwise. Used by [`avoid_combination`](@ref).
+"""
+function add_no_good_terms(cut, binary_ref, active::Bool)
+    if active
+        JuMP.add_to_expression!(cut, -1.0, binary_ref)
+        JuMP.add_to_expression!(cut, 1.0)
+    else
+        JuMP.add_to_expression!(cut, 1.0, binary_ref)
+    end
+    return
 end
 
 ################################################################################
@@ -234,7 +352,7 @@ function copy_gdp_data(
         old_con_ref = LogicalConstraintRef(model, idx)
         new_con_ref = LogicalConstraintRef(new_model, idx)
         c = lc_data.constraint
-        expr = _replace_variables_in_constraint(c.func, lv_map)
+        expr = replace_variables_in_constraint(c.func, lv_map)
         new_con = JuMP.build_constraint(error, expr, c.set)
         JuMP.add_constraint(new_model, new_con, lc_data.name)
         lc_map[old_con_ref] = new_con_ref
@@ -246,7 +364,7 @@ function copy_gdp_data(
         old_dc_ref = DisjunctConstraintRef(model, idx)
         old_indicator = old_gdp.constraint_to_indicator[old_dc_ref]
         new_indicator = lv_map[old_indicator]
-        new_expr = _replace_variables_in_constraint(old_constraint.func, 
+        new_expr = replace_variables_in_constraint(old_constraint.func, 
         var_map
         )
         # Update to new_gdp.disjunct_constraints
@@ -260,7 +378,7 @@ function copy_gdp_data(
     # Copying disjunctions
     for (idx, disj_data) in old_gdp.disjunctions
         old_disj = disj_data.constraint
-        new_indicators = [_replace_variables_in_constraint(indicator, lv_map) 
+        new_indicators = [replace_variables_in_constraint(indicator, lv_map) 
         for indicator in old_disj.indicators
             ]
         new_disj = Disjunction(new_indicators, old_disj.nested)
@@ -396,7 +514,7 @@ function _remap_indicator_to_binary(
     bref::JuMP.GenericAffExpr,
     var_map::Dict{V, V}
 ) where {V <: JuMP.AbstractVariableRef}
-    return _replace_variables_in_constraint(bref, var_map)
+    return replace_variables_in_constraint(bref, var_map)
 end
 
 function _remap_constraint_to_indicator(
@@ -420,6 +538,33 @@ end
 # First-order Taylor approximation and MOI expression building
 # for outer approximation methods (LOA, future OA variants).
 ################################################################################
+
+################################################################################
+#                    AGGREGATE-REF DETECTION
+################################################################################
+# Predicate: does the variable ref aggregate multiple decision
+# variables behind a single leaf? An "aggregate" ref is one that AD
+# cannot see inside — e.g. an InfiniteOpt `MeasureRef` (`∫ f(x,t) dt`
+# is one ref but depends on `x(t_1), …, x(t_K)`) or a
+# `ParameterFunctionRef`. Base returns false; the InfiniteOpt
+# extension overrides for aggregate ref types.
+#
+# When `has_aggregate_ref(expr)` is true, MOI Nonlinear AD on `expr`
+# would treat the aggregate as a single opaque variable and produce a
+# meaningless gradient. The LOA pipeline falls back to transcription
+# in that case (flat scalar expression, AD on the flat form, then map
+# back to master refs).
+#
+# #suggestions for names are welcome
+is_aggregate_ref(::JuMP.AbstractVariableRef) = false
+
+function has_aggregate_ref(expr)
+    found = Ref(false)
+    _interrogate_variables(expr) do v
+        found[] || (found[] = is_aggregate_ref(v))
+    end
+    return found[]
+end
 
 ################################################################################
 #                    MOI NONLINEAR EXPRESSION CONVERSION
