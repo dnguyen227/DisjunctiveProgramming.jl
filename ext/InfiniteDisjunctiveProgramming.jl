@@ -337,10 +337,15 @@ end
 _per_support_values(variable::InfiniteOpt.GeneralVariableRef) =
     vec(vcat(JuMP.value(variable)))
 
-# Read per-support values from the transformation backend.
+# Read per-support values from the transformation backend, keyed by
+# InfiniteOpt vars. Skips fixed vars. The objective-side translation
+# (transcribe-then-AD when the objective has aggregate refs) lives
+# in the `_add_oa_cuts(::InfiniteModel, ...)` override below — base
+# `extract_solution` doesn't need to anticipate it.
 function DP.extract_solution(model::InfiniteOpt.InfiniteModel)
-    return Dict(variable => _per_support_values(variable)
-        for variable in DP.collect_cutting_planes_vars(model))
+    return Dict(var => _per_support_values(var)
+        for var in DP.collect_all_vars(model)
+        if !JuMP.is_fixed(var))
 end
 
 # Add a pointwise-sum cut directly to the transformation backend and mark
@@ -704,6 +709,41 @@ function DP.build_loa_master(
 end
 
 # Override the disjunct-cut loop for `InfiniteModel`. Same shape as
+# Override `_add_oa_cuts` for `InfiniteModel` to translate the
+# linearization point into the form the master's `original_objective`
+# expects. The base `result.linearization_point` has per-support
+# `Vector` values keyed on InfiniteOpt vars; the master's objective
+# is either the raw InfiniteOpt expression (non-aggregate, expects
+# scalar `xk[v]`) or the transcribed flat scalar expression
+# (aggregate, expects transcribed-`JuMP.VariableRef`-keyed scalar
+# dict). The translation produces whichever shape `_linearize_at`
+# needs for this master.
+function DP._add_oa_cuts(
+    model::InfiniteOpt.InfiniteModel,
+    master::NamedTuple,
+    result::NamedTuple,
+    method::DP.LOA
+    )
+    isempty(result.linearization_point) && return
+    obj_point = if DP.has_aggregate_ref(JuMP.objective_function(model))
+        _transcribe_linearization_point(
+            model, result.linearization_point)
+    else
+        T = eltype(valtype(result.linearization_point))
+        Dict{InfiniteOpt.GeneralVariableRef, T}(
+            var => values[1]
+            for (var, values) in result.linearization_point
+            if isempty(InfiniteOpt.parameter_refs(var)))
+    end
+    linearization = DP._linearize_at(master.original_objective,
+        obj_point, master.objective_ref_map)
+    DP._add_objective_cut(
+        Val(master.objective_sense), master, linearization)
+    DP.add_disjunct_oa_cuts(model, master, result, method)
+    return
+end
+
+# Override `add_disjunct_oa_cuts` for `InfiniteModel`. Same shape as
 # the base loop, but each constraint is checked for aggregate refs.
 # Aggregate constraints (e.g. those containing a `MeasureRef`) are
 # transcribed via `InfiniteOpt.transformation_expression`, then
@@ -984,60 +1024,5 @@ _add_to_transcribed_dict(
     value::Real
     ) =
     (d[ts] = value; nothing)
-
-# Extract per-support x-values from the InfiniteModel NLP. The
-# first return is keyed on InfiniteModel vars (used for disjunct
-# OA cuts via `cut_info`). The second return is what the objective
-# OA cut consumes: when the objective is aggregate-free we hand
-# back the same dict (objective AD walks InfiniteOpt vars
-# directly); when it has aggregates we transcribe so the flat
-# objective's AD pipeline can read it.
-function DP.read_primary_solution(
-    model::InfiniteOpt.InfiniteModel
-    )
-    T = JuMP.value_type(typeof(model))
-    linearization_point = Dict{
-        InfiniteOpt.GeneralVariableRef, Vector{T}
-        }(
-        variable => _per_support_values(variable)
-        for variable in DP.collect_all_vars(model)
-        if !JuMP.is_fixed(variable))
-    return linearization_point,
-        _objective_linearization_point(model, linearization_point)
-end
-
-# Same split as `read_primary_solution`: InfiniteOpt-keyed dict for
-# disjunct cuts, plus the matching objective-side point.
-function DP.read_feas_solution(
-    model::InfiniteOpt.InfiniteModel, feas::NamedTuple
-    )
-    linearization_point = DP.extract_solution(feas.sub)
-    return linearization_point,
-        _objective_linearization_point(model, linearization_point)
-end
-
-# Bridge `linearization_point` (InfiniteOpt-keyed, per-support
-# `Vector` values) to the scalar-valued dict the base
-# `_linearize_at` AD pipeline expects. Aggregate objectives go
-# through transcription (flat JuMP-keyed scalar dict).
-# Aggregate-free objectives use only finite vars; we keep the
-# InfiniteOpt keys and collapse the 1-element per-support vector
-# to a scalar so AD reads `xk[v]` as a number.
-function _objective_linearization_point(
-    model::InfiniteOpt.InfiniteModel,
-    linearization_point::AbstractDict
-    )
-    if DP.has_aggregate_ref(JuMP.objective_function(model))
-        return _transcribe_linearization_point(
-            model, linearization_point)
-    end
-    T = eltype(valtype(linearization_point))
-    scalar_point = Dict{InfiniteOpt.GeneralVariableRef, T}()
-    for (variable, values) in linearization_point
-        isempty(InfiniteOpt.parameter_refs(variable)) || continue
-        scalar_point[variable] = values[1]
-    end
-    return scalar_point
-end
 
 end

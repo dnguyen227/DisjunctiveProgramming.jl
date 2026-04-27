@@ -238,14 +238,13 @@ function _solve_nlp(
     fix_combination_binaries(model, combination)
     JuMP.optimize!(model, ignore_optimize_hook = true)
     if JuMP.is_solved_and_feasible(model)
-        lin_point, obj_lin_point = read_primary_solution(model)
+        lin_point = extract_solution(model)
         duals = _collect_nlp_duals(model, combination, reformulation_map)
         objective_val = JuMP.objective_value(model)
         unfix_combination_binaries(model, combination)
         return (combination = combination,
             linearization_point = lin_point, duals = duals,
-            objective = objective_val, feasible = true,
-            objective_linearization_point = obj_lin_point)
+            objective = objective_val, feasible = true)
     end
     unfix_combination_binaries(model, combination)
     active_refs = _active_disjunct_constraint_refs(model, combination)
@@ -258,13 +257,12 @@ function _solve_nlp(
     end
     JuMP.optimize!(feas.sub.model)
     lin_point = JuMP.is_solved_and_feasible(feas.sub.model) ?
-        first(read_feas_solution(model, feas)) :
+        extract_solution(feas.sub) :
         Dict{JuMP.AbstractVariableRef, Any}()
     return (combination = combination,
         linearization_point = lin_point,
         duals = Dict{DisjunctConstraintRef{M}, Any}(),
-        objective = Inf, feasible = false,
-        objective_linearization_point = lin_point)
+        objective = Inf, feasible = false)
 end
 
 # `DisjunctConstraintRef`s of every active indicator in `combination`.
@@ -372,27 +370,6 @@ function _slacken(f, set::_MOI.EqualTo, u)
     return [(f - u, _MOI.LessThan(b)), (f + u, _MOI.GreaterThan(b))]
 end
 _slacken(f, set, u) = [(f, set)]
-
-# OVERRIDABLE. Read the primal NLP solution. Returns
-# `(linearization_point, objective_linearization_point)`; both dicts
-# are equal here. InfiniteOpt overrides to return a transcribed scalar
-# dict for the second element when needed.
-function read_primary_solution(model::JuMP.AbstractModel)
-    linearization_point = Dict{JuMP.AbstractVariableRef, Any}()
-    for variable in JuMP.all_variables(model)
-        JuMP.is_fixed(variable) && continue
-        linearization_point[variable] = JuMP.value(variable)
-    end
-    return linearization_point, linearization_point
-end
-
-# OVERRIDABLE. As `read_primary_solution`, but for the V&G
-# feasibility-restoration submodel; values keyed back to original-model
-# vars via `feas.sub`.
-function read_feas_solution(model::JuMP.AbstractModel, feas::NamedTuple)
-    linearization_point = extract_solution(feas.sub)
-    return linearization_point, linearization_point
-end
 
 ################################################################################
 #                       BIGM DUAL COLLECTION
@@ -506,7 +483,7 @@ function _add_oa_cuts(
     )
     isempty(result.linearization_point) && return
     linearization = _linearize_at(master.original_objective,
-        result.objective_linearization_point, master.objective_ref_map)
+        result.linearization_point, master.objective_ref_map)
     _add_objective_cut(Val(master.objective_sense), master, linearization)
     add_disjunct_oa_cuts(model, master, result, method)
     return
