@@ -619,7 +619,7 @@ function _linearize_at(
         nlp, _MOI.Nonlinear.SparseReverseMode(), ord)
     _MOI.initialize(evaluator, [:Grad])
 
-    xk_vec = [get(xk, v, zero(T)) for v in vars]
+    xk_vec = [_unwrap_scalar(get(xk, v, zero(T))) for v in vars]
     f_xk = _MOI.eval_objective(evaluator, xk_vec)
     grad = zeros(T, n)
     _MOI.eval_objective_gradient(evaluator, grad, xk_vec)
@@ -641,3 +641,11 @@ end
 _set_rhs(s::Union{_MOI.LessThan, _MOI.GreaterThan, _MOI.EqualTo}) =
     _MOI.constant(s)
 _set_rhs(::Any) = 0.0
+
+# Unwrap a 1-element per-support `Vector` to its scalar value;
+# scalars pass through. `extract_solution` returns per-support
+# `Vector`s uniformly (length-1 for finite, length-K for InfiniteOpt).
+# AD pipelines and `set_start_value` need a scalar in the finite
+# case; per-support consumers slice out a scalar themselves.
+_unwrap_scalar(v::Real) = v
+_unwrap_scalar(v::AbstractVector) = only(v)
