@@ -745,6 +745,11 @@ function DP._add_oa_cuts(
         obj_point, master.objective_ref_map)
     DP._add_objective_cut(
         Val(master.objective_sense), master, linearization)
+    # WIP: InfiniteOpt globals need per-support handling analogous to
+    # the obj_point translation above (transcribe-or-flatten). Until
+    # that's implemented, base `_add_global_oa_cuts` is skipped here —
+    # calling it would break on infinite vars (per-support `Vector`
+    # values flow into `_linearize_at`'s scalar-only AD path).
     DP.add_disjunct_oa_cuts(model, master, result, method)
     return
 end

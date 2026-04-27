@@ -1,4 +1,4 @@
-using HiGHS
+using HiGHS, Ipopt, Juniper
 
 function test_loa_datatype()
     method = LOA(HiGHS.Optimizer)
@@ -139,6 +139,31 @@ function test_loa_error_fallback()
     @test_throws ErrorException DP.reformulate_model(42, method)
 end
 
+function test_loa_nonlinear_global()
+    # max x s.t. x^2 <= 25 (global), (x <= 3) ∨ (x <= 8), 0 <= x <= 10.
+    # Disjunct Y[2] permits x up to 8 but the global x^2 <= 25 bounds
+    # x to 5. Verifies that `_add_global_oa_cuts` emits the
+    # linearization of the global into the master without breaking
+    # the loop. Result must hit the global-binding optimum.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = GDPModel(juniper)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @constraint(model, x^2 <= 25)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 8, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    optimize!(model,
+        gdp_method = LOA(juniper; mip_optimizer = HiGHS.Optimizer))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 5.0 atol = 1e-3
+end
+
 function test_linearize_nonlinear_exp()
     # exp(x) + y at (1, 2):
     # f = e + 2, ∇f = [e, 1]
@@ -219,6 +244,7 @@ end
     test_loa_solve_simple()
     test_loa_solve_two_disjunctions()
     test_loa_error_fallback()
+    test_loa_nonlinear_global()
     test_linearize_nonlinear_exp()
     test_linearize_nonlinear_sin()
     test_linearize_nonlinear_multivar()
