@@ -501,46 +501,75 @@ A type for using the P-split reformulation approach for disjunctive constraints.
 This method partitions variables into groups and handles each group separately.
 
 # Constructors
-- `PSplit(partition::Vector{Vector{V}})`: Create a PSplit with the given 
-partition of variables
-- `PSplit(n_parts::Int, model::JuMP.AbstractModel)`: Automatically partition 
-model variables into `n_parts` groups
+- `PSplit(partition::Vector{Vector{V}}; convexify=:off)`: Create a PSplit
+  with the given partition of variables.
+- `PSplit(n_parts::Int, model::JuMP.AbstractModel; convexify=:off)`:
+  Automatically partition model variables into `n_parts` groups.
+
+# Keyword Arguments
+- `convexify::Symbol`: Controls handling of bilinear terms inside disjunct
+  constraints. `:off` (default) errors on any bilinear, matching the
+  baseline P-split assumption of convex additively separable functions.
+  `:mccormick` lifts each bilinear `c*x*y` to a fresh global auxiliary
+  variable `w_xy` with an exact definitional equality `w_xy == x*y`
+  (enforced by the underlying solver, e.g. Gurobi `NonConvex=2`) plus the
+  four McCormick valid inequalities, leaving the disjunct affine in `w_xy`.
+  This realises the Section 5 ("Beyond convex disjuncts") path of
+  Kronqvist, Misener, Tsay (2022) while preserving feasibility exactness.
+  Only single-shift bilinears `x*y` and `c*(x-x0)*y` are recognised.
 
 # Fields
-- `partition::Vector{Vector{V}}`: The partition of variables, where each inner 
-vector represents a group of variables that will be handled together
+- `partition::Vector{Vector{V}}`: The partition of variables, where each
+  inner vector represents a group of variables that will be handled
+  together.
+- `convexify::Symbol`: Bilinear handling mode (`:off | :mccormick`).
+- `bilinear_lifts::Dict{Tuple{V, V}, V}`: Internal cache mapping each
+  lifted bilinear pair `(x, y)` to its auxiliary variable `w_xy` so
+  repeated bilinears across disjuncts share one lift.
 """
 struct PSplit{V <: JuMP.AbstractVariableRef} <: AbstractReformulationMethod
     partition::Vector{Vector{V}}
+    convexify::Symbol
+    bilinear_lifts::Dict{Tuple{V, V}, V}
 
-    function PSplit(partition::Vector{Vector{V}}) where 
-        {V <: JuMP.AbstractVariableRef}
-        new{V}(partition)
+    function PSplit(
+        partition::Vector{Vector{V}};
+        convexify::Symbol = :off
+        ) where {V <: JuMP.AbstractVariableRef}
+        convexify in (:off, :mccormick) || error(
+            "PSplit `convexify` must be :off or :mccormick, got " *
+            "$convexify"
+            )
+        new{V}(partition, convexify, Dict{Tuple{V, V}, V}())
     end
 
-    function PSplit(n_parts::Int, model::JuMP.AbstractModel)
-        n_parts > 0 || error("Number of partitions must be 
-        positive, got $n_parts")
+    function PSplit(
+        n_parts::Int,
+        model::JuMP.AbstractModel;
+        convexify::Symbol = :off
+        )
+        n_parts > 0 || error(
+            "Number of partitions must be positive, got $n_parts")
         variables = collect_all_vars(model)
         n_vars = length(variables)
-        
+
         n_parts = min(n_parts, n_vars)
         n_parts > 0 || error("No variables found in the model")
-        
+
         base_size = n_vars ÷ n_parts
         remaining = n_vars % n_parts
-        
+
         partition = Vector{Vector{eltype(variables)}}()
         start_idx = 1
-        
+
         for i in 1:n_parts
             part_size = i <= remaining ? base_size + 1 : base_size
             end_idx = start_idx + part_size - 1
             push!(partition, variables[start_idx:end_idx])
             start_idx = end_idx + 1
         end
-        
-        return PSplit(partition)
+
+        return PSplit(partition; convexify = convexify)
     end
 end
 
@@ -549,13 +578,15 @@ mutable struct _PSplit{V <: JuMP.AbstractVariableRef, M <: JuMP.AbstractModel, T
     partition::Vector{Vector{V}}
     sum_constraints::Dict{LogicalVariableRef{M}, Vector{<:AbstractConstraint}}
     hull::_Hull{V, T}
-    function _PSplit(method::PSplit{V}, model::M) where 
+    convexify::Symbol
+    function _PSplit(method::PSplit{V}, model::M) where
         {V <: JuMP.AbstractVariableRef, M <: JuMP.AbstractModel}
         T = JuMP.value_type(M)
         new{V, M, T}(
-            method.partition, 
-            Dict{LogicalVariableRef{M}, Vector{<:AbstractConstraint}}(), 
-            _Hull(Hull(), Set{V}())
+            method.partition,
+            Dict{LogicalVariableRef{M}, Vector{<:AbstractConstraint}}(),
+            _Hull(Hull(), Set{V}()),
+            method.convexify
         )
     end
 end

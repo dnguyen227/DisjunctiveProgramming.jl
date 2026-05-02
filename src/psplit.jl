@@ -64,6 +64,124 @@ end
 
 
 ################################################################################
+#                       BILINEAR LIFTING (Section 5)
+################################################################################
+# Implements the convex-underestimator escape hatch from Kronqvist, Misener,
+# Tsay (2022) Section 5 "Beyond convex disjuncts" with one extra ingredient:
+# rather than using the McCormick envelope as a stand-alone relaxation of the
+# disjunct constraint, we lift each bilinear `c*x*y` to a fresh global
+# auxiliary variable `w_xy`, pin `w_xy == x*y` exactly via a global
+# definitional constraint (the underlying solver enforces it -- e.g. Gurobi
+# `NonConvex=2` spatial branch-and-bound), and add the four McCormick cuts
+# globally as valid LP-tightening inequalities. The disjunct then sees only
+# `c*w_xy` (affine), satisfying P-split Assumption 1 while preserving
+# objective parity with BigM/MBM/Hull on the original problem.
+
+# Walk a quadratic expression and return (coeff, x, y) for every off-diagonal
+# bilinear term. Square terms (a == b) and the affine part are skipped.
+function _extract_bilinear_pairs(quad::JuMP.GenericQuadExpr{T, V}) where {T, V}
+    pairs = Vector{Tuple{T, V, V}}()
+    for (vars, coeff) in quad.terms
+        if vars.a !== vars.b
+            push!(pairs, (coeff, vars.a, vars.b))
+        end
+    end
+    return pairs
+end
+
+# Read a variable's box bounds, erroring early if either side is missing.
+# This is the single source of truth for "must have both bounds" in the
+# convexify path.
+function _box_bounds(v::JuMP.AbstractVariableRef)
+    JuMP.has_lower_bound(v) && JuMP.has_upper_bound(v) || error(
+        "PSplit convexify: variable $v requires both lower and upper " *
+        "bounds for the McCormick lifting"
+        )
+    return JuMP.lower_bound(v), JuMP.upper_bound(v)
+end
+
+# Locate a cached lift for the unordered pair (x, y), or `nothing`.
+function _lookup_lift(
+    cache::Dict{Tuple{V, V}, V},
+    x::V,
+    y::V
+    ) where {V <: JuMP.AbstractVariableRef}
+    for ((a, b), w) in cache
+        if (a === x && b === y) || (a === y && b === x)
+            return w
+        end
+    end
+    return nothing
+end
+
+# Lift the bilinear x*y to a fresh global variable w with:
+#   1. an exact definitional equality `w == x*y` (solver-enforced),
+#   2. four McCormick cuts as global valid inequalities,
+#   3. box bounds on w derived from the corner products.
+# Returns the (cached or freshly created) auxiliary variable.
+function _lift_bilinear!(
+    model::JuMP.AbstractModel,
+    x::V,
+    y::V,
+    method::PSplit{V}
+    ) where {V <: JuMP.AbstractVariableRef}
+    cached = _lookup_lift(method.bilinear_lifts, x, y)
+    cached === nothing || return cached
+
+    xL, xU = _box_bounds(x)
+    yL, yU = _box_bounds(y)
+    corners = (xL * yL, xL * yU, xU * yL, xU * yU)
+    wL, wU = minimum(corners), maximum(corners)
+
+    # `VariableProperties(x*y)` carries the parameter refs through the
+    # InfiniteOpt extension overload, so `w` is `Infinite(...)` whenever
+    # x and y are infinite variables.
+    props = VariableProperties(x * y)
+    w = create_variable(model, props)
+    JuMP.set_name(w, "w_lift_$(hash((x, y)))")
+    JuMP.set_lower_bound(w, wL)
+    JuMP.set_upper_bound(w, wU)
+
+    JuMP.@constraint(model, w == x * y)
+    JuMP.@constraint(model, w >= yL * x + xL * y - xL * yL)
+    JuMP.@constraint(model, w >= yU * x + xU * y - xU * yU)
+    JuMP.@constraint(model, w <= yU * x + xL * y - xL * yU)
+    JuMP.@constraint(model, w <= yL * x + xU * y - xU * yL)
+
+    method.bilinear_lifts[(x, y)] = w
+    return w
+end
+
+# Substitute every bilinear term `c*x*y` in `con.func` with `c*w_xy` (lifting
+# as needed) and return the resulting affine-only `ScalarConstraint` carrying
+# the same set. Square terms (x^2) pass through unchanged for the existing
+# diagonal-quadratic dispatch downstream.
+function _convexify_quad(
+    con::JuMP.ScalarConstraint{F, S},
+    model::JuMP.AbstractModel,
+    method::PSplit
+    ) where {F <: JuMP.GenericQuadExpr, S}
+    bilinears = _extract_bilinear_pairs(con.func)
+    isempty(bilinears) && return con
+
+    new_quad = zero(F)
+    for (vars, coeff) in con.func.terms
+        if vars.a === vars.b
+            JuMP.add_to_expression!(new_quad, coeff, vars.a, vars.b)
+        end
+    end
+    JuMP.add_to_expression!(new_quad, con.func.aff)
+
+    for (coeff, x, y) in bilinears
+        w = _lift_bilinear!(model, x, y, method)
+        JuMP.add_to_expression!(new_quad, coeff, w)
+    end
+
+    return JuMP.ScalarConstraint(new_quad, con.set)
+end
+
+
+################################################################################
 #                              BOUND AUXILIARY
 ################################################################################
 function _bound_auxiliary(
@@ -226,11 +344,14 @@ function reformulate_disjunction(
 end
 
 function reformulate_disjunction(
-    model::JuMP.AbstractModel, 
-    disj::Disjunction, 
+    model::JuMP.AbstractModel,
+    disj::Disjunction,
     method::_PSplit
 )
-    return reformulate_disjunction(model, disj, PSplit(method.partition))
+    return reformulate_disjunction(
+        model, disj,
+        PSplit(method.partition; convexify = method.convexify)
+        )
 end
 
 function _reformulate_disjunct(
@@ -259,13 +380,18 @@ function _partition_disjunct(
     partitioned_constraints = Vector{AbstractConstraint}()
     sum_constraints = Vector{AbstractConstraint}()
     aux_vars = Set{JuMP.AbstractVariableRef}()
-    for cref in _indicator_to_constraints(model)[lvref] 
+    for cref in _indicator_to_constraints(model)[lvref]
         con = JuMP.constraint_object(cref)
         if !(con isa Disjunction)
+            if method.convexify == :mccormick &&
+                con isa JuMP.ScalarConstraint &&
+                con.func isa JuMP.GenericQuadExpr
+                con = _convexify_quad(con, model, method)
+            end
             part_con, sum_con, new_aux_vars = _build_partitioned_constraint(model, con, method)
             append!(partitioned_constraints, part_con)
             append!(sum_constraints, sum_con)
-            union!(aux_vars, new_aux_vars)   
+            union!(aux_vars, new_aux_vars)
         end
     end
     return partitioned_constraints, sum_constraints, aux_vars
