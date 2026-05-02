@@ -148,6 +148,19 @@ function _lift_bilinear!(
     JuMP.@constraint(model, w <= yU * x + xL * y - xL * yU)
     JuMP.@constraint(model, w <= yL * x + xU * y - xU * yL)
 
+    # `w` must live in some partition block, otherwise
+    # `_build_partitioned_expression` silently drops its coefficient and the
+    # disjunct constraint loses the lifted term. Place it next to `x` (the
+    # first variable of the bilinear pair) so the partition stays
+    # interpretable; fall back to block 1 if `x` is in no block (e.g. a
+    # hand-crafted partition that intentionally excludes it).
+    blk = findfirst(p -> any(v -> v === x, p), method.partition)
+    push!(method.partition[blk === nothing ? 1 : blk], w)
+
+    # Register w with the bound-info dictionary that `_bound_auxiliary`
+    # reads from. The pre-reformulation pass populated it before w existed.
+    _variable_bounds(model)[w] = set_variable_bound_info(w, method)
+
     method.bilinear_lifts[(x, y)] = w
     return w
 end
