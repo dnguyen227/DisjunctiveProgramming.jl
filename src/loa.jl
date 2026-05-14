@@ -4,6 +4,11 @@
 # Türkay & Grossmann (1996), Comp. & Chem. Eng. 20(8), 959-978
 # With augmented-penalty OA master from:
 # Viswanathan & Grossmann (1990), Comp. & Chem. Eng. 14(7), 769-782
+#
+# Infeasible primary NLPs are handled solely via the master's augmented
+# penalty: the combination is forbidden by a no-good cut and no OA cut
+# is emitted from that iteration. No separate feasibility-restoration
+# (NLPF) subproblem is built.
 ################################################################################
 
 ################################################################################
@@ -228,10 +233,9 @@ end
 #                          NLP SUBPROBLEM
 ################################################################################
 # Solve the primary NLP for a fixed combination. If feasible, read the
-# primal point, duals, and objective and return. If infeasible, build a
-# fresh V&G 1990 NLPF submodel (active-disjunct originals + globals,
-# slackened with shared `u` and `min u` objective), solve it for a
-# least-infeasible point, and return that. The NLPF is discarded.
+# primal point, duals, and objective. If infeasible, return an empty
+# result — the master's augmented penalty (slacks `σ_ik` on disjunct OA
+# cuts) absorbs infeasibility and a no-good cut forbids the combination.
 function _solve_nlp(
     model::M, combination, method::LOA, reformulation_map
     ) where {M <: JuMP.AbstractModel}
@@ -247,38 +251,10 @@ function _solve_nlp(
             objective = objective_val, feasible = true)
     end
     unfix_combination_binaries(model, combination)
-    active_refs = _active_disjunct_constraint_refs(model, combination)
-    feas = copy_model_with_constraints(model, active_refs, method)
-    _embed_feas_slack(feas)
-    for (indicator, value) in combination
-        orig_binary_ref = _indicator_to_binary(model)[indicator]
-        fix_indicator(_remap_indicator_to_binary(
-            orig_binary_ref, feas.sub.fwd_map), value)
-    end
-    JuMP.optimize!(feas.sub.model)
-    lin_point = JuMP.is_solved_and_feasible(feas.sub.model) ?
-        extract_solution(feas.sub) :
-        Dict{JuMP.AbstractVariableRef, Any}()
     return (combination = combination,
-        linearization_point = lin_point,
+        linearization_point = Dict{JuMP.AbstractVariableRef, Any}(),
         duals = Dict{DisjunctConstraintRef{M}, Any}(),
         objective = Inf, feasible = false)
-end
-
-# `DisjunctConstraintRef`s of every active indicator in `combination`.
-function _active_disjunct_constraint_refs(
-    model::M,
-    combination::AbstractDict
-    ) where {M <: JuMP.AbstractModel}
-    refs = DisjunctConstraintRef{M}[]
-    for (indicator, active) in combination
-        any_active(active) || continue
-        haskey(_indicator_to_constraints(model), indicator) || continue
-        for cref in _indicator_to_constraints(model)[indicator]
-            cref isa DisjunctConstraintRef && push!(refs, cref)
-        end
-    end
-    return refs
 end
 
 # OVERRIDABLE. Fix every indicator in `combination` on `model`.
@@ -300,76 +276,6 @@ function unfix_combination_binaries(
         unfix_indicator(model, indicator)
     end
 end
-
-# OVERRIDABLE. Build a raw V&G 1990 NLPF submodel: copy decision
-# variables, copy global (non-reformulation) constraints and the active
-# disjuncts' original pre-BigM constraints. The shared slack `u` and
-# `min u` objective are layered on by `_embed_feas_slack`. Returns
-# `(sub::GDPSubmodel, objective_ref_map)`.
-function copy_model_with_constraints(
-    model::JuMP.AbstractModel,
-    disjunct_constraint_refs::Vector{<:DisjunctConstraintRef},
-    method::LOA
-    )
-    sub_model = _copy_model(model)
-    fwd_map = copy_variables_onto_model(sub_model, model)
-    variable_type = JuMP.variable_ref_type(typeof(model))
-    reform_set = is_gdp_model(model) ?
-        Set(_reformulation_constraints(model)) : Set()
-    for (F, S) in JuMP.list_of_constraint_types(model)
-        F === variable_type && continue
-        for cref in JuMP.all_constraints(model, F, S)
-            cref in reform_set && continue
-            con = JuMP.constraint_object(cref)
-            expr = replace_variables_in_constraint(con.func, fwd_map)
-            JuMP.@constraint(sub_model, expr in con.set)
-        end
-    end
-    for cref in disjunct_constraint_refs
-        con = JuMP.constraint_object(cref)
-        expr = replace_variables_in_constraint(con.func, fwd_map)
-        JuMP.@constraint(sub_model, expr in con.set)
-    end
-    JuMP.set_optimizer(sub_model, method.nlp_optimizer)
-    JuMP.set_silent(sub_model)
-    return (
-        sub = GDPSubmodel(sub_model, collect_all_vars(model), fwd_map),
-        objective_ref_map = fwd_map
-        )
-end
-
-# Convert the raw copy into a V&G 1990 NLPF problem: shared slack
-# embedded in every constraint via `_slacken`, `min slack` objective.
-function _embed_feas_slack(feas::NamedTuple)
-    model = feas.sub.model
-    slack = JuMP.@variable(model, base_name = "_feas_slack", lower_bound = 0.0)
-    variable_type = JuMP.variable_ref_type(typeof(model))
-    to_slacken = Any[]
-    for (F, S) in JuMP.list_of_constraint_types(model)
-        F === variable_type && continue
-        append!(to_slacken, JuMP.all_constraints(model, F, S))
-    end
-    for constraint_ref in to_slacken
-        constraint = JuMP.constraint_object(constraint_ref)
-        for (slack_func, slack_set) in _slacken(
-            constraint.func, constraint.set, slack)
-            JuMP.@constraint(model, slack_func in slack_set)
-        end
-        JuMP.delete(model, constraint_ref)
-    end
-    JuMP.@objective(model, Min, slack)
-    return
-end
-
-# Apply slack `u` to a constraint based on its set type. ≤: `f − u`;
-# ≥: `f + u`; ==: split into ≤ and ≥; otherwise passthrough.
-_slacken(f, set::_MOI.LessThan, u) = [(f - u, set)]
-_slacken(f, set::_MOI.GreaterThan, u) = [(f + u, set)]
-function _slacken(f, set::_MOI.EqualTo, u)
-    b = _MOI.constant(set)
-    return [(f - u, _MOI.LessThan(b)), (f + u, _MOI.GreaterThan(b))]
-end
-_slacken(f, set, u) = [(f, set)]
 
 ################################################################################
 #                       BIGM DUAL COLLECTION

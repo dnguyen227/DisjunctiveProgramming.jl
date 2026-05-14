@@ -933,53 +933,6 @@ _unfix_binary_at_supports(
     ::AbstractVector{Bool}
     ) = nothing
 
-# Build the LOA feasibility-restoration submodel as a fresh
-# `InfiniteModel`: copy the structural skeleton, then copy every
-# non-reformulation constraint plus the active disjuncts'
-# `disjunct_constraint_refs`. `fwd_map` maps input InfiniteOpt vars
-# to single feas-side InfiniteOpt vars; per-support handling falls
-# through to the `GeneralVariableRef` dispatches above.
-function DP.copy_model_with_constraints(
-    model::InfiniteOpt.InfiniteModel,
-    disjunct_constraint_refs::Vector{<:DP.DisjunctConstraintRef},
-    method::DP.LOA
-    )
-    sub_model = InfiniteOpt.InfiniteModel()
-    JuMP.set_optimizer(sub_model, method.nlp_optimizer)
-    JuMP.set_silent(sub_model)
-
-    ref_map = DP.copy_variables_onto_model(sub_model, model)
-
-    variable_type = InfiniteOpt.GeneralVariableRef
-    reform_set = DP.is_gdp_model(model) ?
-        Set(DP._reformulation_constraints(model)) : Set()
-    for (F, S) in JuMP.list_of_constraint_types(model)
-        F === variable_type && continue
-        for cref in JuMP.all_constraints(model, F, S)
-            cref in reform_set && continue
-            con = JuMP.constraint_object(cref)
-            new_func = DP.replace_variables_in_constraint(
-                con.func, ref_map)
-            JuMP.@constraint(sub_model, new_func in con.set)
-        end
-    end
-    for cref in disjunct_constraint_refs
-        con = JuMP.constraint_object(cref)
-        new_func = DP.replace_variables_in_constraint(
-            con.func, ref_map)
-        JuMP.@constraint(sub_model, new_func in con.set)
-    end
-
-    decision_vars = filter(!_is_point_var, DP.collect_all_vars(model))
-    fwd_map = Dict{InfiniteOpt.GeneralVariableRef,
-        InfiniteOpt.GeneralVariableRef}()
-    for v in decision_vars
-        fwd_map[v] = ref_map[v]
-    end
-    return (sub = DP.GDPSubmodel(sub_model, decision_vars, fwd_map),
-        objective_ref_map = ref_map)
-end
-
 # Convert an InfiniteModel-var-keyed per-support point into a
 # transcribed-JuMP-var-keyed scalar point. Companion to
 # `_transcribed_to_master_point`: feeds the AD walker for the
