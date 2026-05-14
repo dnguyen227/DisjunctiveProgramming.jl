@@ -85,7 +85,7 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
     for combination in combinations
         result = _solve_nlp(model, combination, method, reformulation_map)
         avoid_combination(master.model, combination, master.binary_map)
-        _add_oa_cuts(model, master, result, method)
+        add_oa_cuts(model, master, result, method)
         if result.feasible && is_better(result.objective)
             best_objective = result.objective
             best_result = result
@@ -101,7 +101,7 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
         combination = _extract_combination(model, master)
         result = _solve_nlp(model, combination, method, reformulation_map)
         avoid_combination(master.model, combination, master.binary_map)
-        _add_oa_cuts(model, master, result, method)
+        add_oa_cuts(model, master, result, method)
         if result.feasible && is_better(result.objective)
             best_objective = result.objective
             best_result = result
@@ -109,8 +109,8 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
     end
 
     if best_result !== nothing
-        fix_combination_binaries(model, best_result.combination)
-        set_start_values(model, best_result.linearization_point)
+        commit_combination(model, best_result.combination,
+            best_result.linearization_point)
     end
     _set_solution_method(model, method)
     _set_ready_to_optimize(model, true)
@@ -239,42 +239,59 @@ end
 function _solve_nlp(
     model::M, combination, method::LOA, reformulation_map
     ) where {M <: JuMP.AbstractModel}
-    fix_combination_binaries(model, combination)
-    JuMP.optimize!(model, ignore_optimize_hook = true)
-    if JuMP.is_solved_and_feasible(model)
-        lin_point = extract_solution(model)
-        duals = _collect_nlp_duals(model, combination, reformulation_map)
-        objective_val = JuMP.objective_value(model)
-        unfix_combination_binaries(model, combination)
+    return with_fixed_combination(model, combination) do
+        JuMP.optimize!(model, ignore_optimize_hook = true)
+        if JuMP.is_solved_and_feasible(model)
+            lin_point = extract_solution(model)
+            duals = _collect_nlp_duals(
+                model, combination, reformulation_map)
+            objective_val = JuMP.objective_value(model)
+            return (combination = combination,
+                linearization_point = lin_point, duals = duals,
+                objective = objective_val, feasible = true)
+        end
         return (combination = combination,
-            linearization_point = lin_point, duals = duals,
-            objective = objective_val, feasible = true)
+            linearization_point = Dict{JuMP.AbstractVariableRef, Any}(),
+            duals = Dict{DisjunctConstraintRef{M}, Any}(),
+            objective = Inf, feasible = false)
     end
-    unfix_combination_binaries(model, combination)
-    return (combination = combination,
-        linearization_point = Dict{JuMP.AbstractVariableRef, Any}(),
-        duals = Dict{DisjunctConstraintRef{M}, Any}(),
-        objective = Inf, feasible = false)
 end
 
-# OVERRIDABLE. Fix every indicator in `combination` on `model`.
-function fix_combination_binaries(
+# OVERRIDABLE. Fix the indicators in `combination`, run `f()`, unfix.
+# Holds the fix/unfix lifecycle in one call so extensions can manage
+# any per-support bookkeeping locally without `model.ext` stashing.
+function with_fixed_combination(
+    f,
     model::JuMP.AbstractModel,
     combination::AbstractDict
     )
     for (indicator, active) in combination
         fix_indicator(model, indicator, active)
     end
+    try
+        return f()
+    finally
+        for (indicator, _) in combination
+            unfix_indicator(model, indicator)
+        end
+    end
 end
 
-# OVERRIDABLE. Inverse of `fix_combination_binaries`.
-function unfix_combination_binaries(
+# OVERRIDABLE. Finalize the model with the LOA-optimal combination:
+# fix indicators (left fixed for the post-hook `optimize!`) and warm
+# start from the linearization point.
+function commit_combination(
     model::JuMP.AbstractModel,
-    combination::AbstractDict
+    combination::AbstractDict,
+    linearization_point::AbstractDict
     )
-    for (indicator, _) in combination
-        unfix_indicator(model, indicator)
+    for (indicator, active) in combination
+        fix_indicator(model, indicator, active)
     end
+    for (variable, value) in linearization_point
+        JuMP.set_start_value(variable, _unwrap_scalar(value))
+    end
+    return
 end
 
 ################################################################################
@@ -381,7 +398,7 @@ combination_val(binary_ref) = round(Bool, JuMP.value(binary_ref))
 ################################################################################
 #                          OA CUT EMISSION
 ################################################################################
-function _add_oa_cuts(
+function add_oa_cuts(
     model::JuMP.AbstractModel,
     master::NamedTuple,
     result::NamedTuple,
@@ -402,11 +419,6 @@ _add_objective_cut(::Val{_MOI.MIN_SENSE}, master, lin) =
 _add_objective_cut(::Val{_MOI.MAX_SENSE}, master, lin) =
     JuMP.@constraint(master.model, lin >= master.alpha_oa)
 
-# WIP: finite-only. InfiniteOpt's `_add_oa_cuts(::InfiniteModel, ...)`
-# override skips the call to this — globals over infinite vars yield
-# per-support `Vector` values that the scalar-only `_linearize_at` AD
-# path can't consume. A per-support-aware variant is the next step.
-#
 # Add the OA cut `g(x^l) + ∇g(x^l)^T (x − x^l) in con.set` for every
 # nonlinear global constraint of `model` — the third cut class in
 # Türkay & Grossmann (1996, eq. 12) alongside the objective and the
@@ -416,6 +428,10 @@ _add_objective_cut(::Val{_MOI.MAX_SENSE}, master, lin) =
 # `LessThan` and `GreaterThan` are supported; equalities and vector
 # constraints are passed through to `JuMP.@constraint` as-is —
 # valid for affine-after-linearization sets.
+#
+# Finite-only. InfiniteOpt's `add_oa_cuts(::InfiniteModel, ...)`
+# override uses `_add_global_oa_cuts_infinite`, which routes through
+# transcription to handle per-support / aggregate-ref globals.
 function _add_global_oa_cuts(
     model::JuMP.AbstractModel,
     master::NamedTuple,
@@ -548,18 +564,3 @@ function _linearize_at(
     return result
 end
 
-################################################################################
-#                            FINALIZATION
-################################################################################
-# OVERRIDABLE. Set JuMP start values from a scalar-valued
-# linearization-point dict. Warm-starts the post-hook `optimize!`
-# that JuMP fires after `reformulate_model` — without this the final
-# NLP solve restarts from wherever the last LOA iteration left the
-# model. InfiniteOpt overrides for per-support Vector values.
-function set_start_values(
-    ::JuMP.AbstractModel, linearization_point::AbstractDict
-    )
-    for (variable, value) in linearization_point
-        JuMP.set_start_value(variable, _unwrap_scalar(value))
-    end
-end

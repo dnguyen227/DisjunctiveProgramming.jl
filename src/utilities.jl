@@ -540,33 +540,6 @@ end
 ################################################################################
 
 ################################################################################
-#                    AGGREGATE-REF DETECTION
-################################################################################
-# Predicate: does the variable ref aggregate multiple decision
-# variables behind a single leaf? An "aggregate" ref is one that AD
-# cannot see inside — e.g. an InfiniteOpt `MeasureRef` (`∫ f(x,t) dt`
-# is one ref but depends on `x(t_1), …, x(t_K)`) or a
-# `ParameterFunctionRef`. Base returns false; the InfiniteOpt
-# extension overrides for aggregate ref types.
-#
-# When `has_aggregate_ref(expr)` is true, MOI Nonlinear AD on `expr`
-# would treat the aggregate as a single opaque variable and produce a
-# meaningless gradient. The LOA pipeline falls back to transcription
-# in that case (flat scalar expression, AD on the flat form, then map
-# back to master refs).
-#
-# #suggestions for names are welcome
-is_aggregate_ref(::JuMP.AbstractVariableRef) = false
-
-function has_aggregate_ref(expr)
-    found = Ref(false)
-    _interrogate_variables(expr) do v
-        found[] || (found[] = is_aggregate_ref(v))
-    end
-    return found[]
-end
-
-################################################################################
 #                    MOI NONLINEAR EXPRESSION CONVERSION
 ################################################################################
 # Convert JuMP expression trees to Julia Expr with
