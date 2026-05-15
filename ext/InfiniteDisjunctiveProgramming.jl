@@ -325,7 +325,10 @@ function DP.copy_and_reformulate(
     end
     sub = DP.GDPSubmodel(sub_copy, decision_vars, fwd_map)
     JuMP.set_optimizer(sub.model, method.optimizer)
-    JuMP.set_silent(sub.model)
+    # NOTE: previously called JuMP.set_silent(sub.model) here, but
+    # that hides the Gurobi B&B trace even when the caller passes
+    # OutputFlag=1 / LogToConsole=1 via optimizer_with_attributes.
+    # The caller is now responsible for silencing if desired.
     return sub
 end
 
@@ -600,11 +603,20 @@ function DP.build_loa_master(
 
     # Strip nonlinear constraints; they re-enter via OA cuts.
     # Variable bounds (F=GeneralVariableRef) are kept by `copy_model`.
+    # An aggregate-wrapped constraint (e.g. `∫(x^2,t) ≤ c`) is
+    # structurally affine over a `MeasureRef` so `_is_linear_F` reads
+    # it as linear, but it expands to a nonlinear form on
+    # transcription — strip it too and let the OA cut re-add the
+    # linearized version.
     variable_type = InfiniteOpt.GeneralVariableRef
     for (F, S) in JuMP.list_of_constraint_types(master)
         F === variable_type && continue
-        DP._is_linear_F(F) && continue
+        is_linear = DP._is_linear_F(F)
         for cref in JuMP.all_constraints(master, F, S)
+            if is_linear
+                con = JuMP.constraint_object(cref)
+                _has_aggregate_ref(con.func) || continue
+            end
             JuMP.delete(master, cref)
         end
     end
@@ -711,6 +723,8 @@ function _add_global_oa_cuts_infinite(
     result::NamedTuple,
     method::DP.LOA
     )
+    _, penalty_sign = DP._disjunct_cut_coefficients(
+        Val(master.objective_sense))
     variable_type = InfiniteOpt.GeneralVariableRef
     reform_set = DP.is_gdp_model(model) ?
         Set(DP._reformulation_constraints(model)) : Set()
@@ -739,12 +753,14 @@ function _add_global_oa_cuts_infinite(
                 for tf in vec(transcribed_func)
                     lin = DP._linearize_at(tf, transcribed_xk[],
                         transcribed_to_master[])
-                    JuMP.@constraint(master.model, lin in con.set)
+                    DP._add_global_oa_row!(master, lin, con.set,
+                        method, penalty_sign)
                 end
             else
                 lin = DP._linearize_at(transcribed_func,
                     transcribed_xk[], transcribed_to_master[])
-                JuMP.@constraint(master.model, lin in con.set)
+                DP._add_global_oa_row!(master, lin, con.set,
+                    method, penalty_sign)
             end
         end
     end

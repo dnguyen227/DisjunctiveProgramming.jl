@@ -791,6 +791,63 @@ function test_CuttingPlanes_multiparameter()
         [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
 end
 
+function test_loa_infinite_nonlinear_global()
+    # max ∫x dt s.t. x(t)^2 <= 25 (global, per-support nonlinear),
+    #   (x <= 3) ∨ (x <= 8), 0 <= x <= 10 over t ∈ [0, 1].
+    # Disjunct Y[2] permits x up to 8 but the global x^2 <= 25 caps
+    # x at 5. The per-support global transcribes to an `AbstractArray`
+    # of scalar constraints, so this exercises the array branch of
+    # `_add_global_oa_cuts_infinite`. Without the global cut the
+    # master would allow x = 8 and report 8.0; the binding optimum
+    # is ∫5 dt = 5.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    model = InfiniteGDPModel(ipopt)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 10)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @constraint(model, x^2 <= 25)
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 8, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, ∫(x, t))
+    optimize!(model,
+        gdp_method = LOA(ipopt; mip_optimizer = HiGHS.Optimizer))
+    @test termination_status(model) in
+        (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 5.0 atol = 1e-2
+end
+
+function test_loa_infinite_aggregate_global()
+    # min ∫x dt s.t. ∫(x^2, t) <= 4 (aggregate global), x >= y,
+    #   (y >= 1) ∨ (y >= 3), 0 <= x, y <= 10 over t ∈ [0, 1].
+    # The aggregate global transcribes to a single scalar (the
+    # measure is flattened), exercising the non-array branch of
+    # `_add_global_oa_cuts_infinite`. Y[1] (y >= 1) is the cheaper
+    # disjunct: x = 1 satisfies x >= y and ∫x^2 = 1 <= 4, giving
+    # objective ∫1 dt = 1.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    model = InfiniteGDPModel(ipopt)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 10)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, 0 <= y <= 10)
+    @constraint(model, ∫(x^2, t) <= 4)
+    @constraint(model, x >= y)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, y >= 1, Disjunct(Y[1]))
+    @constraint(model, y >= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, ∫(x, t))
+    optimize!(model,
+        gdp_method = LOA(ipopt; mip_optimizer = HiGHS.Optimizer))
+    @test termination_status(model) in
+        (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 1.0 atol = 1e-2
+end
+
 @testset "InfiniteDisjunctiveProgramming" begin
 
     @testset "Model" begin
@@ -853,6 +910,22 @@ end
         test_CuttingPlanes_infinite_two_disj()
         test_CuttingPlanes_with_cuts()
         test_CuttingPlanes_multiparameter()
+    end
+
+    # LOA on InfiniteOpt needs `JuMP.copy_model(::InfiniteModel)`
+    # (build_loa_master). That lives in the InfiniteOpt fork and is
+    # not in the registered release, so guard the suite: it runs
+    # (and validates the global-cut paths) when the fork is dev'd
+    # into the env, and skips cleanly otherwise.
+    @testset "LOA" begin
+        if hasmethod(JuMP.copy_model, Tuple{InfiniteModel})
+            test_loa_infinite_nonlinear_global()
+            test_loa_infinite_aggregate_global()
+        else
+            @info "Skipping InfiniteOpt LOA tests: " *
+                "JuMP.copy_model(::InfiniteModel) unavailable " *
+                "(registered InfiniteOpt; dev the fork to run)."
+        end
     end
 
 end

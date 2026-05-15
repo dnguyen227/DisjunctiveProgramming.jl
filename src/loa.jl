@@ -438,6 +438,8 @@ function _add_global_oa_cuts(
     result::NamedTuple,
     method::LOA
     )
+    _, penalty_sign = _disjunct_cut_coefficients(
+        Val(master.objective_sense))
     variable_type = JuMP.variable_ref_type(typeof(model))
     reform_set = is_gdp_model(model) ?
         Set(_reformulation_constraints(model)) : Set()
@@ -450,7 +452,8 @@ function _add_global_oa_cuts(
             con isa JuMP.ScalarConstraint || continue
             linearization = _linearize_at(con.func,
                 result.linearization_point, master.variable_map)
-            JuMP.@constraint(master.model, linearization in con.set)
+            _add_global_oa_row!(master, linearization, con.set,
+                method, penalty_sign)
         end
     end
     return
@@ -489,6 +492,22 @@ function add_disjunct_oa_cuts(
     end
 end
 
+# Fresh nonnegative slack added to the master objective with the V&G
+# 1990 penalty. Shared by the disjunct and global OA cuts so both get
+# the same augmented-penalty treatment: a nonconvex linearization can
+# be an invalid relaxation, and the penalized slack keeps the master
+# feasible instead of letting accumulated cuts make it infeasible.
+function _penalized_slack(
+    master::NamedTuple, method::LOA, penalty_sign::Int
+    )
+    slack = JuMP.@variable(master.model,
+        lower_bound = 0.0, upper_bound = method.max_slack)
+    JuMP.set_objective_function(master.model,
+        JuMP.objective_function(master.model) +
+            penalty_sign * method.OA_penalty_factor * slack)
+    return slack
+end
+
 # Linearize constraint at `linearization_point`, append a fresh per-cut
 # slack with V&G penalty, gate by `M(1 − binary)`. Linear constraints
 # are exact via BigM and skipped.
@@ -508,14 +527,58 @@ function _add_oa_cut_for_constraint(
     sign_value == 0 && return
     rhs = _set_rhs(constraint.set)
     linearization = _linearize_at(constraint.func, linearization_point, var_map)
-    slack = JuMP.@variable(master.model,
-        lower_bound = 0.0, upper_bound = method.max_slack)
-    JuMP.set_objective_function(master.model,
-        JuMP.objective_function(master.model) +
-            penalty_sign * method.OA_penalty_factor * slack)
+    slack = _penalized_slack(master, method, penalty_sign)
     JuMP.@constraint(master.model,
         sign_value * (linearization - rhs) - slack <=
             method.M_value * (1 - binary_ref))
+    return
+end
+
+# Slacked global OA row(s) (V&G 1990). The nonconvex linearization may
+# be an invalid relaxation, so each row carries a penalized slack
+# rather than being a hard constraint — without this the accumulated
+# global cuts make the master infeasible on nonconvex models.
+# `EqualTo` / `Interval` get a two-sided pair sharing one slack.
+# Unknown set types fall back to the prior hard cut.
+function _add_global_oa_row!(
+    master::NamedTuple, lin, set::_MOI.LessThan,
+    method::LOA, penalty_sign::Int
+    )
+    slack = _penalized_slack(master, method, penalty_sign)
+    JuMP.@constraint(master.model, lin - _MOI.constant(set) <= slack)
+    return
+end
+function _add_global_oa_row!(
+    master::NamedTuple, lin, set::_MOI.GreaterThan,
+    method::LOA, penalty_sign::Int
+    )
+    slack = _penalized_slack(master, method, penalty_sign)
+    JuMP.@constraint(master.model, _MOI.constant(set) - lin <= slack)
+    return
+end
+function _add_global_oa_row!(
+    master::NamedTuple, lin, set::_MOI.EqualTo,
+    method::LOA, penalty_sign::Int
+    )
+    slack = _penalized_slack(master, method, penalty_sign)
+    c = _MOI.constant(set)
+    JuMP.@constraint(master.model, lin - c <= slack)
+    JuMP.@constraint(master.model, c - lin <= slack)
+    return
+end
+function _add_global_oa_row!(
+    master::NamedTuple, lin, set::_MOI.Interval,
+    method::LOA, penalty_sign::Int
+    )
+    slack = _penalized_slack(master, method, penalty_sign)
+    JuMP.@constraint(master.model, lin - set.upper <= slack)
+    JuMP.@constraint(master.model, set.lower - lin <= slack)
+    return
+end
+function _add_global_oa_row!(
+    master::NamedTuple, lin, set, ::LOA, ::Int
+    )
+    JuMP.@constraint(master.model, lin in set)
     return
 end
 
