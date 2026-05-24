@@ -182,12 +182,11 @@ function DP.copy_model_with_constraints(
     constraints::Vector{<:DP.DisjunctConstraintRef},
     method::DP._MBM
     )
-    mini, ref_map = JuMP.copy_model(model)
-
-    # Drop global constraints.
-    for cref in JuMP.all_constraints(mini)
-        JuMP.delete(mini, cref)
-    end
+    # Filter out every source constraint at copy time instead of
+    # copying then deleting. Equivalent end state, fewer allocations.
+    mini, ref_map = JuMP.copy_model(
+        model; filter_constraints = cref -> false
+        )
 
     for cref in constraints
         con = JuMP.constraint_object(cref)
