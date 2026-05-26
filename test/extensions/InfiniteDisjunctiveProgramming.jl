@@ -819,6 +819,70 @@ function test_loa_infinite_nonlinear_global()
     @test objective_value(model) ≈ 5.0 atol = 1e-2
 end
 
+function test_loa_infinite_complement_indicator()
+    # Regression: `_indicator_to_binary(model)[Y2]` returns the AffExpr
+    # `1 - binary(Y1)` for a logical-complement indicator. Earlier the
+    # extension's `_fix_combination` called `JuMP.fix` directly on that
+    # AffExpr and crashed; now it delegates to base `fix_indicator`
+    # which unwraps and inverts.
+    #
+    # Linear disjuncts only — a nonlinear disjunct constraint on an
+    # infinite variable would also hit a separate gap where
+    # `cut_info` for a finite indicator does not slice the per-support
+    # linearization point. Out of scope for this regression.
+    #
+    # max ∫ x dt with 0 ≤ x ≤ 10 over t ∈ [0,1]:
+    #   Y1: x ≤ 3       Y2 ≡ ¬Y1: x ≤ 8
+    # Y2 is the maximizer (x = 8 across t), giving ∫8 dt = 8.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    model = InfiniteGDPModel(ipopt)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y1, Logical)
+    @variable(model, Y2, Logical, logical_complement = Y1)
+    @constraint(model, x <= 3, Disjunct(Y1))
+    @constraint(model, x <= 8, Disjunct(Y2))
+    @disjunction(model, [Y1, Y2])
+    @objective(model, Max, ∫(x, t))
+    optimize!(model,
+        gdp_method = LOA(ipopt; mip_optimizer = HiGHS.Optimizer))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 8.0 atol = 1e-2
+end
+
+function test_loa_infinite_multidim_parameter()
+    # Regression: multi-D dependent parameter group. `supports(ξ)` is
+    # a 2 × N matrix, not a vector. Earlier the extension called
+    # `vec(supports(ξ))`, flattened to 2·N scalars, then called
+    # `binary_ref(scalar)` on a 2-D infinite var — dim mismatch.
+    # Fixed by returning `eachcol(supports(ξ))` and splatting vector
+    # supports through `_at_support`.
+    #
+    # max w with 0 ≤ x ≤ 10 over ξ[1:2] ∈ [0,1]², w ≤ x at every joint
+    # support:
+    #   Y[1]: x ≤ 3       Y[2]: x ≤ 8
+    # Y[2] is the maximizer (x = 8 across ξ allows w = 8).
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    model = InfiniteGDPModel(ipopt)
+    set_silent(model)
+    @infinite_parameter(model, ξ[1:2] ∈ [0, 1], num_supports = 4)
+    @variable(model, 0 <= x <= 10, Infinite(ξ))
+    @variable(model, 0 <= w <= 10)
+    @constraint(model, w <= x)
+    @variable(model, Y[1:2], InfiniteLogical(ξ))
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 8, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, w)
+    optimize!(model,
+        gdp_method = LOA(ipopt; mip_optimizer = HiGHS.Optimizer))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 8.0 atol = 1e-2
+end
+
 function test_loa_infinite_aggregate_global()
     # min ∫x dt s.t. ∫(x^2, t) <= 4 (aggregate global), x >= y,
     #   (y >= 1) ∨ (y >= 3), 0 <= x, y <= 10 over t ∈ [0, 1].
@@ -921,6 +985,8 @@ end
         if hasmethod(JuMP.copy_model, Tuple{InfiniteModel})
             test_loa_infinite_nonlinear_global()
             test_loa_infinite_aggregate_global()
+            test_loa_infinite_complement_indicator()
+            test_loa_infinite_multidim_parameter()
         else
             @info "Skipping InfiniteOpt LOA tests: " *
                 "JuMP.copy_model(::InfiniteModel) unavailable " *

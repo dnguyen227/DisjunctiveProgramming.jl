@@ -402,8 +402,21 @@ function DP.combination_val(v::InfiniteOpt.GeneralVariableRef)
     return val isa AbstractArray ? vec(round.(Bool, val)) : round(Bool, val)
 end
 
-_supports_of(v::InfiniteOpt.GeneralVariableRef) =
-    vec(InfiniteOpt.supports(only(InfiniteOpt.parameter_refs(v))))
+# Supports of the infinite parameter group `v` depends on. For a 1-D
+# parameter, `supports(p)` is a `Vector{Float64}`; for a dependent
+# group of dimension k, it is a k × N_supports `Matrix`. Returns each
+# joint support point as one element — scalar for 1-D, column view for
+# multi-D — so callers can iterate uniformly. Pair with `_at_support`,
+# which splats vector supports into the variable's call form.
+function _supports_of(v::InfiniteOpt.GeneralVariableRef)
+    p = only(InfiniteOpt.parameter_refs(v))
+    sup = InfiniteOpt.supports(p)
+    ndims(sup) == 1 && return sup
+    # Materialize each column as a concrete `Vector{Float64}`;
+    # `eachcol` yields `SubArray` views that InfiniteOpt's
+    # `VectorTuple` constructor refuses.
+    return [sup[:, k] for k in axes(sup, 2)]
+end
 
 _is_point_var(v::InfiniteOpt.GeneralVariableRef) =
     InfiniteOpt.dispatch_variable_ref(v) isa InfiniteOpt.PointVariableRef
@@ -452,7 +465,7 @@ function DP.add_no_good_terms(
         return invoke(DP.add_no_good_terms,
             Tuple{Any, Any, Bool}, cut, binary_ref, active)
     for support in _supports_of(binary_ref)
-        DP.add_no_good_terms(cut, binary_ref(support), active)
+        DP.add_no_good_terms(cut, _at_support(binary_ref, support), active)
     end
     return
 end
@@ -465,7 +478,8 @@ function DP.add_no_good_terms(
     )
     supports = _supports_of(binary_ref)
     for (k, support) in enumerate(supports)
-        DP.add_no_good_terms(cut, binary_ref(support), actives[k])
+        DP.add_no_good_terms(
+            cut, _at_support(binary_ref, support), actives[k])
     end
     return
 end
@@ -519,7 +533,7 @@ function _cut_sites(
             point[variable] = _at(point_value, k)
         end
         push!(sites, (
-            binary_ref(support),
+            _at_support(binary_ref, support),
             point,
             point_var_map,
             _at(dual, k)
@@ -528,12 +542,19 @@ function _cut_sites(
     return sites
 end
 
-# Slice a per-support container at index `k`; pass scalars through.
-_at(values::AbstractArray, k::Integer) = values[k]
+# Slice a per-support container at index `k`. Length-1 vectors are
+# finite-shape (one value applies at every support, per
+# `_per_support_values` wrapping `JuMP.value` of a finite var as
+# `[scalar]`) — return the single value regardless of `k`. Scalars
+# pass through.
+_at(values::AbstractArray, k::Integer) =
+    length(values) == 1 ? values[1] : values[k]
 _at(scalar, ::Integer) = scalar
 
 # Point-evaluate an InfiniteOpt var at `support` if it's infinite;
-# return the var as-is if it's finite.
+# return the var as-is if it's finite. `support` is one joint support
+# point — a scalar for 1-D parameters, a vector for a multi-D
+# dependent group — and `v(support)` matches both call forms.
 _at_support(v::InfiniteOpt.GeneralVariableRef, support) =
     isempty(InfiniteOpt.parameter_refs(v)) ? v : v(support)
 
@@ -849,34 +870,42 @@ function DP.add_disjunct_oa_cuts(
 end
 
 # Apply per-indicator fixes for `combination` and return a closure
-# that reverses them. Scalar (`Bool`) values fix the whole infinite
-# var via `JuMP.fix`; per-support `AbstractVector{Bool}` values fix
-# each support with a point-equality constraint. Refs and fixed
-# binaries live in the closure — no `model.ext` stash. Used by base
-# `with_fixed_combination` and `commit_combination`.
+# that reverses them. Scalar (`Bool`) values delegate to base
+# `fix_indicator` (which unwraps complement-form `1 - y` AffExprs to
+# the underlying binary and inverts the target). Per-support
+# `AbstractVector{Bool}` values fix each support via a point-equality
+# constraint on the underlying infinite var. State lives in the
+# closure — no `model.ext` stash. Used by base `with_fixed_combination`
+# and `commit_combination`.
 function DP._fix_combination(
     model::InfiniteOpt.InfiniteModel, combination::AbstractDict
     )
     constraint_refs = InfiniteOpt.InfOptConstraintRef[]
-    fixed_binaries = InfiniteOpt.GeneralVariableRef[]
+    fixed_indicators = DP.LogicalVariableRef{
+        InfiniteOpt.InfiniteModel}[]
     for (indicator, value) in combination
-        binary_ref = DP._indicator_to_binary(model)[indicator]
         if value isa AbstractVector
-            for (k, support) in enumerate(_supports_of(binary_ref))
+            binary_ref = DP._indicator_to_binary(model)[indicator]
+            target, target_for_active = binary_ref isa JuMP.GenericAffExpr ?
+                (only(keys(binary_ref.terms)), 0.0) :
+                (binary_ref, 1.0)
+            target_for_inactive = 1.0 - target_for_active
+            for (k, support) in enumerate(_supports_of(target))
                 push!(constraint_refs, JuMP.@constraint(model,
-                    binary_ref(support) == (value[k] ? 1.0 : 0.0)))
+                    _at_support(target, support) ==
+                        (value[k] ? target_for_active : target_for_inactive)))
             end
         else
-            JuMP.fix(binary_ref, value ? 1.0 : 0.0; force = true)
-            push!(fixed_binaries, binary_ref)
+            DP.fix_indicator(model, indicator, value)
+            push!(fixed_indicators, indicator)
         end
     end
     return function ()
         for ref in constraint_refs
             JuMP.is_valid(model, ref) && JuMP.delete(model, ref)
         end
-        for binary_ref in fixed_binaries
-            JuMP.is_fixed(binary_ref) && JuMP.unfix(binary_ref)
+        for indicator in fixed_indicators
+            DP.unfix_indicator(model, indicator)
         end
     end
 end
