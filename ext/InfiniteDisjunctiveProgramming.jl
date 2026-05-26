@@ -848,116 +848,57 @@ function DP.add_disjunct_oa_cuts(
     end
 end
 
-# Fix indicators for `combination`, run `f()`, then undo. Bool values
-# are whole-var fixes via `JuMP.fix`; AbstractVector values are
-# per-support point-equality constraints. Refs and fixed binaries are
-# tracked in local state so cleanup runs from the same closure — no
-# `model.ext` stash.
-function DP.with_fixed_combination(
-    f,
-    model::InfiniteOpt.InfiniteModel,
-    combination::AbstractDict
+# Apply per-indicator fixes for `combination` and return a closure
+# that reverses them. Scalar (`Bool`) values fix the whole infinite
+# var via `JuMP.fix`; per-support `AbstractVector{Bool}` values fix
+# each support with a point-equality constraint. Refs and fixed
+# binaries live in the closure — no `model.ext` stash. Used by base
+# `with_fixed_combination` and `commit_combination`.
+function DP._fix_combination(
+    model::InfiniteOpt.InfiniteModel, combination::AbstractDict
     )
-    # Relax binaries so the NLP solver doesn't see ZeroOne (see the
-    # base `with_fixed_combination` for rationale).
-    relaxed_binaries = DP.relax_logical_vars(model)
     constraint_refs = InfiniteOpt.InfOptConstraintRef[]
     fixed_binaries = InfiniteOpt.GeneralVariableRef[]
     for (indicator, value) in combination
         binary_ref = DP._indicator_to_binary(model)[indicator]
-        _apply_fix!(
-            constraint_refs, fixed_binaries, model, binary_ref, value)
+        if value isa AbstractVector
+            for (k, support) in enumerate(_supports_of(binary_ref))
+                push!(constraint_refs, JuMP.@constraint(model,
+                    binary_ref(support) == (value[k] ? 1.0 : 0.0)))
+            end
+        else
+            JuMP.fix(binary_ref, value ? 1.0 : 0.0; force = true)
+            push!(fixed_binaries, binary_ref)
+        end
     end
-    try
-        return f()
-    finally
+    return function ()
         for ref in constraint_refs
             JuMP.is_valid(model, ref) && JuMP.delete(model, ref)
         end
         for binary_ref in fixed_binaries
             JuMP.is_fixed(binary_ref) && JuMP.unfix(binary_ref)
         end
-        DP.unrelax_logical_vars(relaxed_binaries)
     end
 end
 
-# Finalize the LOA-best combination + warm start, leaving the model
-# in a state the post-hook `optimize!` will accept. Mirrors
-# `with_fixed_combination` for the fixing half but skips bookkeeping
-# (these fixes stay).
-function DP.commit_combination(
-    model::InfiniteOpt.InfiniteModel,
-    combination::AbstractDict,
-    linearization_point::AbstractDict
-    )
-    constraint_refs = InfiniteOpt.InfOptConstraintRef[]
-    fixed_binaries = InfiniteOpt.GeneralVariableRef[]
-    for (indicator, value) in combination
-        binary_ref = DP._indicator_to_binary(model)[indicator]
-        _apply_fix!(
-            constraint_refs, fixed_binaries, model, binary_ref, value)
-    end
-    for (variable, values) in linearization_point
-        _set_starts_for_transcribed(
-            InfiniteOpt.transformation_variable(variable),
-            values
-            )
-    end
-    return
-end
-
-# Bool: fix the whole infinite var across all supports.
-function _apply_fix!(
-    ::AbstractVector,
-    fixed::AbstractVector,
-    ::InfiniteOpt.InfiniteModel,
-    binary_ref::InfiniteOpt.GeneralVariableRef,
-    value::Bool
-    )
-    JuMP.fix(binary_ref, value ? 1.0 : 0.0; force = true)
-    push!(fixed, binary_ref)
-    return
-end
-
-# Vector{Bool}: per-support point-equality constraints.
-function _apply_fix!(
-    refs::AbstractVector,
-    ::AbstractVector,
-    model::InfiniteOpt.InfiniteModel,
-    binary_ref::InfiniteOpt.GeneralVariableRef,
-    values::AbstractVector{Bool}
-    )
-    for (k, support) in enumerate(_supports_of(binary_ref))
-        push!(refs, JuMP.@constraint(model,
-            binary_ref(support) == (values[k] ? 1.0 : 0.0)))
-    end
-    return
-end
-
-# Infinite var: per-support transcribed array
-function _set_starts_for_transcribed(
-    transcribed::AbstractArray,
+# Broadcast a per-support warm start across an infinite var's
+# transcribed instances; for a finite var on an InfiniteModel,
+# `transcription_variable` returns a single ref and `values` is
+# length-1.
+function DP._set_warm_start!(
+    variable::InfiniteOpt.GeneralVariableRef,
     values::AbstractVector
     )
-    for (k, ref) in enumerate(vec(transcribed))
-        JuMP.set_start_value(ref, values[k])
+    transcribed = InfiniteOpt.transformation_variable(variable)
+    if transcribed isa AbstractArray
+        for (k, ref) in enumerate(vec(transcribed))
+            JuMP.set_start_value(ref, values[k])
+        end
+    else
+        JuMP.set_start_value(transcribed, only(values))
     end
     return
 end
-
-# Finite var: single transcribed ref, `values` is 1-element
-_set_starts_for_transcribed(
-    transcribed::JuMP.AbstractVariableRef,
-    values::AbstractVector
-    ) =
-    JuMP.set_start_value(transcribed, values[1])
-
-# Finite var: single transcribed ref, scalar value (feas-side path)
-_set_starts_for_transcribed(
-    transcribed::JuMP.AbstractVariableRef,
-    value::Real
-    ) =
-    JuMP.set_start_value(transcribed, value)
 
 # Convert an InfiniteModel-var-keyed per-support point into a
 # transcribed-JuMP-var-keyed scalar point. Companion to

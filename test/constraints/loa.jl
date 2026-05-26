@@ -10,6 +10,8 @@ function test_loa_datatype()
     @test method.M_value == 1e9
     @test method.max_slack == 1000.0
     @test method.OA_penalty_factor == 1000.0
+    @test method.inner_method isa BigM
+    @test method.inner_method.value == 1e9
 
     method = LOA(HiGHS.Optimizer; max_iter = 50, atol = 1e-8,
         rtol = 1e-6, M_value = 1e6, max_slack = 500.0,
@@ -20,6 +22,11 @@ function test_loa_datatype()
     @test method.M_value == 1e6
     @test method.max_slack == 500.0
     @test method.OA_penalty_factor == 200.0
+    @test method.inner_method isa BigM
+    @test method.inner_method.value == 1e6
+
+    method = LOA(HiGHS.Optimizer; inner_method = MBM(HiGHS.Optimizer))
+    @test method.inner_method isa MBM
 end
 
 function test_set_covering_combos()
@@ -110,6 +117,25 @@ function test_loa_solve_simple()
     @test objective_value(model) ≈ 7.0 atol=1e-4
 end
 
+function test_loa_solve_simple_with_mbm()
+    # Same GDP as test_loa_solve_simple, but inner_method = MBM so the
+    # NLP model is built with per-constraint tight Ms instead of BigM.
+    # Optimum unchanged: x = 7 via the second disjunct.
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer;
+        inner_method = MBM(HiGHS.Optimizer)))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 7.0 atol=1e-4
+end
+
 function test_loa_solve_two_disjunctions()
     # Two disjunctions: max x + z
     # D1: (x <= 3) OR (x <= 7)
@@ -162,6 +188,34 @@ function test_loa_nonlinear_global()
         gdp_method = LOA(juniper; mip_optimizer = HiGHS.Optimizer))
     @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
     @test objective_value(model) ≈ 5.0 atol = 1e-3
+end
+
+function test_loa_complement_indicator_nonlinear_disjunct()
+    # Regression: complement-form indicators store `1 - y_base` (an
+    # AffExpr) in `binary_map`. When the complement disjunct has a
+    # nonlinear constraint, `add_disjunct_oa_cuts` calls `cut_info`
+    # on that AffExpr; the AffExpr method must dispatch.
+    #
+    # Setup: 0 <= x <= 10, Y2 ≡ ¬Y1.
+    #   Disjunct(Y1): x <= 3     (linear)
+    #   Disjunct(Y2): x^2 <= 64  (nonlinear, optimum: x = 8 with Y2)
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = GDPModel(juniper)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y1, Logical)
+    @variable(model, Y2, Logical, logical_complement = Y1)
+    @constraint(model, x <= 3, Disjunct(Y1))
+    @constraint(model, x^2 <= 64, Disjunct(Y2))
+    @disjunction(model, [Y1, Y2])
+    @objective(model, Max, x)
+    optimize!(model,
+        gdp_method = LOA(juniper; mip_optimizer = HiGHS.Optimizer))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 8.0 atol = 1e-3
 end
 
 function test_linearize_nonlinear_exp()
@@ -242,9 +296,11 @@ end
     test_loa_convergence_check()
     test_loa_reformulate_simple()
     test_loa_solve_simple()
+    test_loa_solve_simple_with_mbm()
     test_loa_solve_two_disjunctions()
     test_loa_error_fallback()
     test_loa_nonlinear_global()
+    test_loa_complement_indicator_nonlinear_disjunct()
     test_linearize_nonlinear_exp()
     test_linearize_nonlinear_sin()
     test_linearize_nonlinear_multivar()

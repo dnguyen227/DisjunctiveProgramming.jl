@@ -15,15 +15,21 @@
 #                              METHOD TYPE
 ################################################################################
 """
-    LOA{O, P} <: AbstractReformulationMethod
+    LOA{O, P, R} <: AbstractReformulationMethod
 
 Logic-based Outer Approximation solver for GDP models. Uses two models: the
-original (BigM-reformulated, binaries fixed per iteration as an NLP) and a
-master MILP copy that accumulates OA and no-good cuts.
+original (reformulated by `inner_method`, binaries fixed per iteration as an
+NLP) and a master MILP copy that accumulates OA and no-good cuts.
+
+`inner_method` defaults to `BigM(M_value)`; pass `MBM(optimizer)` to use
+tighter per-constraint Ms. Other reformulations (`Hull`, `PSplit`) are not
+yet supported — they emit constraints whose shapes the LOA dual-collection
+logic can't slice.
 """
-struct LOA{O, P} <: AbstractReformulationMethod
+struct LOA{O, P, R} <: AbstractReformulationMethod
     nlp_optimizer::O
     mip_optimizer::P
+    inner_method::R
     max_iter::Int
     atol::Float64
     rtol::Float64
@@ -38,10 +44,11 @@ struct LOA{O, P} <: AbstractReformulationMethod
         rtol::Float64 = 1e-4,
         M_value::Float64 = 1e9,
         max_slack::Float64 = 1000.0,
-        OA_penalty_factor::Float64 = 1000.0
-        ) where {O, P}
-        new{O, P}(nlp_optimizer, mip_optimizer, max_iter, atol, rtol,
-            M_value, max_slack, OA_penalty_factor)
+        OA_penalty_factor::Float64 = 1000.0,
+        inner_method::R = BigM(M_value)
+        ) where {O, P, R <: AbstractReformulationMethod}
+        new{O, P, R}(nlp_optimizer, mip_optimizer, inner_method, max_iter,
+            atol, rtol, M_value, max_slack, OA_penalty_factor)
     end
 end
 
@@ -66,7 +73,7 @@ _flip_sense(::Val{_MOI.MAX_SENSE}) = Val(_MOI.MIN_SENSE)
 function reformulate_model(model::JuMP.AbstractModel, method::LOA)
     _clear_reformulations(model)
     combinations = _set_covering_combinations(model)
-    reformulate_model(model, BigM(method.M_value))
+    reformulate_model(model, method.inner_method)
 
     master = build_loa_master(model, method)
     reformulation_map = _build_reformulation_map(model)
@@ -97,6 +104,8 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
         JuMP.optimize!(master.model)
         JuMP.is_solved_and_feasible(master.model) || break
         master_bound = JuMP.objective_value(master.model)
+        @info "LOA iter $iter: LB=$master_bound  UB=$best_objective  " *
+              "gap=$(_gap(sense_token, best_objective, master_bound))"
         _loa_converged(best_objective, master_bound, sense_token, method) && break
         combination = _extract_combination(model, master)
         result = _solve_nlp(model, combination, method, reformulation_map)
@@ -257,42 +266,69 @@ function _solve_nlp(
     end
 end
 
-# OVERRIDABLE. Fix the indicators in `combination`, run `f()`, unfix.
-# Holds the fix/unfix lifecycle in one call so extensions can manage
-# any per-support bookkeeping locally without `model.ext` stashing.
+# Fix `combination`, run `f()`, unfix. Logical binaries are relaxed
+# from ZeroOne for the duration so a pure NLP solver (Ipopt) can
+# handle the inner solve; restored on exit. Extensions override
+# `_fix_combination` to handle per-support fixing without needing
+# their own try/finally lifecycle.
 function with_fixed_combination(
     f,
     model::JuMP.AbstractModel,
     combination::AbstractDict
     )
-    for (indicator, active) in combination
-        fix_indicator(model, indicator, active)
-    end
+    relaxed = relax_logical_vars(model)
+    undo = _fix_combination(model, combination)
     try
         return f()
     finally
+        undo()
+        unrelax_logical_vars(relaxed)
+    end
+end
+
+# Finalize the model with the LOA-optimal combination: relax logical
+# binaries (stripping ZeroOne so a pure NLP solver can handle the
+# post-hook `JuMP.optimize!`), fix indicators at the committed values,
+# and warm-start from the linearization point. After this, the model
+# is no longer in a state suitable for re-running with a different
+# `gdp_method`.
+function commit_combination(
+    model::JuMP.AbstractModel,
+    combination::AbstractDict,
+    linearization_point::AbstractDict
+    )
+    relax_logical_vars(model)
+    _fix_combination(model, combination)
+    for (variable, values) in linearization_point
+        _set_warm_start!(variable, values)
+    end
+    return
+end
+
+# OVERRIDABLE. Apply the combination's fixes and return a closure that
+# undoes them. Base loops `fix_indicator`/`unfix_indicator`. The
+# InfiniteOpt extension overrides this to handle per-support
+# `Vector{Bool}` values via point-equality constraints, keeping all
+# cleanup state captured in the returned closure.
+function _fix_combination(
+    model::JuMP.AbstractModel, combination::AbstractDict
+    )
+    for (indicator, value) in combination
+        fix_indicator(model, indicator, value)
+    end
+    return function ()
         for (indicator, _) in combination
             unfix_indicator(model, indicator)
         end
     end
 end
 
-# OVERRIDABLE. Finalize the model with the LOA-optimal combination:
-# fix indicators (left fixed for the post-hook `optimize!`) and warm
-# start from the linearization point.
-function commit_combination(
-    model::JuMP.AbstractModel,
-    combination::AbstractDict,
-    linearization_point::AbstractDict
-    )
-    for (indicator, active) in combination
-        fix_indicator(model, indicator, active)
-    end
-    for (variable, value) in linearization_point
-        JuMP.set_start_value(variable, _unwrap_scalar(value))
-    end
-    return
-end
+# OVERRIDABLE. Write the LOA linearization point into a variable's
+# warm start. `values` is always per-support shape (length-1 vector
+# for finite vars); base unwraps. The InfiniteOpt extension overrides
+# for `GeneralVariableRef` to broadcast across transcribed supports.
+_set_warm_start!(variable, values::AbstractVector) =
+    JuMP.set_start_value(variable, only(values))
 
 ################################################################################
 #                       BIGM DUAL COLLECTION
@@ -585,8 +621,17 @@ end
 # OVERRIDABLE. Yield `(binary_ref, lin_point, var_map, dual)` per OA
 # cut to emit. Scalar binary returns one tuple; InfiniteOpt overrides
 # for per-support `Vector` binaries to yield multiple sliced tuples.
+# `GenericAffExpr` covers complement-form indicators (`1 - y`) stored
+# in `binary_map` when a `Logical` is declared with `logical_complement`.
 cut_info(
     binary_ref::JuMP.AbstractVariableRef,
+    active::Bool,
+    linearization_point::AbstractDict,
+    variable_map::AbstractDict,
+    dual
+    ) = ((binary_ref, linearization_point, variable_map, dual),)
+cut_info(
+    binary_ref::JuMP.GenericAffExpr,
     active::Bool,
     linearization_point::AbstractDict,
     variable_map::AbstractDict,
