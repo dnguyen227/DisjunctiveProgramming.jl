@@ -10,15 +10,12 @@ Reexport = "189a3867-3050-52da-a836-e630ba90ab69"
 [weakdeps]
 InfiniteOpt = "20393b10-9daf-11e9-18c9-8db751c92c57"
 
-[sources]
-InfiniteOpt = {path = "..\\InfiniteOpt.jl"}
-
 [extensions]
 InfiniteDisjunctiveProgramming = "InfiniteOpt"
 
 [compat]
 Aqua = "0.8"
-InfiniteOpt = "0.6"
+InfiniteOpt = "0.6.3"
 Ipopt = "1.9.0"
 JuMP = "1.18"
 Juniper = "0.9.3"

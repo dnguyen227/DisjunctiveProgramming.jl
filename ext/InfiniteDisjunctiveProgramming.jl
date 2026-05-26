@@ -182,8 +182,8 @@ function DP.copy_model_with_constraints(
     constraints::Vector{<:DP.DisjunctConstraintRef},
     method::DP._MBM
     )
-    # Skip every source constraint at copy time instead of
-    # copying-then-deleting. Equivalent end state, no churn.
+    # Filter out every source constraint at copy time instead of
+    # copying then deleting. Equivalent end state, fewer allocations.
     mini, ref_map = JuMP.copy_model(
         model; filter_constraints = cref -> false
         )
