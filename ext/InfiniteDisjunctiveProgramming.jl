@@ -182,12 +182,11 @@ function DP.copy_model_with_constraints(
     constraints::Vector{<:DP.DisjunctConstraintRef},
     method::DP._MBM
     )
-    mini, ref_map = JuMP.copy_model(model)
-
-    # Drop global constraints.
-    for cref in JuMP.all_constraints(mini)
-        JuMP.delete(mini, cref)
-    end
+    # Skip every source constraint at copy time instead of
+    # copying-then-deleting. Equivalent end state, no churn.
+    mini, ref_map = JuMP.copy_model(
+        model; filter_constraints = cref -> false
+        )
 
     for cref in constraints
         con = JuMP.constraint_object(cref)
@@ -473,8 +472,14 @@ end
 
 function DP.cut_info(
     binary_ref::InfiniteOpt.GeneralVariableRef, active::Bool,
-    linearization_point, variable_map, dual
+    linearization_point::AbstractDict,
+    variable_map::AbstractDict, dual
     )
+    # Finite binary (plain `Logical` indicator on an `InfiniteModel`)
+    # has no infinite parameters — no per-support breakdown to do, so
+    # emit a single site like the base scalar method.
+    isempty(InfiniteOpt.parameter_refs(binary_ref)) &&
+        return ((binary_ref, linearization_point, variable_map, dual),)
     supports = _supports_of(binary_ref)
     return _cut_sites(binary_ref, supports,
         fill(true, length(supports)),
@@ -484,7 +489,8 @@ end
 function DP.cut_info(
     binary_ref::InfiniteOpt.GeneralVariableRef,
     actives::AbstractVector,
-    linearization_point, variable_map, dual
+    linearization_point::AbstractDict,
+    variable_map::AbstractDict, dual
     )
     return _cut_sites(binary_ref, _supports_of(binary_ref), actives,
         linearization_point, variable_map, dual)
@@ -593,33 +599,32 @@ end
 function DP.build_loa_master(
     model::InfiniteOpt.InfiniteModel, method::DP.LOA
     )
-    master, copy_ref_map = JuMP.copy_model(model)
+    # Linear, non-aggregate constraints stay on the master. Nonlinear
+    # constraints — and aggregate-wrapped affine ones like
+    # `∫(x^2,t) ≤ c`, which read linear via `_is_linear_F` over a
+    # `MeasureRef` but expand to a nonlinear form on transcription —
+    # re-enter as OA cuts after each NLP solve, so they are dropped
+    # at copy time instead of copied then deleted. Variable bounds
+    # proper live on VariableInfo and survive `copy_model` regardless;
+    # the `F === GeneralVariableRef` early-return covers
+    # variable-ref-as-constraint registrations.
+    variable_type = InfiniteOpt.GeneralVariableRef
+    master, copy_ref_map = JuMP.copy_model(
+        model;
+        filter_constraints = function (cref)
+            con = JuMP.constraint_object(cref)
+            F = typeof(con.func)
+            F === variable_type && return true
+            DP._is_linear_F(F) || return false
+            return !_has_aggregate_ref(con.func)
+        end
+        )
     # `copy_model` copies the GDP optimize-hook; clear it so
     # `optimize!(master)` doesn't re-trigger reformulation on the
     # (empty-GDP-data) master copy.
     JuMP.set_optimize_hook(master, nothing)
     JuMP.set_optimizer(master, method.mip_optimizer)
     JuMP.set_silent(master)
-
-    # Strip nonlinear constraints; they re-enter via OA cuts.
-    # Variable bounds (F=GeneralVariableRef) are kept by `copy_model`.
-    # An aggregate-wrapped constraint (e.g. `∫(x^2,t) ≤ c`) is
-    # structurally affine over a `MeasureRef` so `_is_linear_F` reads
-    # it as linear, but it expands to a nonlinear form on
-    # transcription — strip it too and let the OA cut re-add the
-    # linearized version.
-    variable_type = InfiniteOpt.GeneralVariableRef
-    for (F, S) in JuMP.list_of_constraint_types(master)
-        F === variable_type && continue
-        is_linear = DP._is_linear_F(F)
-        for cref in JuMP.all_constraints(master, F, S)
-            if is_linear
-                con = JuMP.constraint_object(cref)
-                _has_aggregate_ref(con.func) || continue
-            end
-            JuMP.delete(master, cref)
-        end
-    end
 
     # InfiniteReferenceMap supports indexing but not iteration; build
     # a Dict so downstream LOA code can `haskey` / iterate over the
@@ -853,6 +858,9 @@ function DP.with_fixed_combination(
     model::InfiniteOpt.InfiniteModel,
     combination::AbstractDict
     )
+    # Relax binaries so the NLP solver doesn't see ZeroOne (see the
+    # base `with_fixed_combination` for rationale).
+    relaxed_binaries = DP.relax_logical_vars(model)
     constraint_refs = InfiniteOpt.InfOptConstraintRef[]
     fixed_binaries = InfiniteOpt.GeneralVariableRef[]
     for (indicator, value) in combination
@@ -869,6 +877,7 @@ function DP.with_fixed_combination(
         for binary_ref in fixed_binaries
             JuMP.is_fixed(binary_ref) && JuMP.unfix(binary_ref)
         end
+        DP.unrelax_logical_vars(relaxed_binaries)
     end
 end
 
