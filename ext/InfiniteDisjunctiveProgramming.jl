@@ -390,6 +390,190 @@ end
 
 DP.any_active(actives::AbstractVector{Bool}) = any(actives)
 
+# Override `reformulate_model` for `InfiniteModel` so the LOA
+# `supports_schedule` activates the multi-resolution loop. With
+# `supports_schedule = nothing` this is identical to the base path. With
+# a schedule + `coarse_builder = N -> InfiniteModel`, the wrapper:
+#
+#   1. For each N in the schedule, build a FRESH InfiniteModel via
+#      `coarse_builder(N)`. Apply warm-starts captured from the previous
+#      warmup level (indexed by variable name + parameter name, which
+#      survive across model rebuilds). Run LOA. Capture trajectory.
+#      Discard the warmup model.
+#   2. Apply the final captured trajectory to the user's `model`.
+#   3. Run a single-level LOA on the user's model.
+#
+# This sidesteps every accumulated-state failure mode we hit when
+# mutating one InfiniteModel across resolutions (orphan point vars,
+# stale parameter supports, transcription cache poisoning, etc.).
+function DP.reformulate_model(
+    model::InfiniteOpt.InfiniteModel, method::DP.LOA
+    )
+    schedule = method.supports_schedule
+    if schedule === nothing
+        DP._reformulate_loa_single_level(model, method)
+        DP._set_solution_method(model, method)
+        DP._set_ready_to_optimize(model, true)
+        return
+    end
+
+    isempty(schedule) && error(
+        "LOA `supports_schedule` must be `nothing` or non-empty.")
+    builder = method.coarse_builder
+    builder === nothing && error(
+        "LOA `supports_schedule` requires `coarse_builder`.")
+
+    trajectory = nothing
+    for (level, N) in enumerate(schedule)
+        method.verbose && println(
+            "LOA_MULTIRES warmup level=", level, " N=", N,
+            trajectory === nothing ? " (cold start)" :
+                " (warm-start from level $(level - 1))")
+        warmup_model = builder(N)
+        if trajectory !== nothing
+            _apply_trajectory_by_name!(warmup_model, trajectory)
+        end
+        warmup_method = _strip_schedule(method)
+        warmup_result = DP._reformulate_loa_single_level(
+            warmup_model, warmup_method)
+        if warmup_result === nothing
+            method.verbose && println("LOA_MULTIRES warmup level=",
+                level, " no commit; trajectory unchanged")
+            continue
+        end
+        trajectory = _capture_trajectory_by_name(
+            warmup_model, warmup_result)
+        method.verbose && println("LOA_MULTIRES warmup level=",
+            level, " obj=", warmup_result.objective)
+    end
+
+    if trajectory !== nothing
+        method.verbose && println(
+            "LOA_MULTIRES applying warmup trajectory to user model")
+        _apply_trajectory_by_name!(model, trajectory)
+    end
+    DP._reformulate_loa_single_level(model, method)
+    DP._set_solution_method(model, method)
+    DP._set_ready_to_optimize(model, true)
+    return
+end
+
+# Build a copy of `method` with `supports_schedule = nothing` so the
+# warmup LOA runs as single-level (not recursively triggering its own
+# multi-res). The `coarse_builder` is irrelevant once the schedule is
+# stripped; nothing reads it.
+function _strip_schedule(method::DP.LOA)
+    return DP.LOA(method.nlp_optimizer;
+        mip_optimizer = method.mip_optimizer,
+        inner_method = method.inner_method,
+        max_iter = method.max_iter,
+        atol = method.atol, rtol = method.rtol,
+        M_value = method.M_value,
+        max_slack = method.max_slack,
+        oa_penalty = method.oa_penalty,
+        verbose = method.verbose)
+end
+
+# Capture the converged trajectory as a name-keyed dict so we can apply
+# it to a freshly-built model whose `GeneralVariableRef`s are different
+# objects. Also records each parameter's current supports (per name) so
+# the apply step knows the source grid for interpolation.
+function _capture_trajectory_by_name(
+    model::InfiniteOpt.InfiniteModel, result::NamedTuple
+    )
+    name_to_values = Dict{String, Vector{Float64}}()
+    for (variable, values) in result.linearization_point
+        nm = JuMP.name(variable)
+        isempty(nm) && continue
+        name_to_values[nm] = collect(values)
+    end
+    name_to_supports = Dict{String, Vector{Float64}}()
+    for p in InfiniteOpt.all_parameters(model)
+        nm = JuMP.name(p)
+        isempty(nm) && continue
+        sup = InfiniteOpt.supports(p)
+        ndims(sup) == 1 || continue
+        name_to_supports[nm] = collect(sup)
+    end
+    return (values = name_to_values, supports = name_to_supports)
+end
+
+# Apply a name-keyed trajectory to a fresh model: for each variable
+# whose name appears in `trajectory.values`, interpolate its captured
+# per-support values from the source parameter grid to this model's
+# grid and write as `set_start_value` on the transcribed JuMP refs.
+# Indicator binaries are skipped — they're not part of the primal
+# warm-start.
+function _apply_trajectory_by_name!(
+    target::InfiniteOpt.InfiniteModel, trajectory::NamedTuple
+    )
+    indicator_binaries = Set{InfiniteOpt.GeneralVariableRef}()
+    for (_, bref) in DP._indicator_to_binary(target)
+        push!(indicator_binaries, bref isa JuMP.GenericAffExpr ?
+            only(keys(bref.terms)) : bref)
+    end
+    InfiniteOpt.build_transformation_backend!(target)
+    for v in JuMP.all_variables(target)
+        v in indicator_binaries && continue
+        nm = JuMP.name(v)
+        haskey(trajectory.values, nm) || continue
+        values = trajectory.values[nm]
+        _warm_start_by_name(target, v, values, trajectory.supports)
+    end
+    return
+end
+
+# Variable-side warm-start: finite vars get the scalar value directly;
+# infinite (single-parameter) vars get linearly interpolated from the
+# captured source grid to this model's transcribed supports.
+function _warm_start_by_name(
+    ::InfiniteOpt.InfiniteModel,
+    variable::InfiniteOpt.GeneralVariableRef,
+    values::AbstractVector,
+    captured_supports::AbstractDict
+    )
+    prefs = InfiniteOpt.parameter_refs(variable)
+    if isempty(prefs)
+        length(values) == 1 || return
+        transcribed = InfiniteOpt.transformation_variable(variable)
+        transcribed isa JuMP.AbstractVariableRef || return
+        JuMP.set_start_value(transcribed, only(values))
+        return
+    end
+    length(prefs) == 1 || return
+    pname = JuMP.name(first(prefs))
+    haskey(captured_supports, pname) || return
+    old = captured_supports[pname]
+    length(values) == length(old) || return
+    new = InfiniteOpt.supports(first(prefs))
+    ndims(new) == 1 || return
+    transcribed = InfiniteOpt.transformation_variable(variable)
+    transcribed isa AbstractArray || return
+    refs = vec(transcribed)
+    length(refs) == length(new) || return
+    for (k, s) in enumerate(new)
+        JuMP.set_start_value(refs[k], _linear_interp(old, values, s))
+    end
+    return
+end
+
+# Piecewise-linear interpolation of `ys` defined on the increasing
+# nodes `xs`, evaluated at `q`. Clamps at the endpoints. Cheap and
+# stable enough for warm-starts; only neighborhood-correctness matters.
+function _linear_interp(
+    xs::AbstractVector{<:Real}, ys::AbstractVector{<:Real}, q::Real
+    )
+    n = length(xs)
+    q <= xs[1] && return ys[1]
+    q >= xs[n] && return ys[n]
+    i = searchsortedlast(xs, q)
+    i == n && return ys[n]
+    x0, x1 = xs[i], xs[i + 1]
+    x1 == x0 && return ys[i]
+    t = (q - x0) / (x1 - x0)
+    return (1 - t) * ys[i] + t * ys[i + 1]
+end
+
 # `JuMP.value` returns a per-support `Array` for infinite vars and a
 # scalar for finite vars. The `> 0.5` cutoff handles solver-side
 # integer-feasibility slack (e.g. HiGHS can return 2.75e-40 for a
@@ -398,6 +582,17 @@ DP.any_active(actives::AbstractVector{Bool}) = any(actives)
 # scalar for finite vars; `round(Bool, ·)` handles both via broadcast
 # and absorbs solver integer-feasibility slack.
 function DP.combination_val(v::InfiniteOpt.GeneralVariableRef)
+    val = JuMP.value(v)
+    return val isa AbstractArray ? vec(round.(Bool, val)) : round(Bool, val)
+end
+
+# Complement-form binary (`1 - y_underlying`) stored in `binary_map`
+# for indicators declared `logical_complement`. `JuMP.value` on the
+# AffExpr returns a per-support `Vector{Float64}` when the underlying
+# is infinite, or a scalar when it's finite.
+function DP.combination_val(
+    v::JuMP.GenericAffExpr{C, <:InfiniteOpt.GeneralVariableRef}
+    ) where {C}
     val = JuMP.value(v)
     return val isa AbstractArray ? vec(round.(Bool, val)) : round(Bool, val)
 end
@@ -484,34 +679,131 @@ function DP.add_no_good_terms(
     return
 end
 
+# Complement-form AffExpr (`1 - y_underlying`) with per-support active
+# descriptor — same fan-out as the variable-ref form, but the
+# underlying var lives inside the AffExpr's terms. Use the underlying
+# var's supports to drive the loop.
+function DP.add_no_good_terms(
+    cut, binary_ref::JuMP.GenericAffExpr,
+    actives::AbstractVector
+    )
+    underlying = only(keys(binary_ref.terms))
+    underlying isa InfiniteOpt.GeneralVariableRef || return invoke(
+        DP.add_no_good_terms,
+        Tuple{Any, Any, AbstractVector}, cut, binary_ref, actives)
+    supports = _supports_of(underlying)
+    for (k, support) in enumerate(supports)
+        DP.add_no_good_terms(
+            cut, _at_support(binary_ref, support), actives[k])
+    end
+    return
+end
+
 function DP.cut_info(
-    binary_ref::InfiniteOpt.GeneralVariableRef, active::Bool,
+    binary_ref::InfiniteOpt.GeneralVariableRef,
+    active::Bool,
+    constraint::JuMP.AbstractConstraint,
     linearization_point::AbstractDict,
     variable_map::AbstractDict, dual
     )
-    # Finite binary (plain `Logical` indicator on an `InfiniteModel`)
-    # has no infinite parameters — no per-support breakdown to do, so
-    # emit a single site like the base scalar method.
-    isempty(InfiniteOpt.parameter_refs(binary_ref)) &&
-        return ((binary_ref, linearization_point, variable_map, dual),)
-    supports = _supports_of(binary_ref)
-    return _cut_sites(binary_ref, supports,
-        fill(true, length(supports)),
+    return _infinite_cut_info(binary_ref, active, constraint.func,
         linearization_point, variable_map, dual)
 end
 
 function DP.cut_info(
     binary_ref::InfiniteOpt.GeneralVariableRef,
     actives::AbstractVector,
+    constraint::JuMP.AbstractConstraint,
     linearization_point::AbstractDict,
     variable_map::AbstractDict, dual
     )
-    return _cut_sites(binary_ref, _supports_of(binary_ref), actives,
+    return _infinite_cut_info(binary_ref, actives, constraint.func,
         linearization_point, variable_map, dual)
 end
 
+# Complement-form binary (`1 - y_underlying`). Same fan-out logic as
+# the variable-ref form; the per-support `_at_support` rebuilds the
+# AffExpr with its variable point-evaluated.
+function DP.cut_info(
+    binary_ref::JuMP.GenericAffExpr,
+    active::Bool,
+    constraint::JuMP.AbstractConstraint,
+    linearization_point::AbstractDict,
+    variable_map::AbstractDict, dual
+    )
+    return _infinite_cut_info(binary_ref, active, constraint.func,
+        linearization_point, variable_map, dual)
+end
+
+# Complement-form binary with per-support active descriptor (e.g.,
+# `BitVector` from `_extract_combination` on an InfiniteOpt master
+# where the indicator was declared `logical_complement`).
+function DP.cut_info(
+    binary_ref::JuMP.GenericAffExpr,
+    actives::AbstractVector,
+    constraint::JuMP.AbstractConstraint,
+    linearization_point::AbstractDict,
+    variable_map::AbstractDict, dual
+    )
+    return _infinite_cut_info(binary_ref, actives, constraint.func,
+        linearization_point, variable_map, dual)
+end
+
+# Fan out across supports if either the binary or the constraint
+# expression involves an infinite variable; otherwise emit one
+# un-sliced site. The chosen supports come from the first infinite
+# variable found in either expression.
+function _infinite_cut_info(
+    binary_ref, active, constraint_func,
+    linearization_point, variable_map, dual
+    )
+    supports = _relevant_supports(binary_ref, constraint_func)
+    supports === nothing &&
+        return ((binary_ref, linearization_point, variable_map, dual),)
+    actives = active isa AbstractVector ? active :
+        fill(active, length(supports))
+    return _cut_sites(binary_ref, supports, actives,
+        linearization_point, variable_map, dual)
+end
+
+# Supports governing per-support fan-out — pick the first infinite
+# variable found in the binary expression, falling back to the
+# constraint expression. `nothing` means everything is finite, so the
+# caller emits a single un-sliced site.
+function _relevant_supports(binary_ref, constraint_func)
+    var = _find_infinite_var(binary_ref)
+    var === nothing && (var = _find_infinite_var(constraint_func))
+    var === nothing && return nothing
+    return _supports_of(var)
+end
+
+_find_infinite_var(v::InfiniteOpt.GeneralVariableRef) =
+    isempty(InfiniteOpt.parameter_refs(v)) ? nothing : v
+
+function _find_infinite_var(expr::JuMP.GenericAffExpr)
+    for v in keys(expr.terms)
+        v isa InfiniteOpt.GeneralVariableRef || continue
+        result = _find_infinite_var(v)
+        result === nothing || return result
+    end
+    return nothing
+end
+
+function _find_infinite_var(expr)
+    found = Ref{Any}(nothing)
+    DP._interrogate_variables(expr) do v
+        found[] === nothing || return
+        v isa InfiniteOpt.GeneralVariableRef || return
+        isempty(InfiniteOpt.parameter_refs(v)) && return
+        found[] = v
+    end
+    return found[]
+end
+
+_find_infinite_var(::Any) = nothing
+
 function _cut_sites(
-    binary_ref::InfiniteOpt.GeneralVariableRef,
+    binary_ref,
     supports::AbstractVector,
     actives::AbstractVector,
     linearization_point::AbstractDict,
@@ -557,6 +849,19 @@ _at(scalar, ::Integer) = scalar
 # dependent group — and `v(support)` matches both call forms.
 _at_support(v::InfiniteOpt.GeneralVariableRef, support) =
     isempty(InfiniteOpt.parameter_refs(v)) ? v : v(support)
+
+# Rebuild a complement-form AffExpr (`1 - y_underlying`) with its
+# variables point-evaluated, so per-support fan-out can use the
+# AffExpr directly in the gating term `M(1 - binary_at_support)`.
+function _at_support(
+    expr::JuMP.GenericAffExpr{C, V}, support
+    ) where {C, V <: InfiniteOpt.GeneralVariableRef}
+    result = JuMP.GenericAffExpr{C, V}(expr.constant)
+    for (var, coef) in expr.terms
+        JuMP.add_to_expression!(result, coef, _at_support(var, support))
+    end
+    return result
+end
 
 # Build map: transcribed input JuMP var → master point variable.
 # For an infinite input var v, every transcribed support `v_k`
@@ -619,7 +924,7 @@ end
 # the flat scalar objective with a transcribed-to-master point map.
 function DP.build_loa_master(
     model::InfiniteOpt.InfiniteModel, method::DP.LOA
-    )
+    )::DP._LOAMaster
     # Linear, non-aggregate constraints stay on the master. Nonlinear
     # constraints — and aggregate-wrapped affine ones like
     # `∫(x^2,t) ≤ c`, which read linear via `_is_linear_F` over a
@@ -691,12 +996,9 @@ function DP.build_loa_master(
         variable_map[v] = ref_map[v]
     end
 
-    return (model = master, binary_map = binary_map,
-        variable_map = variable_map,
-        objective_sense = objective_sense,
-        original_objective = original_objective,
-        alpha_oa = alpha_oa,
-        objective_ref_map = objective_ref_map)
+    return DP._LOAMaster(master, binary_map, variable_map,
+        objective_sense, original_objective, alpha_oa,
+        objective_ref_map)
 end
 
 # Override the disjunct-cut loop for `InfiniteModel`. Same shape as
@@ -712,7 +1014,7 @@ end
 # produces whichever shape `_linearize_at` needs.
 function DP.add_oa_cuts(
     model::InfiniteOpt.InfiniteModel,
-    master::NamedTuple,
+    master::DP._LOAMaster,
     result::NamedTuple,
     method::DP.LOA
     )
@@ -745,7 +1047,7 @@ end
 # of scalar expressions — one OA cut is emitted per support.
 function _add_global_oa_cuts_infinite(
     model::InfiniteOpt.InfiniteModel,
-    master::NamedTuple,
+    master::DP._LOAMaster,
     result::NamedTuple,
     method::DP.LOA
     )
@@ -806,7 +1108,7 @@ end
 # constraints in the iteration.
 function DP.add_disjunct_oa_cuts(
     model::InfiniteOpt.InfiniteModel,
-    master::NamedTuple,
+    master::DP._LOAMaster,
     result::NamedTuple,
     method::DP.LOA
     )
@@ -845,6 +1147,7 @@ function DP.add_disjunct_oa_cuts(
                     transcribed_func, constraint.set)
                 for (binary_ref, _, _, dual_value) in DP.cut_info(
                     master.binary_map[indicator], active,
+                    transcribed_constraint,
                     result.linearization_point,
                     master.variable_map, dual)
                     DP._add_oa_cut_for_constraint(
@@ -857,7 +1160,7 @@ function DP.add_disjunct_oa_cuts(
             end
             for (binary_ref, linearization_point, var_map,
                     dual_value) in DP.cut_info(
-                    master.binary_map[indicator], active,
+                    master.binary_map[indicator], active, constraint,
                     result.linearization_point,
                     master.variable_map, dual)
                 DP._add_oa_cut_for_constraint(
@@ -877,7 +1180,7 @@ end
 # constraint on the underlying infinite var. State lives in the
 # closure — no `model.ext` stash. Used by base `with_fixed_combination`
 # and `commit_combination`.
-function DP._fix_combination(
+function DP.fix_combination(
     model::InfiniteOpt.InfiniteModel, combination::AbstractDict
     )
     constraint_refs = InfiniteOpt.InfOptConstraintRef[]
@@ -914,7 +1217,7 @@ end
 # transcribed instances; for a finite var on an InfiniteModel,
 # `transcription_variable` returns a single ref and `values` is
 # length-1.
-function DP._set_warm_start!(
+function DP.set_warm_start!(
     variable::InfiniteOpt.GeneralVariableRef,
     values::AbstractVector
     )

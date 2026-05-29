@@ -9,19 +9,19 @@ function test_loa_datatype()
     @test method.rtol == 1e-4
     @test method.M_value == 1e9
     @test method.max_slack == 1000.0
-    @test method.OA_penalty_factor == 1000.0
+    @test method.oa_penalty == 1000.0
     @test method.inner_method isa BigM
     @test method.inner_method.value == 1e9
 
     method = LOA(HiGHS.Optimizer; max_iter = 50, atol = 1e-8,
         rtol = 1e-6, M_value = 1e6, max_slack = 500.0,
-        OA_penalty_factor = 200.0)
+        oa_penalty = 200.0)
     @test method.max_iter == 50
     @test method.atol == 1e-8
     @test method.rtol == 1e-6
     @test method.M_value == 1e6
     @test method.max_slack == 500.0
-    @test method.OA_penalty_factor == 200.0
+    @test method.oa_penalty == 200.0
     @test method.inner_method isa BigM
     @test method.inner_method.value == 1e6
 

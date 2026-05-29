@@ -822,7 +822,7 @@ end
 function test_loa_infinite_complement_indicator()
     # Regression: `_indicator_to_binary(model)[Y2]` returns the AffExpr
     # `1 - binary(Y1)` for a logical-complement indicator. Earlier the
-    # extension's `_fix_combination` called `JuMP.fix` directly on that
+    # extension's `fix_combination` called `JuMP.fix` directly on that
     # AffExpr and crashed; now it delegates to base `fix_indicator`
     # which unwraps and inverts.
     #
@@ -848,6 +848,39 @@ function test_loa_infinite_complement_indicator()
     @objective(model, Max, ∫(x, t))
     optimize!(model,
         gdp_method = LOA(ipopt; mip_optimizer = HiGHS.Optimizer))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 8.0 atol = 1e-2
+end
+
+function test_loa_infinite_complement_nonlinear_disjunct()
+    # Regression: a finite (or complement-form AffExpr) indicator
+    # gating a NONLINEAR constraint on an infinite variable. Earlier
+    # `cut_info` decided fan-out from the indicator only — finite
+    # indicator → single un-sliced site → `_linearize_at` received
+    # per-support `Vector{Float64}` values and tripped on
+    # `_unwrap_scalar`'s `only(v)`. Fixed by inspecting the constraint
+    # expression too: any infinite var found there governs the fan-out
+    # supports, even when the indicator is scalar.
+    #
+    # max ∫ x dt with 0 ≤ x ≤ 10 over t ∈ [0,1]:
+    #   Y1: x ≤ 3        Y2 ≡ ¬Y1: x² ≤ 64
+    # Y2 (complement) is the maximizer (x = 8 across t), giving 8.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = InfiniteGDPModel(juniper)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y1, Logical)
+    @variable(model, Y2, Logical, logical_complement = Y1)
+    @constraint(model, x <= 3, Disjunct(Y1))
+    @constraint(model, x^2 <= 64, Disjunct(Y2))
+    @disjunction(model, [Y1, Y2])
+    @objective(model, Max, ∫(x, t))
+    optimize!(model,
+        gdp_method = LOA(juniper; mip_optimizer = HiGHS.Optimizer))
     @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
     @test objective_value(model) ≈ 8.0 atol = 1e-2
 end
@@ -986,6 +1019,7 @@ end
             test_loa_infinite_nonlinear_global()
             test_loa_infinite_aggregate_global()
             test_loa_infinite_complement_indicator()
+            test_loa_infinite_complement_nonlinear_disjunct()
             test_loa_infinite_multidim_parameter()
         else
             @info "Skipping InfiniteOpt LOA tests: " *
