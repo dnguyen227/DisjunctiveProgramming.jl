@@ -5,10 +5,12 @@
 # With augmented-penalty OA master from:
 # Viswanathan & Grossmann (1990), Comp. & Chem. Eng. 14(7), 769-782
 #
-# Infeasible primary NLPs are handled solely via the master's augmented
-# penalty: the combination is forbidden by a no-good cut and no OA cut
-# is emitted from that iteration. No separate feasibility-restoration
-# (NLPF) subproblem is built.
+# Infeasible primary NLPs fall through to NLPF (V&G 1990 eq. 8): a
+# slacked feasibility version of the same problem whose primal becomes
+# the linearization site for OA cuts. A no-good cut still forbids that
+# combination on the master. NLPF is bypassed for per-support
+# Vector{Bool} combinations (InfiniteOpt multi-resolution master) —
+# those fall back to no-good-only.
 ################################################################################
 
 ################################################################################

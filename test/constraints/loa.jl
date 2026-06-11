@@ -289,6 +289,36 @@ function test_to_nlp_expr()
     @test DP._to_nlp_expr(42, idx) == 42
 end
 
+function test_loa_nlpf_infeasible_disjunct()
+    # Y1 disjunct constraint x^2 >= 200 is NLP-infeasible against the
+    # variable bound x in [0, 10] (max x^2 = 100). The primary NLP at
+    # the Y1=true seed therefore fails and NLPF (V&G 1990 eq. 8) must
+    # kick in: slack `u` on the GreaterThan, minimize u, return the
+    # x = 10 / u = 100 primal as the linearization site for the OA cut
+    # on x^2 >= 200. With the master's per-cut penalized slack
+    # absorbing the resulting (invalid in isolation) linearization and
+    # the no-good cut forbidding Y1, LOA should still converge to the
+    # Y2=true optimum x = 5.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = GDPModel(juniper)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x^2 >= 200, Disjunct(Y[1]))
+    @constraint(model, x <= 5, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    optimize!(model,
+        gdp_method = LOA(juniper; mip_optimizer = HiGHS.Optimizer))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 5.0 atol = 1e-3
+    @test value(Y[2]) ≈ 1.0 atol = 1e-6
+    @test value(Y[1]) ≈ 0.0 atol = 1e-6
+end
+
 @testset "LOA" begin
     test_loa_datatype()
     test_set_covering_combos()
@@ -301,6 +331,7 @@ end
     test_loa_error_fallback()
     test_loa_nonlinear_global()
     test_loa_complement_indicator_nonlinear_disjunct()
+    test_loa_nlpf_infeasible_disjunct()
     test_linearize_nonlinear_exp()
     test_linearize_nonlinear_sin()
     test_linearize_nonlinear_multivar()
