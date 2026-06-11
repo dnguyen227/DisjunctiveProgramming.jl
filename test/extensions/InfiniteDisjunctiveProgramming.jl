@@ -916,6 +916,35 @@ function test_loa_infinite_multidim_parameter()
     @test objective_value(model) ≈ 8.0 atol = 1e-2
 end
 
+function test_loa_infinite_nlpf_infeasible_disjunct()
+    # InfiniteOpt LOA: Y[1]'s per-support constraint x^2 >= 200 is
+    # NLP-infeasible against the bound x in [0, 10] (max x^2 = 100).
+    # With infinite indicators `Y[1:2], InfiniteLogical(t)`, the
+    # combination value is `Vector{Bool}` — exercising the extension
+    # override `_nlpf_fix_on_copy(::InfiniteModel,
+    # ::GeneralVariableRef, ::AbstractVector{Bool})` that pins each
+    # support via point-equality. LOA must still converge to Y[2]
+    # active everywhere (x = 5), giving objective ∫x dt = 5.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = InfiniteGDPModel(juniper)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 3)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x^2 >= 200, Disjunct(Y[1]))
+    @constraint(model, x <= 5, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, ∫(x, t))
+    optimize!(model,
+        gdp_method = LOA(juniper; mip_optimizer = HiGHS.Optimizer))
+    @test termination_status(model) in
+        (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 5.0 atol = 1e-2
+end
+
 function test_loa_infinite_aggregate_global()
     # min ∫x dt s.t. ∫(x^2, t) <= 4 (aggregate global), x >= y,
     #   (y >= 1) ∨ (y >= 3), 0 <= x, y <= 10 over t ∈ [0, 1].
@@ -1021,6 +1050,7 @@ end
             test_loa_infinite_complement_indicator()
             test_loa_infinite_complement_nonlinear_disjunct()
             test_loa_infinite_multidim_parameter()
+            test_loa_infinite_nlpf_infeasible_disjunct()
         else
             @info "Skipping InfiniteOpt LOA tests: " *
                 "JuMP.copy_model(::InfiniteModel) unavailable " *

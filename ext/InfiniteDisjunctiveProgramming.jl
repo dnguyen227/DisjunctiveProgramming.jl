@@ -1213,6 +1213,26 @@ function DP.fix_combination(
     end
 end
 
+# Per-support binary pin on an NLPF copy of an `InfiniteModel`.
+# Triggered when the combination value is `AbstractVector{Bool}` —
+# i.e., the indicator is itself infinite, so each support k must be
+# pinned independently via a point-equality `binary(t_k) == value[k]`.
+# Finite indicators on an `InfiniteModel` dispatch to the base scalar
+# `JuMP.fix` path because `combination_val` returns a scalar `Bool`.
+# Complement-form binaries are handled by base recursion before this
+# dispatch fires.
+function DP._nlpf_fix_on_copy(
+    copy::InfiniteOpt.InfiniteModel,
+    binary::InfiniteOpt.GeneralVariableRef,
+    value::AbstractVector{Bool}
+    )
+    for (k, support) in enumerate(_supports_of(binary))
+        JuMP.@constraint(copy,
+            _at_support(binary, support) == (value[k] ? 1.0 : 0.0))
+    end
+    return
+end
+
 # Broadcast a per-support warm start across an infinite var's
 # transcribed instances; for a finite var on an InfiniteModel,
 # `transcription_variable` returns a single ref and `values` is

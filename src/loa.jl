@@ -384,11 +384,6 @@ end
 function _solve_nlpf(
     model::M, combination, method::LOA
     ) where {M <: JuMP.AbstractModel}
-    # NLPF needs scalar Bool combination values to fix binaries
-    # directly. Per-support `Vector{Bool}` from the InfiniteOpt master
-    # is out of scope for v1.
-    all(v -> v isa Bool, values(combination)) || return nothing
-
     copy, ref_map = JuMP.copy_model(model)
     JuMP.set_optimizer(copy, method.nlp_optimizer)
     JuMP.set_silent(copy)
@@ -409,17 +404,16 @@ function _solve_nlpf(
 
     JuMP.@objective(copy, Min, u)
 
-    # Plain `JuMP.fix` (no `force = true`) — `force` triggers
-    # `delete_upper_bound` which fails on InfiniteOpt copies whose
-    # ZeroOne constraint refs didn't survive `JuMP.copy_model`. We
-    # leave the binary attribute intact on the copy; the fix pins
-    # the value to 0/1 which satisfies the ZeroOne anyway. Solvers
-    # that can't handle binaries (Ipopt) will error out — we catch
-    # and return `nothing` so the caller falls back to the existing
-    # no-good-only behavior.
+    # Translate each original-model indicator binary to its
+    # counterpart on the copy, then pin it to the combination value.
+    # `_nlpf_fix_on_copy` dispatches on value type: scalar `Bool`
+    # paths use `JuMP.fix`; per-support `AbstractVector{Bool}` paths
+    # require an `InfiniteModel`-side override (per-support point-
+    # equality) — see `ext/InfiniteDisjunctiveProgramming.jl`.
     for (indicator, value) in combination
-        original_binary = _indicator_to_binary(model)[indicator]
-        _nlpf_fix_on_copy(original_binary, value, ref_map)
+        binary = _binary_on_copy(
+            _indicator_to_binary(model)[indicator], ref_map)
+        _nlpf_fix_on_copy(copy, binary, value)
     end
 
     try
@@ -437,23 +431,45 @@ function _solve_nlpf(
         objective = Inf, feasible = false)
 end
 
-function _nlpf_fix_on_copy(
-    binary::JuMP.AbstractVariableRef, value::Bool, ref_map
+# Translate a binary reference from the original model to its
+# counterpart on the copy. Direct refs go through `ref_map`;
+# complement-form `1 - y_orig` rebuilds as `1 - ref_map[y_orig]`.
+_binary_on_copy(binary::JuMP.AbstractVariableRef, ref_map) =
+    ref_map[binary]
+function _binary_on_copy(
+    binary::JuMP.GenericAffExpr, ref_map
     )
-    target = ref_map[binary]
-    JuMP.is_fixed(target) && JuMP.unfix(target)
-    JuMP.fix(target, value ? 1.0 : 0.0)
-    return
-end
-function _nlpf_fix_on_copy(
-    binary::JuMP.GenericAffExpr, value::Bool, ref_map
-    )
-    # complement form `1 - y_underlying`: indicator=true means
-    # underlying=0; indicator=false means underlying=1.
     underlying = only(keys(binary.terms))
-    _nlpf_fix_on_copy(underlying, !value, ref_map)
+    return 1.0 - ref_map[underlying]
+end
+
+# Pin a copy-side binary to a combination value. Plain `JuMP.fix`
+# (no `force = true`) — `force` triggers `delete_upper_bound` which
+# fails on InfiniteOpt copies whose ZeroOne constraint refs didn't
+# survive `JuMP.copy_model`. The fix pins the value to 0/1 which
+# satisfies the ZeroOne anyway. Solvers that can't handle binaries
+# (Ipopt) will error out — the caller catches and returns `nothing`
+# so the iteration falls back to no-good-only behavior.
+function _nlpf_fix_on_copy(
+    copy, binary::JuMP.AbstractVariableRef, value::Bool
+    )
+    JuMP.is_fixed(binary) && JuMP.unfix(binary)
+    JuMP.fix(binary, value ? 1.0 : 0.0)
     return
 end
+# Complement form `1 - y_underlying`: indicator=value means
+# underlying=!value. Recursion routes both scalar `Bool` and per-
+# support `AbstractVector{Bool}` to the underlying-binary dispatch.
+function _nlpf_fix_on_copy(
+    copy, binary::JuMP.GenericAffExpr, value
+    )
+    underlying = only(keys(binary.terms))
+    _nlpf_fix_on_copy(copy, underlying, _flip(value))
+    return
+end
+
+_flip(v::Bool) = !v
+_flip(v::AbstractVector{Bool}) = .!v
 
 _nlpf_should_slack(::Type{<:_MOI.LessThan}) = true
 _nlpf_should_slack(::Type{<:_MOI.GreaterThan}) = true
