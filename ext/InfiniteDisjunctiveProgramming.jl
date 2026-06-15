@@ -898,9 +898,15 @@ function _transcribed_to_master_point(
         if isempty(prefs)
             result[transcribed] = master_var
         else
-            supports = vec(InfiniteOpt.supports(only(prefs)))
-            for (k, ref) in enumerate(vec(transcribed))
-                result[ref] = master_var(supports[k])
+            # `_supports_of` returns scalars for 1-D parameters and
+            # vectors for multi-D dependent groups; `_at_support`
+            # routes both shapes through `v(support)`. Using
+            # `vec(InfiniteOpt.supports(...))` here would silently
+            # flatten a multi-D matrix into scalars and break point
+            # evaluation on dependent parameter groups.
+            for (k, support) in enumerate(_supports_of(v))
+                result[vec(transcribed)[k]] =
+                    _at_support(master_var, support)
             end
         end
     end
@@ -996,9 +1002,98 @@ function DP.build_loa_master(
         variable_map[v] = ref_map[v]
     end
 
+    # Aggregate-wrapped LINEAR constraints (e.g. `𝔼(W, ξ) ≥ α`)
+    # were filtered out at `copy_model` time because `copy_model`
+    # cannot transfer MeasureRefs across InfiniteModels. The
+    # nonlinear-aggregate path re-adds them as OA cuts after each
+    # NLP solve, but `_add_global_oa_cuts_infinite` short-circuits
+    # on linear `F` — so without this step a linear chance
+    # constraint is missing from the master entirely, and the
+    # master will pick combinations that violate it. Transcribe
+    # each such constraint once and add the flat scalar form to
+    # the master directly.
+    _add_aggregate_linear_constraints!(
+        master, model, ref_map, variable_type)
+
     return DP._LOAMaster(master, binary_map, variable_map,
         objective_sense, original_objective, alpha_oa,
-        objective_ref_map)
+        objective_ref_map, Any[])
+end
+
+# Walk the original model's linear-`F` constraints, transcribe those
+# containing a `MeasureRef` / `ParameterFunctionRef`, and append the
+# resulting flat scalar constraint to the master. No linearization
+# needed (the constraint is already affine post-transcription) —
+# `_linearize_at` on an `AffExpr` just substitutes variables via
+# `transcribed_to_master`. Reuses the transformation backend that
+# `_add_global_oa_cuts_infinite` will rebuild later; building it
+# now is cheap and idempotent.
+function _add_aggregate_linear_constraints!(
+    master::InfiniteOpt.InfiniteModel,
+    model::InfiniteOpt.InfiniteModel,
+    ref_map::AbstractDict,
+    variable_type::Type
+    )
+    has_any = false
+    for (F, S) in JuMP.list_of_constraint_types(model)
+        F === variable_type && continue
+        DP._is_linear_F(F) || continue
+        for cref in JuMP.all_constraints(model, F, S)
+            con = JuMP.constraint_object(cref)
+            _has_aggregate_ref(con.func) || continue
+            has_any = true
+            break
+        end
+        has_any && break
+    end
+    has_any || return
+
+    InfiniteOpt.build_transformation_backend!(model)
+    transcribed_to_master = _transcribed_to_master_point(model, ref_map)
+    # `_transcribed_to_master_point` only walks decision vars. Finite
+    # parameters (`@finite_parameter`) survive transcription as
+    # scalar JuMP variables and can appear in transcribed
+    # constraints (e.g. the `α` on the RHS of an event constraint).
+    # Map each transcribed-parameter JuMP var to the master's
+    # corresponding parameter so the constraint stays
+    # parameter-relative (the master then honors `set_value(α, ...)`
+    # without rebuild).
+    for p in InfiniteOpt.all_parameters(model)
+        transcribed_p = try
+            InfiniteOpt.transformation_variable(p)
+        catch
+            continue
+        end
+        transcribed_p isa JuMP.VariableRef || continue
+        haskey(ref_map, p) || continue
+        transcribed_to_master[transcribed_p] = ref_map[p]
+    end
+    # `_linearize_at(::GenericAffExpr, ...)` ignores its
+    # `linearization_point` arg; pass any empty dict.
+    empty_point = Dict{JuMP.VariableRef, Float64}()
+    for (F, S) in JuMP.list_of_constraint_types(model)
+        F === variable_type && continue
+        DP._is_linear_F(F) || continue
+        for cref in JuMP.all_constraints(model, F, S)
+            con = JuMP.constraint_object(cref)
+            _has_aggregate_ref(con.func) || continue
+            con isa JuMP.ScalarConstraint || continue
+            transcribed_func = InfiniteOpt.transformation_expression(
+                con.func)
+            if transcribed_func isa AbstractArray
+                for tf in vec(transcribed_func)
+                    master_expr = DP._linearize_at(
+                        tf, empty_point, transcribed_to_master)
+                    JuMP.@constraint(master, master_expr in con.set)
+                end
+            else
+                master_expr = DP._linearize_at(
+                    transcribed_func, empty_point, transcribed_to_master)
+                JuMP.@constraint(master, master_expr in con.set)
+            end
+        end
+    end
+    return
 end
 
 # Override the disjunct-cut loop for `InfiniteModel`. Same shape as
@@ -1032,7 +1127,7 @@ function DP.add_oa_cuts(
     linearization = DP._linearize_at(master.original_objective,
         obj_point, master.objective_ref_map)
     DP._add_objective_cut(
-        Val(master.objective_sense), master, linearization)
+        Val(master.objective_sense), master, linearization, method)
     _add_global_oa_cuts_infinite(model, master, result, method)
     DP.add_disjunct_oa_cuts(model, master, result, method)
     return
@@ -1154,7 +1249,7 @@ function DP.add_disjunct_oa_cuts(
                         transcribed_constraint, master, binary_ref,
                         transcribed_xk[], transcribed_to_master[],
                         dual_value, method, sign_factor,
-                        penalty_sign)
+                        penalty_sign, result.feasible)
                 end
                 continue
             end
@@ -1166,7 +1261,8 @@ function DP.add_disjunct_oa_cuts(
                 DP._add_oa_cut_for_constraint(
                     constraint, master, binary_ref,
                     linearization_point, var_map, dual_value,
-                    method, sign_factor, penalty_sign)
+                    method, sign_factor, penalty_sign,
+                    result.feasible)
             end
         end
     end

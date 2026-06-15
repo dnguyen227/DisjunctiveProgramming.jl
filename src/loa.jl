@@ -102,6 +102,11 @@ mutable struct _LOAMaster{M <: JuMP.AbstractModel, OF, AO, BM, VM, RM}
     original_objective::OF
     alpha_oa::AO
     objective_ref_map::RM
+    # All penalized slacks ever appended to the master, in emission
+    # order — disjunct, global, and objective cuts. Iterated by
+    # `_check_slacks` after each master solve to diagnose whether
+    # `max_slack` is binding.
+    slacks::Vector{Any}
 end
 
 ################################################################################
@@ -157,16 +162,23 @@ function _reformulate_loa_single_level(
     # Initialization Procedure (Türkay & Grossmann 1996, sec. 2.2):
     # solve K set-covering NLPs with cycling indicator combinations to
     # seed the master with at least one OA cut per disjunct.
+    # `previous_result` carries the most recent FEASIBLE NLP primal
+    # forward as the warm start for the next NLP (T&G §2.3); NLPF
+    # solutions are skipped since their primal is slack-distorted.
+    previous_result = nothing
     for (i, combination) in enumerate(combinations)
+        _set_nlp_warm_start!(previous_result)
         t_seed = @elapsed result = _solve_nlp(
             model, combination, method, reformulation_map)
         avoid_combination(master.model, combination, master.binary_map)
         add_oa_cuts(model, master, result, method)
+        _check_penalty(result, method)
         if result.feasible && _is_better(sense_token, result.objective,
                 best_objective)
             best_objective = result.objective
             best_result = result
         end
+        result.feasible && (previous_result = result)
         method.verbose && _log_seed(i, t_seed, result, best_objective)
     end
 
@@ -175,21 +187,25 @@ function _reformulate_loa_single_level(
         feasible = JuMP.is_solved_and_feasible(master.model)
         method.verbose && _log_master(iter, master.model, t_master)
         feasible || break
+        _check_slacks(master, method)
         master_bound = JuMP.objective_value(master.model)
         method.verbose &&
             _log_iter(iter, master_bound, best_objective, sense_token)
         _loa_converged(best_objective, master_bound, sense_token, method) &&
             break
         combination = _extract_combination(model, master)
+        _set_nlp_warm_start!(previous_result)
         t_nlp = @elapsed result = _solve_nlp(
             model, combination, method, reformulation_map)
         avoid_combination(master.model, combination, master.binary_map)
         add_oa_cuts(model, master, result, method)
+        _check_penalty(result, method)
         if result.feasible && _is_better(sense_token, result.objective,
                 best_objective)
             best_objective = result.objective
             best_result = result
         end
+        result.feasible && (previous_result = result)
         method.verbose && _log_nlp(iter, t_nlp, result, best_objective)
     end
 
@@ -328,7 +344,7 @@ function build_loa_master(model::JuMP.AbstractModel, method::LOA)
     JuMP.@objective(master, objective_sense, alpha_oa)
 
     return _LOAMaster(master, binary_map, variable_map, objective_sense,
-        original_objective, alpha_oa, variable_map)
+        original_objective, alpha_oa, variable_map, Any[])
 end
 
 ################################################################################
@@ -550,6 +566,22 @@ function with_fixed_combination(
     end
 end
 
+# Iter-to-iter NLP warm start (T&G 1996 §2.3): seed the next primary
+# NLP solve from the most recent FEASIBLE solution's primal point.
+# No-op on the first seed iteration when `previous` is `nothing`, and
+# no-op on iterations following an NLPF fall-through (caller does not
+# update `previous_result` then), since NLPF's primal is slack-
+# distorted and a worse start than the prior real NLP. Routes through
+# the `set_warm_start!` dispatch so the InfiniteOpt extension's
+# per-support broadcast handles `GeneralVariableRef` correctly.
+function _set_nlp_warm_start!(previous)
+    previous === nothing && return
+    for (variable, values) in previous.linearization_point
+        set_warm_start!(variable, values)
+    end
+    return
+end
+
 # Finalize the model with the LOA-optimal combination: relax logical
 # binaries (stripping ZeroOne so a pure NLP solver can handle the
 # post-hook `JuMP.optimize!`), fix indicators at the committed values,
@@ -673,6 +705,57 @@ function _collect_nlp_duals(
 end
 
 ################################################################################
+#                              DIAGNOSTICS
+################################################################################
+# V&G 1990 requires ρ > ‖λ*‖_∞ for the penalty term to dominate any
+# admissible Lagrange multiplier — otherwise a slack can absorb a real
+# violation and the OA cut becomes an invalid relaxation. Check after
+# every feasible primary NLP and warn if the bound is at risk. NLPF
+# returns sign-only duals (`±1`) so this is a no-op when `!feasible`.
+function _check_penalty(result::NamedTuple, method::LOA)
+    result.feasible || return
+    isempty(result.duals) && return
+    max_dual = 0.0
+    for (_, d) in result.duals
+        max_dual = max(max_dual, _max_abs_dual(d))
+    end
+    if max_dual >= method.oa_penalty
+        @warn "LOA: oa_penalty = $(method.oa_penalty) ≤ max |dual| " *
+            "= $max_dual. V&G 1990 requires ρ > ‖λ‖_∞; slacks may " *
+            "absorb real OA-cut violations. Raise `oa_penalty`."
+    end
+    return
+end
+_max_abs_dual(d::Number) = abs(d)
+_max_abs_dual(d::AbstractArray) = isempty(d) ? 0.0 : maximum(abs, d)
+_max_abs_dual(::Nothing) = 0.0
+
+# `max_slack` is a numerical guard (V&G 1990 leaves slacks unbounded;
+# in practice an unbounded slack lets the master trivially feasible-
+# itself out of the OA constraints). When a slack is at the cap, the
+# master is effectively solving a stricter problem than V&G's master.
+# Diagnose so the user can raise `max_slack` if the cap binds often.
+function _check_slacks(master::_LOAMaster, method::LOA)
+    JuMP.has_values(master.model) || return
+    isempty(master.slacks) && return
+    cap = method.max_slack
+    threshold = 0.99 * cap
+    max_value = 0.0
+    binding = 0
+    for slack in master.slacks
+        val = JuMP.value(slack)
+        max_value = max(max_value, val)
+        val >= threshold && (binding += 1)
+    end
+    if binding > 0
+        @warn "LOA: $binding slack(s) at max_slack = $cap (max " *
+            "value $max_value). Master is solving a stricter problem " *
+            "than V&G's; raise `max_slack` if this persists."
+    end
+    return
+end
+
+################################################################################
 #                       COMBO EXTRACTION (master → NLP)
 ################################################################################
 # Read each indicator's binary value from the master MILP solution.
@@ -707,17 +790,31 @@ function add_oa_cuts(
     isempty(result.linearization_point) && return
     linearization = _linearize_at(master.original_objective,
         result.linearization_point, master.objective_ref_map)
-    _add_objective_cut(Val(master.objective_sense), master, linearization)
+    _add_objective_cut(
+        Val(master.objective_sense), master, linearization, method)
     _add_global_oa_cuts(model, master, result, method)
     add_disjunct_oa_cuts(model, master, result, method)
     return
 end
 
-# Bounding cut `lin ≤ α` (min) or `lin ≥ α` (max) on the master.
-_add_objective_cut(::Val{_MOI.MIN_SENSE}, master, lin) =
-    JuMP.@constraint(master.model, lin <= master.alpha_oa)
-_add_objective_cut(::Val{_MOI.MAX_SENSE}, master, lin) =
-    JuMP.@constraint(master.model, lin >= master.alpha_oa)
+# Slacked objective cut (V&G 1990 eq. 6). For MIN, `lin ≤ α + σ` with
+# `σ ≥ 0` penalized in the master objective so the slack drives to
+# zero at convergence; the linearization is then `α ≥ lin` (standard
+# OA bound). MAX is symmetric: `lin ≥ α − σ`. Without the slack, an
+# accumulated bad linearization on a nonconvex objective can make the
+# master infeasible — the disjunct and global cuts already carry
+# slacks but the objective cut did not.
+function _add_objective_cut(
+    sense_token::Val, master::_LOAMaster, lin, method::LOA
+    )
+    _, penalty_sign = _disjunct_cut_coefficients(sense_token)
+    slack = _penalized_slack(master, method, penalty_sign)
+    _add_objective_cut_body(sense_token, master, lin, slack)
+end
+_add_objective_cut_body(::Val{_MOI.MIN_SENSE}, master, lin, slack) =
+    JuMP.@constraint(master.model, lin <= master.alpha_oa + slack)
+_add_objective_cut_body(::Val{_MOI.MAX_SENSE}, master, lin, slack) =
+    JuMP.@constraint(master.model, lin >= master.alpha_oa - slack)
 
 # Add the OA cut `g(x^l) + ∇g(x^l)^T (x − x^l) in con.set` for every
 # nonlinear global constraint of `model` — the third cut class in
@@ -786,31 +883,37 @@ function add_disjunct_oa_cuts(
                     result.linearization_point, master.variable_map, dual)
                 _add_oa_cut_for_constraint(
                     constraint, master, binary_ref, lin_point,
-                    var_map, dual_value, method, sign_factor, penalty_sign)
+                    var_map, dual_value, method, sign_factor,
+                    penalty_sign, result.feasible)
             end
         end
     end
 end
 
 # Fresh nonnegative slack added to the master objective with the V&G
-# 1990 penalty. Shared by the disjunct and global OA cuts so both get
-# the same augmented-penalty treatment: a nonconvex linearization can
-# be an invalid relaxation, and the penalized slack keeps the master
-# feasible instead of letting accumulated cuts make it infeasible.
+# 1990 penalty. Shared by the disjunct, global, and objective OA cuts
+# so all three carry the same augmented-penalty treatment: a nonconvex
+# linearization can be an invalid relaxation, and the penalized slack
+# keeps the master feasible instead of letting accumulated cuts make
+# it infeasible. The slack is recorded on `master.slacks` so the
+# `_check_slacks` diagnostic can see whether `max_slack` is binding.
 function _penalized_slack(
     master::_LOAMaster, method::LOA, penalty_sign::Int
     )
     slack = JuMP.@variable(master.model,
         lower_bound = 0.0, upper_bound = method.max_slack)
+    push!(master.slacks, slack)
     JuMP.set_objective_function(master.model,
         JuMP.objective_function(master.model) +
             penalty_sign * method.oa_penalty * slack)
     return slack
 end
 
-# Linearize constraint at `linearization_point`, append a fresh per-cut
-# slack with V&G penalty, gate by `M(1 − binary)`. Linear constraints
-# are exact via BigM and skipped.
+# Linearize constraint at `linearization_point`, then dispatch on the
+# constraint's set to emit slacked OA cut(s) gated by `M(1 − binary)`.
+# Linear constraints are exact via BigM and skipped. `feasible` flags
+# whether the linearization point came from a real NLP (true) or from
+# NLPF (false); equality cuts behave differently in those two regimes.
 function _add_oa_cut_for_constraint(
     constraint::JuMP.AbstractConstraint,
     master::_LOAMaster,
@@ -820,13 +923,94 @@ function _add_oa_cut_for_constraint(
     dual_value,
     method::LOA,
     sign_factor::Int,
-    penalty_sign::Int
+    penalty_sign::Int,
+    feasible::Bool
     )
     _is_linear_F(typeof(constraint.func)) && return
+    linearization = _linearize_at(
+        constraint.func, linearization_point, var_map)
+    _emit_disjunct_oa_cut(constraint.set, master, binary_ref,
+        linearization, dual_value, method, sign_factor,
+        penalty_sign, feasible)
+    return
+end
+
+# Inequality sets — one signed cut per Türkay-Grossmann 1996 / Duran-
+# Grossmann 1986 OA convention. Primary NLP gives the real Lagrange
+# multiplier (whose sign picks the active side); NLPF returns ±1 from
+# `_nlpf_dual_sign(set)`.
+function _emit_disjunct_oa_cut(
+    set::Union{_MOI.LessThan, _MOI.GreaterThan},
+    master::_LOAMaster, binary_ref, linearization, dual_value,
+    method::LOA, sign_factor::Int, penalty_sign::Int, ::Bool
+    )
     sign_value = sign(sign_factor * _collapse_dual(dual_value))
     sign_value == 0 && return
-    rhs = _set_rhs(constraint.set)
-    linearization = _linearize_at(constraint.func, linearization_point, var_map)
+    rhs = _set_rhs(set)
+    slack = _penalized_slack(master, method, penalty_sign)
+    JuMP.@constraint(master.model,
+        sign_value * (linearization - rhs) - slack <=
+            method.M_value * (1 - binary_ref))
+    return
+end
+
+# Equality — feasible NLP: the summed BigM duals give the OA/ER
+# multiplier sign (Duran-Grossmann 1986), so one signed cut suffices.
+# Infeasible (NLPF): sign is uninformative, so emit both directions
+# sharing one slack — mirrors the global-OA equality treatment in
+# `_add_global_oa_row!(::EqualTo)`.
+function _emit_disjunct_oa_cut(
+    set::_MOI.EqualTo,
+    master::_LOAMaster, binary_ref, linearization, dual_value,
+    method::LOA, sign_factor::Int, penalty_sign::Int, feasible::Bool
+    )
+    c = _MOI.constant(set)
+    slack = _penalized_slack(master, method, penalty_sign)
+    if feasible
+        sign_value = sign(sign_factor * _collapse_dual(dual_value))
+        sign_value == 0 && return
+        JuMP.@constraint(master.model,
+            sign_value * (linearization - c) - slack <=
+                method.M_value * (1 - binary_ref))
+        return
+    end
+    JuMP.@constraint(master.model,
+        (linearization - c) - slack <=
+            method.M_value * (1 - binary_ref))
+    JuMP.@constraint(master.model,
+        (c - linearization) - slack <=
+            method.M_value * (1 - binary_ref))
+    return
+end
+
+# Interval — always two-sided regardless of dual: there is no single
+# rhs to sign against (`_set_rhs(::Interval) = 0` is wrong here), and
+# any active boundary needs its linearization to gate the right side.
+# Both rows share one slack so the V&G penalty is not double-counted.
+function _emit_disjunct_oa_cut(
+    set::_MOI.Interval,
+    master::_LOAMaster, binary_ref, linearization, ::Any,
+    method::LOA, ::Int, penalty_sign::Int, ::Bool
+    )
+    slack = _penalized_slack(master, method, penalty_sign)
+    JuMP.@constraint(master.model,
+        (linearization - set.upper) - slack <=
+            method.M_value * (1 - binary_ref))
+    JuMP.@constraint(master.model,
+        (set.lower - linearization) - slack <=
+            method.M_value * (1 - binary_ref))
+    return
+end
+
+# Fallback for vector sets and any future set types — preserve the
+# original single-signed behavior with `_collapse_dual` for the sign.
+function _emit_disjunct_oa_cut(
+    set, master::_LOAMaster, binary_ref, linearization, dual_value,
+    method::LOA, sign_factor::Int, penalty_sign::Int, ::Bool
+    )
+    sign_value = sign(sign_factor * _collapse_dual(dual_value))
+    sign_value == 0 && return
+    rhs = _set_rhs(set)
     slack = _penalized_slack(master, method, penalty_sign)
     JuMP.@constraint(master.model,
         sign_value * (linearization - rhs) - slack <=
