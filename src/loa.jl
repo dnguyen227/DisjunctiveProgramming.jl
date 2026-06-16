@@ -182,17 +182,53 @@ function _reformulate_loa_single_level(
         method.verbose && _log_seed(i, t_seed, result, best_objective)
     end
 
+    # The master objective is a rigorous bound only for a convex (here,
+    # linear) inner problem. With nonlinear constraints the bound may be
+    # invalid, so terminate on V&G (1990) criterion 5 — stop once a
+    # feasible NLP no longer improves on the previous feasible NLP —
+    # rather than on the untrustworthy master gap.
+    rigorous = !_has_nonlinear_constraints(model)
+    warned = false
+    produced_bound = false
+    prev_nlp_objective = previous_result === nothing ? nothing :
+        previous_result.objective
     for iter in 1:method.max_iter
         t_master = @elapsed JuMP.optimize!(master.model)
         feasible = JuMP.is_solved_and_feasible(master.model)
         method.verbose && _log_master(iter, master.model, t_master)
-        feasible || break
+        if !feasible
+            # An infeasible/unbounded master before any bound is a
+            # degenerate exit, not convergence: LOA falls back to the
+            # best set-covering seed without ever iterating. Common
+            # when most NLP subproblems are infeasible, so the master
+            # lacks the OA cuts to bound `alpha_oa`.
+            produced_bound || @warn "LOA: master returned status " *
+                "$(JuMP.termination_status(master.model)) before any " *
+                "bound was produced; exiting with the best seed NLP " *
+                "incumbent ($best_objective). This is NOT a converged " *
+                "or certified optimum — often a sign the NLP " *
+                "subproblems are mostly infeasible."
+            break
+        end
         _check_slacks(master, method)
         master_bound = JuMP.objective_value(master.model)
+        produced_bound = true
         method.verbose &&
             _log_iter(iter, master_bound, best_objective, sense_token)
-        _loa_converged(best_objective, master_bound, sense_token, method) &&
-            break
+        if rigorous
+            _loa_converged(
+                best_objective, master_bound, sense_token, method) &&
+                break
+        elseif !warned && _bound_crossed(
+                best_objective, master_bound, sense_token, method)
+            @warn "LOA: master bound ($master_bound) crossed the " *
+                "incumbent ($best_objective). The model appears " *
+                "nonconvex, so the OA cuts are not valid supports and " *
+                "the dual bound is NOT rigorous. Returning the best " *
+                "NLP incumbent as a heuristic (Viswanathan & " *
+                "Grossmann 1990)."
+            warned = true
+        end
         combination = _extract_combination(model, master)
         _set_nlp_warm_start!(previous_result)
         t_nlp = @elapsed result = _solve_nlp(
@@ -205,8 +241,15 @@ function _reformulate_loa_single_level(
             best_objective = result.objective
             best_result = result
         end
-        result.feasible && (previous_result = result)
         method.verbose && _log_nlp(iter, t_nlp, result, best_objective)
+        # V&G (1990) criterion 5: without a rigorous bound, stop once a
+        # feasible NLP fails to improve on the previous feasible NLP.
+        if !rigorous && result.feasible
+            prev_nlp_objective !== nothing && !_is_better(sense_token,
+                result.objective, prev_nlp_objective) && break
+            prev_nlp_objective = result.objective
+        end
+        result.feasible && (previous_result = result)
     end
 
     if best_result !== nothing
@@ -260,6 +303,24 @@ function _loa_converged(
     return false
 end
 
+# A genuine bound crossing: the master "bound" is worse than the
+# incumbent by more than the convergence tolerance (gap strongly
+# negative). In valid convex OA, LB ≤ UB always, so this can only
+# arise from invalid OA cuts on a nonconvex problem — V&G (1990) report
+# the master objective exceeding the integer NLP optimum on every
+# nonconvex test problem. The tolerance band separates a real crossing
+# from floating-point / solver noise.
+function _bound_crossed(
+    best_objective::Real,
+    master_bound::Real,
+    sense_token::Val,
+    method::LOA
+    )
+    (isinf(best_objective) || isinf(master_bound)) && return false
+    gap = _gap(sense_token, best_objective, master_bound)
+    return gap < -(method.atol + method.rtol * abs(best_objective))
+end
+
 # Error fallback for unsupported model types.
 function reformulate_model(::M, ::LOA) where {M}
     error("reformulate_model not implemented for model type `$(M)` with LOA.")
@@ -306,6 +367,22 @@ _is_linear_F(::Type{<:JuMP.GenericAffExpr}) = true
 _is_linear_F(::Type{<:AbstractVector{<:JuMP.AbstractVariableRef}}) = true
 _is_linear_F(::Type{<:AbstractVector{<:JuMP.GenericAffExpr}}) = true
 _is_linear_F(::Type) = false
+
+# True if any constraint carries a non-affine function. LOA's master
+# objective is a rigorous lower bound only when every constraint is
+# linear: the inner problem is then a (linear, hence convex) GDP and
+# the OA cuts are exact supporting hyperplanes. With a nonlinear
+# constraint the problem may be nonconvex, the OA linearizations need
+# not support the feasible set, and the master bound is not rigorous —
+# so LOA terminates on V&G (1990) subproblem-improvement instead.
+function _has_nonlinear_constraints(model::JuMP.AbstractModel)
+    variable_type = JuMP.variable_ref_type(typeof(model))
+    for (F, _) in JuMP.list_of_constraint_types(model)
+        F === variable_type && continue
+        _is_linear_F(F) || return true
+    end
+    return false
+end
 
 # OVERRIDABLE. Build the LOA master MILP `M^b_{LA}` (Türkay & Grossmann
 # 1996, eq. 12): copy decision variables and only the linear
