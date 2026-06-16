@@ -811,6 +811,7 @@ function _cut_sites(
     dual
     )
     sites = Any[]
+    dual = _support_dual(dual, length(supports))
     for (k, support) in enumerate(supports)
         actives[k] || continue
         point_var_map = Dict{
@@ -842,6 +843,15 @@ end
 _at(values::AbstractArray, k::Integer) =
     length(values) == 1 ? values[1] : values[k]
 _at(scalar, ::Integer) = scalar
+
+# A feasible NLP yields one dual per support (length == nsupp). A
+# feasibility-restoration solve yields a set-shaped *sign* dual (e.g.
+# EqualTo → [1, 1]) carrying only a direction, identical at every
+# support. Collapse the latter to a scalar so per-support slicing
+# broadcasts the sign instead of indexing past its length.
+_support_dual(dual, nsupp::Integer) =
+    dual isa AbstractArray && length(dual) != nsupp &&
+        length(dual) != 1 ? DP._collapse_dual(dual) : dual
 
 # Point-evaluate an InfiniteOpt var at `support` if it's infinite;
 # return the var as-is if it's finite. `support` is one joint support
