@@ -9,8 +9,8 @@
 # slacked feasibility version of the same problem whose primal becomes
 # the linearization site for OA cuts. A no-good cut still forbids that
 # combination on the master. NLPF is bypassed for per-support
-# Vector{Bool} combinations (InfiniteOpt multi-resolution master) —
-# those fall back to no-good-only.
+# Vector{Bool} combinations (InfiniteOpt per-support master) — those
+# fall back to no-good-only.
 ################################################################################
 
 ################################################################################
@@ -40,6 +40,13 @@ supported. Other reformulations (`Hull`, `PSplit`) are not yet supported.
 - `max_slack::T`: Upper bound for each per-cut slack variable.
 - `oa_penalty::T`: V&G 1990 penalty coefficient applied to slacks in
   the master objective.
+- `iteration_time_limit::Float64`: Wall-clock budget (seconds) for the
+  LOA iteration loop (seeds + main loop). `Inf` (default) is no limit;
+  each subproblem solve is capped to the budget left so one solve can't
+  overrun it.
+- `time_limit::Float64`: Overall wall-clock cap (seconds) covering the
+  iteration loop AND the final committed solve. `Inf` (default) is no
+  cap; when set, the final solve gets only the budget left under it.
 """
 struct LOA{O, P, R, T} <: AbstractReformulationMethod
     nlp_optimizer::O
@@ -52,8 +59,8 @@ struct LOA{O, P, R, T} <: AbstractReformulationMethod
     max_slack::T
     oa_penalty::T
     verbose::Bool
-    supports_schedule::Union{Nothing, Vector{Int}}
-    coarse_builder::Union{Nothing, Function}
+    iteration_time_limit::Float64
+    time_limit::Float64
     function LOA(
         nlp_optimizer::O;
         mip_optimizer::P = nlp_optimizer,
@@ -65,19 +72,15 @@ struct LOA{O, P, R, T} <: AbstractReformulationMethod
         oa_penalty::T = 1e3,
         inner_method::R = BigM(M_value),
         verbose::Bool = false,
-        supports_schedule::Union{Nothing, Vector{Int}} = nothing,
-        coarse_builder::Union{Nothing, Function} = nothing
+        iteration_time_limit::Float64 = Inf,
+        time_limit::Float64 = Inf
         ) where {O, P, R <: AbstractReformulationMethod, T}
         R <: Union{BigM, MBM} || error(
             "LOA inner_method must be BigM or MBM (got $R). " *
             "Hull and PSplit are not yet supported.")
-        supports_schedule === nothing || coarse_builder !== nothing || error(
-            "LOA `supports_schedule` requires a `coarse_builder = N -> " *
-            "InfiniteModel` that constructs a fresh model at each " *
-            "warmup resolution.")
         new{O, P, R, T}(nlp_optimizer, mip_optimizer, inner_method,
             max_iter, atol, rtol, M_value, max_slack, oa_penalty, verbose,
-            supports_schedule, coarse_builder)
+            iteration_time_limit, time_limit)
     end
 end
 
@@ -127,26 +130,12 @@ _flip_sense(::Val{_MOI.MAX_SENSE}) = Val(_MOI.MIN_SENSE)
 ################################################################################
 #                            MAIN ALGORITHM
 ################################################################################
+# LOA reformulation entry point: set-covering seeds, the master/NLP
+# iteration loop, commit the best combination, and mark the model ready.
+# Plain `LOA` on an `InfiniteModel` dispatches here too — the InfiniteOpt
+# overrides act on the inner solve steps (master build, NLP, cuts), not
+# on this driver.
 function reformulate_model(model::JuMP.AbstractModel, method::LOA)
-    method.supports_schedule === nothing ||
-        error("`supports_schedule` is only meaningful for InfiniteOpt " *
-            "models; load InfiniteOpt to enable the multi-resolution path.")
-    _reformulate_loa_single_level(model, method)
-    _set_solution_method(model, method)
-    _set_ready_to_optimize(model, true)
-    return
-end
-
-# Single-resolution LOA. Always uses set-covering for the
-# initialization seeds; the InfiniteOpt multi-resolution wrapper
-# carries trajectory information across levels via primal warm starts
-# on transcribed JuMP variables (set before this is called), not by
-# overriding the seed-combination loop. Returns `best_result`
-# (NamedTuple with `combination` / `linearization_point` / etc.) or
-# `nothing` if every NLP was infeasible.
-function _reformulate_loa_single_level(
-    model::JuMP.AbstractModel, method::LOA
-    )
     _clear_reformulations(model)
     combinations = _set_covering_combinations(model)
     reformulate_model(model, method.inner_method)
@@ -155,6 +144,11 @@ function _reformulate_loa_single_level(
     reformulation_map = _build_reformulation_map(model)
     JuMP.set_optimizer(model, method.nlp_optimizer)
     JuMP.set_silent(model)
+    t_start = time()
+    overall_deadline = t_start + method.time_limit
+    loop_deadline =
+        min(t_start + method.iteration_time_limit, overall_deadline)
+    original_time_limit = JuMP.time_limit_sec(model)
     sense_token = Val(JuMP.objective_sense(model))
     best_objective = _worst_objective(sense_token)
     best_result = nothing
@@ -167,9 +161,11 @@ function _reformulate_loa_single_level(
     # solutions are skipped since their primal is slack-distorted.
     previous_result = nothing
     for (i, combination) in enumerate(combinations)
-        _set_nlp_warm_start!(previous_result)
+        time() < loop_deadline || break
+        _set_nlp_warm_start(previous_result)
         t_seed = @elapsed result = _solve_nlp(
-            model, combination, method, reformulation_map)
+            model, combination, method, reformulation_map;
+            deadline = loop_deadline)
         avoid_combination(master.model, combination, master.binary_map)
         add_oa_cuts(model, master, result, method)
         _check_penalty(result, method)
@@ -182,32 +178,22 @@ function _reformulate_loa_single_level(
         method.verbose && _log_seed(i, t_seed, result, best_objective)
     end
 
-    # The master objective is a rigorous bound only for a convex (here,
-    # linear) inner problem. With nonlinear constraints the bound may be
-    # invalid, so terminate on V&G (1990) criterion 5 — stop once a
-    # feasible NLP no longer improves on the previous feasible NLP —
-    # rather than on the untrustworthy master gap.
+    # Master bound is a rigorous dual bound only for a convex (linear)
+    # inner problem; otherwise stop on V&G (1990) criterion 5
+    # (`_nlp_stalled`), not the untrustworthy gap.
     rigorous = !_has_nonlinear_constraints(model)
-    warned = false
     produced_bound = false
     prev_nlp_objective = previous_result === nothing ? nothing :
         previous_result.objective
     for iter in 1:method.max_iter
+        time() < loop_deadline || break
+        _cap_remaining_time(master.model, loop_deadline)
         t_master = @elapsed JuMP.optimize!(master.model)
         feasible = JuMP.is_solved_and_feasible(master.model)
         method.verbose && _log_master(iter, master.model, t_master)
         if !feasible
-            # An infeasible/unbounded master before any bound is a
-            # degenerate exit, not convergence: LOA falls back to the
-            # best set-covering seed without ever iterating. Common
-            # when most NLP subproblems are infeasible, so the master
-            # lacks the OA cuts to bound `alpha_oa`.
-            produced_bound || @warn "LOA: master returned status " *
-                "$(JuMP.termination_status(master.model)) before any " *
-                "bound was produced; exiting with the best seed NLP " *
-                "incumbent ($best_objective). This is NOT a converged " *
-                "or certified optimum — often a sign the NLP " *
-                "subproblems are mostly infeasible."
+            _check_degenerate_master(master, produced_bound,
+                best_objective)
             break
         end
         _check_slacks(master, method)
@@ -217,22 +203,16 @@ function _reformulate_loa_single_level(
             _log_iter(iter, master_bound, best_objective, sense_token)
         if rigorous
             _loa_converged(
-                best_objective, master_bound, sense_token, method) &&
-                break
-        elseif !warned && _bound_crossed(
+                best_objective, master_bound, sense_token, method) && break
+        else
+            _check_nonrigorous_bound(
                 best_objective, master_bound, sense_token, method)
-            @warn "LOA: master bound ($master_bound) crossed the " *
-                "incumbent ($best_objective). The model appears " *
-                "nonconvex, so the OA cuts are not valid supports and " *
-                "the dual bound is NOT rigorous. Returning the best " *
-                "NLP incumbent as a heuristic (Viswanathan & " *
-                "Grossmann 1990)."
-            warned = true
         end
         combination = _extract_combination(model, master)
-        _set_nlp_warm_start!(previous_result)
+        _set_nlp_warm_start(previous_result)
         t_nlp = @elapsed result = _solve_nlp(
-            model, combination, method, reformulation_map)
+            model, combination, method, reformulation_map;
+            deadline = loop_deadline)
         avoid_combination(master.model, combination, master.binary_map)
         add_oa_cuts(model, master, result, method)
         _check_penalty(result, method)
@@ -242,11 +222,11 @@ function _reformulate_loa_single_level(
             best_result = result
         end
         method.verbose && _log_nlp(iter, t_nlp, result, best_objective)
-        # V&G (1990) criterion 5: without a rigorous bound, stop once a
-        # feasible NLP fails to improve on the previous feasible NLP.
+        # V&G (1990) criterion 5: with no rigorous bound, stop once a
+        # feasible NLP stops improving on the previous feasible NLP.
         if !rigorous && result.feasible
-            prev_nlp_objective !== nothing && !_is_better(sense_token,
-                result.objective, prev_nlp_objective) && break
+            _nlp_stalled(sense_token, result.objective,
+                prev_nlp_objective) && break
             prev_nlp_objective = result.objective
         end
         result.feasible && (previous_result = result)
@@ -256,7 +236,16 @@ function _reformulate_loa_single_level(
         commit_combination(model, best_result.combination,
             best_result.linearization_point)
     end
-    return best_result
+    if isfinite(method.time_limit)
+        # Overall cap: the final committed solve gets the budget left.
+        JuMP.set_time_limit_sec(model, max(0.0, overall_deadline - time()))
+    elseif isfinite(method.iteration_time_limit)
+        # Loop-only budget: restore so the final solve isn't crippled.
+        _restore_time_limit(model, original_time_limit)
+    end
+    _set_solution_method(model, method)
+    _set_ready_to_optimize(model, true)
+    return
 end
 
 # `verbose = true` trace helpers. Print to stdout so a `tee`-d log
@@ -320,6 +309,13 @@ function _bound_crossed(
     gap = _gap(sense_token, best_objective, master_bound)
     return gap < -(method.atol + method.rtol * abs(best_objective))
 end
+
+# V&G (1990) criterion 5: a feasible NLP that does not improve on the
+# previous feasible NLP signals the heuristic has converged. The first
+# feasible NLP (`nothing` previous) is never stalled.
+_nlp_stalled(sense_token::Val, objective::Real, previous::Real) =
+    !_is_better(sense_token, objective, previous)
+_nlp_stalled(::Val, ::Real, ::Nothing) = false
 
 # Error fallback for unsupported model types.
 function reformulate_model(::M, ::LOA) where {M}
@@ -427,6 +423,23 @@ end
 ################################################################################
 #                          NLP SUBPROBLEM
 ################################################################################
+# Cap `target`'s solver to the wall-clock budget left before `deadline`
+# (seconds, `time()` clock). No-op when `deadline` is `Inf` (no LOA time
+# limit). Keeps one in-flight solve from overrunning the whole-loop
+# budget; the loop also breaks once `deadline` passes.
+function _cap_remaining_time(target::JuMP.AbstractModel, deadline::Float64)
+    isfinite(deadline) || return
+    JuMP.set_time_limit_sec(target, max(0.0, deadline - time()))
+    return
+end
+
+# Restore the model's solver time limit after the loop — the factory
+# value captured before capping, or unset if the factory set none.
+_restore_time_limit(model::JuMP.AbstractModel, ::Nothing) =
+    JuMP.unset_time_limit_sec(model)
+_restore_time_limit(model::JuMP.AbstractModel, seconds::Real) =
+    JuMP.set_time_limit_sec(model, seconds)
+
 # Solve the primary NLP for a fixed combination. If feasible, read the
 # primal point, duals, and objective. If infeasible, fall through to
 # the NLPF (V&G 1990 eq. 8) approximation: a slacked version of the
@@ -435,8 +448,10 @@ end
 # information from the failed combination instead of only adding a
 # no-good cut.
 function _solve_nlp(
-    model::M, combination, method::LOA, reformulation_map
+    model::M, combination, method::LOA, reformulation_map;
+    deadline::Float64 = Inf
     ) where {M <: JuMP.AbstractModel}
+    _cap_remaining_time(model, deadline)
     primary = with_fixed_combination(model, combination) do
         JuMP.optimize!(model, ignore_optimize_hook = true)
         if JuMP.is_solved_and_feasible(model)
@@ -453,7 +468,7 @@ function _solve_nlp(
     primary === nothing || return primary
 
     # Primary NLP infeasible — try NLPF.
-    nlpf = _solve_nlpf(model, combination, method)
+    nlpf = _solve_nlpf(model, combination, method; deadline = deadline)
     nlpf === nothing || return nlpf
 
     return (combination = combination,
@@ -475,11 +490,12 @@ end
 # slacked feasibility solve we know each active constraint's
 # linearization is informative in the standard direction.
 function _solve_nlpf(
-    model::M, combination, method::LOA
+    model::M, combination, method::LOA; deadline::Float64 = Inf
     ) where {M <: JuMP.AbstractModel}
     copy, ref_map = JuMP.copy_model(model)
     JuMP.set_optimizer(copy, method.nlp_optimizer)
     JuMP.set_silent(copy)
+    _cap_remaining_time(copy, deadline)
 
     var_type = JuMP.variable_ref_type(typeof(copy))
     u = JuMP.@variable(copy, lower_bound = 0.0, base_name = "_nlpf_u")
@@ -649,12 +665,12 @@ end
 # no-op on iterations following an NLPF fall-through (caller does not
 # update `previous_result` then), since NLPF's primal is slack-
 # distorted and a worse start than the prior real NLP. Routes through
-# the `set_warm_start!` dispatch so the InfiniteOpt extension's
+# the `set_linearization_start` dispatch so the InfiniteOpt extension's
 # per-support broadcast handles `GeneralVariableRef` correctly.
-function _set_nlp_warm_start!(previous)
+function _set_nlp_warm_start(previous)
     previous === nothing && return
     for (variable, values) in previous.linearization_point
-        set_warm_start!(variable, values)
+        set_linearization_start(variable, values)
     end
     return
 end
@@ -673,7 +689,7 @@ function commit_combination(
     relax_logical_vars(model)
     fix_combination(model, combination)
     for (variable, values) in linearization_point
-        set_warm_start!(variable, values)
+        set_linearization_start(variable, values)
     end
     return
 end
@@ -700,7 +716,7 @@ end
 # warm start. `values` is always per-support shape (length-1 vector
 # for finite vars); base unwraps. The InfiniteOpt extension overrides
 # for `GeneralVariableRef` to broadcast across transcribed supports.
-set_warm_start!(variable, values::AbstractVector) =
+set_linearization_start(variable, values::AbstractVector) =
     JuMP.set_start_value(variable, only(values))
 
 ################################################################################
@@ -832,6 +848,37 @@ function _check_slacks(master::_LOAMaster, method::LOA)
     return
 end
 
+# A master that is infeasible/unbounded before producing any bound is a
+# degenerate exit, not convergence: LOA falls back to the best
+# set-covering seed without iterating, usually because most NLP
+# subproblems are infeasible and the master lacks the OA cuts to bound
+# `alpha_oa`. No-op once a bound has been produced.
+function _check_degenerate_master(
+    master::_LOAMaster, produced_bound::Bool, best_objective::Real
+    )
+    produced_bound && return
+    @warn "LOA: master returned " *
+        "$(JuMP.termination_status(master.model)) before any bound; " *
+        "returning the best seed incumbent ($best_objective). Not a " *
+        "certified optimum — usually most NLP subproblems are infeasible."
+    return
+end
+
+# A master bound that crosses the incumbent (`_bound_crossed`) proves the
+# OA cuts are not valid supports: the model is nonconvex and the master
+# gives no rigorous dual bound. LOA continues as a V&G (1990) heuristic
+# and returns the best NLP incumbent.
+function _check_nonrigorous_bound(
+    best_objective::Real, master_bound::Real, sense_token::Val, method::LOA
+    )
+    _bound_crossed(best_objective, master_bound, sense_token, method) ||
+        return
+    @warn "LOA: master bound ($master_bound) crossed the incumbent " *
+        "($best_objective); model is nonconvex, dual bound is not " *
+        "rigorous. Returning the best NLP incumbent (heuristic, V&G 1990)."
+    return
+end
+
 ################################################################################
 #                       COMBO EXTRACTION (master → NLP)
 ################################################################################
@@ -926,7 +973,7 @@ function _add_global_oa_cuts(
             con isa JuMP.ScalarConstraint || continue
             linearization = _linearize_at(con.func,
                 result.linearization_point, master.variable_map)
-            _add_global_oa_row!(master, linearization, con.set,
+            _add_global_oa_row(master, linearization, con.set,
                 method, penalty_sign)
         end
     end
@@ -1035,7 +1082,7 @@ end
 # multiplier sign (Duran-Grossmann 1986), so one signed cut suffices.
 # Infeasible (NLPF): sign is uninformative, so emit both directions
 # sharing one slack — mirrors the global-OA equality treatment in
-# `_add_global_oa_row!(::EqualTo)`.
+# `_add_global_oa_row(::EqualTo)`.
 function _emit_disjunct_oa_cut(
     set::_MOI.EqualTo,
     master::_LOAMaster, binary_ref, linearization, dual_value,
@@ -1101,7 +1148,7 @@ end
 # global cuts make the master infeasible on nonconvex models.
 # `EqualTo` / `Interval` get a two-sided pair sharing one slack.
 # Unknown set types fall back to the prior hard cut.
-function _add_global_oa_row!(
+function _add_global_oa_row(
     master::_LOAMaster, lin, set::_MOI.LessThan,
     method::LOA, penalty_sign::Int
     )
@@ -1109,7 +1156,7 @@ function _add_global_oa_row!(
     JuMP.@constraint(master.model, lin - _MOI.constant(set) <= slack)
     return
 end
-function _add_global_oa_row!(
+function _add_global_oa_row(
     master::_LOAMaster, lin, set::_MOI.GreaterThan,
     method::LOA, penalty_sign::Int
     )
@@ -1117,7 +1164,7 @@ function _add_global_oa_row!(
     JuMP.@constraint(master.model, _MOI.constant(set) - lin <= slack)
     return
 end
-function _add_global_oa_row!(
+function _add_global_oa_row(
     master::_LOAMaster, lin, set::_MOI.EqualTo,
     method::LOA, penalty_sign::Int
     )
@@ -1127,7 +1174,7 @@ function _add_global_oa_row!(
     JuMP.@constraint(master.model, c - lin <= slack)
     return
 end
-function _add_global_oa_row!(
+function _add_global_oa_row(
     master::_LOAMaster, lin, set::_MOI.Interval,
     method::LOA, penalty_sign::Int
     )
@@ -1136,7 +1183,7 @@ function _add_global_oa_row!(
     JuMP.@constraint(master.model, set.lower - lin <= slack)
     return
 end
-function _add_global_oa_row!(
+function _add_global_oa_row(
     master::_LOAMaster, lin, set, ::LOA, ::Int
     )
     JuMP.@constraint(master.model, lin in set)

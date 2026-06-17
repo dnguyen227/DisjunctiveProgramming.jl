@@ -390,190 +390,6 @@ end
 
 DP.any_active(actives::AbstractVector{Bool}) = any(actives)
 
-# Override `reformulate_model` for `InfiniteModel` so the LOA
-# `supports_schedule` activates the multi-resolution loop. With
-# `supports_schedule = nothing` this is identical to the base path. With
-# a schedule + `coarse_builder = N -> InfiniteModel`, the wrapper:
-#
-#   1. For each N in the schedule, build a FRESH InfiniteModel via
-#      `coarse_builder(N)`. Apply warm-starts captured from the previous
-#      warmup level (indexed by variable name + parameter name, which
-#      survive across model rebuilds). Run LOA. Capture trajectory.
-#      Discard the warmup model.
-#   2. Apply the final captured trajectory to the user's `model`.
-#   3. Run a single-level LOA on the user's model.
-#
-# This sidesteps every accumulated-state failure mode we hit when
-# mutating one InfiniteModel across resolutions (orphan point vars,
-# stale parameter supports, transcription cache poisoning, etc.).
-function DP.reformulate_model(
-    model::InfiniteOpt.InfiniteModel, method::DP.LOA
-    )
-    schedule = method.supports_schedule
-    if schedule === nothing
-        DP._reformulate_loa_single_level(model, method)
-        DP._set_solution_method(model, method)
-        DP._set_ready_to_optimize(model, true)
-        return
-    end
-
-    isempty(schedule) && error(
-        "LOA `supports_schedule` must be `nothing` or non-empty.")
-    builder = method.coarse_builder
-    builder === nothing && error(
-        "LOA `supports_schedule` requires `coarse_builder`.")
-
-    trajectory = nothing
-    for (level, N) in enumerate(schedule)
-        method.verbose && println(
-            "LOA_MULTIRES warmup level=", level, " N=", N,
-            trajectory === nothing ? " (cold start)" :
-                " (warm-start from level $(level - 1))")
-        warmup_model = builder(N)
-        if trajectory !== nothing
-            _apply_trajectory_by_name!(warmup_model, trajectory)
-        end
-        warmup_method = _strip_schedule(method)
-        warmup_result = DP._reformulate_loa_single_level(
-            warmup_model, warmup_method)
-        if warmup_result === nothing
-            method.verbose && println("LOA_MULTIRES warmup level=",
-                level, " no commit; trajectory unchanged")
-            continue
-        end
-        trajectory = _capture_trajectory_by_name(
-            warmup_model, warmup_result)
-        method.verbose && println("LOA_MULTIRES warmup level=",
-            level, " obj=", warmup_result.objective)
-    end
-
-    if trajectory !== nothing
-        method.verbose && println(
-            "LOA_MULTIRES applying warmup trajectory to user model")
-        _apply_trajectory_by_name!(model, trajectory)
-    end
-    DP._reformulate_loa_single_level(model, method)
-    DP._set_solution_method(model, method)
-    DP._set_ready_to_optimize(model, true)
-    return
-end
-
-# Build a copy of `method` with `supports_schedule = nothing` so the
-# warmup LOA runs as single-level (not recursively triggering its own
-# multi-res). The `coarse_builder` is irrelevant once the schedule is
-# stripped; nothing reads it.
-function _strip_schedule(method::DP.LOA)
-    return DP.LOA(method.nlp_optimizer;
-        mip_optimizer = method.mip_optimizer,
-        inner_method = method.inner_method,
-        max_iter = method.max_iter,
-        atol = method.atol, rtol = method.rtol,
-        M_value = method.M_value,
-        max_slack = method.max_slack,
-        oa_penalty = method.oa_penalty,
-        verbose = method.verbose)
-end
-
-# Capture the converged trajectory as a name-keyed dict so we can apply
-# it to a freshly-built model whose `GeneralVariableRef`s are different
-# objects. Also records each parameter's current supports (per name) so
-# the apply step knows the source grid for interpolation.
-function _capture_trajectory_by_name(
-    model::InfiniteOpt.InfiniteModel, result::NamedTuple
-    )
-    name_to_values = Dict{String, Vector{Float64}}()
-    for (variable, values) in result.linearization_point
-        nm = JuMP.name(variable)
-        isempty(nm) && continue
-        name_to_values[nm] = collect(values)
-    end
-    name_to_supports = Dict{String, Vector{Float64}}()
-    for p in InfiniteOpt.all_parameters(model)
-        nm = JuMP.name(p)
-        isempty(nm) && continue
-        sup = InfiniteOpt.supports(p)
-        ndims(sup) == 1 || continue
-        name_to_supports[nm] = collect(sup)
-    end
-    return (values = name_to_values, supports = name_to_supports)
-end
-
-# Apply a name-keyed trajectory to a fresh model: for each variable
-# whose name appears in `trajectory.values`, interpolate its captured
-# per-support values from the source parameter grid to this model's
-# grid and write as `set_start_value` on the transcribed JuMP refs.
-# Indicator binaries are skipped — they're not part of the primal
-# warm-start.
-function _apply_trajectory_by_name!(
-    target::InfiniteOpt.InfiniteModel, trajectory::NamedTuple
-    )
-    indicator_binaries = Set{InfiniteOpt.GeneralVariableRef}()
-    for (_, bref) in DP._indicator_to_binary(target)
-        push!(indicator_binaries, bref isa JuMP.GenericAffExpr ?
-            only(keys(bref.terms)) : bref)
-    end
-    InfiniteOpt.build_transformation_backend!(target)
-    for v in JuMP.all_variables(target)
-        v in indicator_binaries && continue
-        nm = JuMP.name(v)
-        haskey(trajectory.values, nm) || continue
-        values = trajectory.values[nm]
-        _warm_start_by_name(target, v, values, trajectory.supports)
-    end
-    return
-end
-
-# Variable-side warm-start: finite vars get the scalar value directly;
-# infinite (single-parameter) vars get linearly interpolated from the
-# captured source grid to this model's transcribed supports.
-function _warm_start_by_name(
-    ::InfiniteOpt.InfiniteModel,
-    variable::InfiniteOpt.GeneralVariableRef,
-    values::AbstractVector,
-    captured_supports::AbstractDict
-    )
-    prefs = InfiniteOpt.parameter_refs(variable)
-    if isempty(prefs)
-        length(values) == 1 || return
-        transcribed = InfiniteOpt.transformation_variable(variable)
-        transcribed isa JuMP.AbstractVariableRef || return
-        JuMP.set_start_value(transcribed, only(values))
-        return
-    end
-    length(prefs) == 1 || return
-    pname = JuMP.name(first(prefs))
-    haskey(captured_supports, pname) || return
-    old = captured_supports[pname]
-    length(values) == length(old) || return
-    new = InfiniteOpt.supports(first(prefs))
-    ndims(new) == 1 || return
-    transcribed = InfiniteOpt.transformation_variable(variable)
-    transcribed isa AbstractArray || return
-    refs = vec(transcribed)
-    length(refs) == length(new) || return
-    for (k, s) in enumerate(new)
-        JuMP.set_start_value(refs[k], _linear_interp(old, values, s))
-    end
-    return
-end
-
-# Piecewise-linear interpolation of `ys` defined on the increasing
-# nodes `xs`, evaluated at `q`. Clamps at the endpoints. Cheap and
-# stable enough for warm-starts; only neighborhood-correctness matters.
-function _linear_interp(
-    xs::AbstractVector{<:Real}, ys::AbstractVector{<:Real}, q::Real
-    )
-    n = length(xs)
-    q <= xs[1] && return ys[1]
-    q >= xs[n] && return ys[n]
-    i = searchsortedlast(xs, q)
-    i == n && return ys[n]
-    x0, x1 = xs[i], xs[i + 1]
-    x1 == x0 && return ys[i]
-    t = (q - x0) / (x1 - x0)
-    return (1 - t) * ys[i] + t * ys[i + 1]
-end
-
 # `JuMP.value` returns a per-support `Array` for infinite vars and a
 # scalar for finite vars. The `> 0.5` cutoff handles solver-side
 # integer-feasibility slack (e.g. HiGHS can return 2.75e-40 for a
@@ -1022,7 +838,7 @@ function DP.build_loa_master(
     # master will pick combinations that violate it. Transcribe
     # each such constraint once and add the flat scalar form to
     # the master directly.
-    _add_aggregate_linear_constraints!(
+    _add_aggregate_linear_constraints(
         master, model, ref_map, variable_type)
 
     return DP._LOAMaster(master, binary_map, variable_map,
@@ -1038,7 +854,7 @@ end
 # `transcribed_to_master`. Reuses the transformation backend that
 # `_add_global_oa_cuts_infinite` will rebuild later; building it
 # now is cheap and idempotent.
-function _add_aggregate_linear_constraints!(
+function _add_aggregate_linear_constraints(
     master::InfiniteOpt.InfiniteModel,
     model::InfiniteOpt.InfiniteModel,
     ref_map::AbstractDict,
@@ -1186,13 +1002,13 @@ function _add_global_oa_cuts_infinite(
                 for tf in vec(transcribed_func)
                     lin = DP._linearize_at(tf, transcribed_xk[],
                         transcribed_to_master[])
-                    DP._add_global_oa_row!(master, lin, con.set,
+                    DP._add_global_oa_row(master, lin, con.set,
                         method, penalty_sign)
                 end
             else
                 lin = DP._linearize_at(transcribed_func,
                     transcribed_xk[], transcribed_to_master[])
-                DP._add_global_oa_row!(master, lin, con.set,
+                DP._add_global_oa_row(master, lin, con.set,
                     method, penalty_sign)
             end
         end
@@ -1343,7 +1159,7 @@ end
 # transcribed instances; for a finite var on an InfiniteModel,
 # `transcription_variable` returns a single ref and `values` is
 # length-1.
-function DP.set_warm_start!(
+function DP.set_linearization_start(
     variable::InfiniteOpt.GeneralVariableRef,
     values::AbstractVector
     )
