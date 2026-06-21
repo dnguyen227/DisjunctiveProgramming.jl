@@ -388,31 +388,6 @@ end
 # submodel are themselves InfiniteModels, with per-support handling
 # via point evaluation on infinite `GeneralVariableRef`s.
 
-DP.any_active(actives::AbstractVector{Bool}) = any(actives)
-
-# `JuMP.value` returns a per-support `Array` for infinite vars and a
-# scalar for finite vars. The `> 0.5` cutoff handles solver-side
-# integer-feasibility slack (e.g. HiGHS can return 2.75e-40 for a
-# "0" binary), where direct `Bool(val)` would `InexactError`.
-# `JuMP.value` returns a per-support `Array` for infinite vars and a
-# scalar for finite vars; `round(Bool, ·)` handles both via broadcast
-# and absorbs solver integer-feasibility slack.
-function DP.combination_val(v::InfiniteOpt.GeneralVariableRef)
-    val = JuMP.value(v)
-    return val isa AbstractArray ? vec(round.(Bool, val)) : round(Bool, val)
-end
-
-# Complement-form binary (`1 - y_underlying`) stored in `binary_map`
-# for indicators declared `logical_complement`. `JuMP.value` on the
-# AffExpr returns a per-support `Vector{Float64}` when the underlying
-# is infinite, or a scalar when it's finite.
-function DP.combination_val(
-    v::JuMP.GenericAffExpr{C, <:InfiniteOpt.GeneralVariableRef}
-    ) where {C}
-    val = JuMP.value(v)
-    return val isa AbstractArray ? vec(round.(Bool, val)) : round(Bool, val)
-end
-
 # Supports of the infinite parameter group `v` depends on. For a 1-D
 # parameter, `supports(p)` is a `Vector{Float64}`; for a dependent
 # group of dimension k, it is a k × N_supports `Matrix`. Returns each
@@ -515,71 +490,24 @@ function DP.add_no_good_terms(
     return
 end
 
-function DP.cut_info(
-    binary_ref::InfiniteOpt.GeneralVariableRef,
-    active::Bool,
-    constraint::JuMP.AbstractConstraint,
-    linearization_point::AbstractDict,
-    variable_map::AbstractDict, dual
-    )
-    return _infinite_cut_info(binary_ref, active, constraint.func,
-        linearization_point, variable_map, dual)
-end
-
-function DP.cut_info(
-    binary_ref::InfiniteOpt.GeneralVariableRef,
-    actives::AbstractVector,
-    constraint::JuMP.AbstractConstraint,
-    linearization_point::AbstractDict,
-    variable_map::AbstractDict, dual
-    )
-    return _infinite_cut_info(binary_ref, actives, constraint.func,
-        linearization_point, variable_map, dual)
-end
-
-# Complement-form binary (`1 - y_underlying`). Same fan-out logic as
-# the variable-ref form; the per-support `_at_support` rebuilds the
-# AffExpr with its variable point-evaluated.
-function DP.cut_info(
-    binary_ref::JuMP.GenericAffExpr,
-    active::Bool,
-    constraint::JuMP.AbstractConstraint,
-    linearization_point::AbstractDict,
-    variable_map::AbstractDict, dual
-    )
-    return _infinite_cut_info(binary_ref, active, constraint.func,
-        linearization_point, variable_map, dual)
-end
-
-# Complement-form binary with per-support active descriptor (e.g.,
-# `BitVector` from `_extract_combination` on an InfiniteOpt master
-# where the indicator was declared `logical_complement`).
-function DP.cut_info(
-    binary_ref::JuMP.GenericAffExpr,
-    actives::AbstractVector,
-    constraint::JuMP.AbstractConstraint,
-    linearization_point::AbstractDict,
-    variable_map::AbstractDict, dual
-    )
-    return _infinite_cut_info(binary_ref, actives, constraint.func,
-        linearization_point, variable_map, dual)
-end
-
 # Fan out across supports if either the binary or the constraint
 # expression involves an infinite variable; otherwise emit one
 # un-sliced site. The chosen supports come from the first infinite
 # variable found in either expression.
 function _infinite_cut_info(
-    binary_ref, active, constraint_func,
-    linearization_point, variable_map, dual
+    binary_ref,
+    active,
+    constraint_func,
+    linearization_point,
+    variable_map
     )
     supports = _relevant_supports(binary_ref, constraint_func)
     supports === nothing &&
-        return ((binary_ref, linearization_point, variable_map, dual),)
+        return ((binary_ref, linearization_point, variable_map),)
     actives = active isa AbstractVector ? active :
         fill(active, length(supports))
     return _cut_sites(binary_ref, supports, actives,
-        linearization_point, variable_map, dual)
+        linearization_point, variable_map)
 end
 
 # Supports governing per-support fan-out — pick the first infinite
@@ -616,18 +544,14 @@ function _find_infinite_var(expr)
     return found[]
 end
 
-_find_infinite_var(::Any) = nothing
-
 function _cut_sites(
     binary_ref,
     supports::AbstractVector,
     actives::AbstractVector,
     linearization_point::AbstractDict,
-    variable_map::AbstractDict,
-    dual
+    variable_map::AbstractDict
     )
     sites = Any[]
-    dual = _support_dual(dual, length(supports))
     for (k, support) in enumerate(supports)
         actives[k] || continue
         point_var_map = Dict{
@@ -644,8 +568,7 @@ function _cut_sites(
         push!(sites, (
             _at_support(binary_ref, support),
             point,
-            point_var_map,
-            _at(dual, k)
+            point_var_map
             ))
     end
     return sites
@@ -659,15 +582,6 @@ end
 _at(values::AbstractArray, k::Integer) =
     length(values) == 1 ? values[1] : values[k]
 _at(scalar, ::Integer) = scalar
-
-# A feasible NLP yields one dual per support (length == nsupp). A
-# feasibility-restoration solve yields a set-shaped *sign* dual (e.g.
-# EqualTo → [1, 1]) carrying only a direction, identical at every
-# support. Collapse the latter to a scalar so per-support slicing
-# broadcasts the sign instead of indexing past its length.
-_support_dual(dual, nsupp::Integer) =
-    dual isa AbstractArray && length(dual) != nsupp &&
-        length(dual) != 1 ? DP._collapse_dual(dual) : dual
 
 # Point-evaluate an InfiniteOpt var at `support` if it's infinite;
 # return the var as-is if it's finite. `support` is one joint support
@@ -703,7 +617,7 @@ end
 # resulting flat scalar objective, and uses this map to translate
 # the gradient back into master point variables. Per-support
 # DISJUNCT cuts do NOT need this — they linearize natively in
-# InfiniteModel space via `cut_info`. If the objective contains no
+# InfiniteModel space via `_infinite_cut_info`. If the objective has no
 # measures, this whole layer is dead weight; killing it would
 # require either banning measure objectives or hand-writing a
 # `_linearize_at` that walks `MeasureRef` symbolically.
@@ -843,7 +757,7 @@ function DP.build_loa_master(
 
     return DP._LOAMaster(master, binary_map, variable_map,
         objective_sense, original_objective, alpha_oa,
-        objective_ref_map, Any[])
+        objective_ref_map)
 end
 
 # Walk the original model's linear-`F` constraints, transcribe those
@@ -885,11 +799,9 @@ function _add_aggregate_linear_constraints(
     # parameter-relative (the master then honors `set_value(α, ...)`
     # without rebuild).
     for p in InfiniteOpt.all_parameters(model)
-        transcribed_p = try
-            InfiniteOpt.transformation_variable(p)
-        catch
-            continue
-        end
+        InfiniteOpt.dispatch_variable_ref(p) isa
+            InfiniteOpt.FiniteParameterRef || continue
+        transcribed_p = InfiniteOpt.transformation_variable(p)
         transcribed_p isa JuMP.VariableRef || continue
         haskey(ref_map, p) || continue
         transcribed_to_master[transcribed_p] = ref_map[p]
@@ -922,10 +834,9 @@ function _add_aggregate_linear_constraints(
     return
 end
 
-# Override the disjunct-cut loop for `InfiniteModel`. Same shape as
-# Override `add_oa_cuts` for `InfiniteModel` to translate the
+# Override `add_oa_cuts` for `InfiniteModel`: translate the
 # linearization point into the form the master's `original_objective`
-# expects, and to route global OA cuts through transcription so they
+# expects, and route global OA cuts through transcription so they
 # work over infinite vars and aggregate refs. The base
 # `result.linearization_point` has per-support `Vector` values keyed
 # on InfiniteOpt vars; the master's objective is either the raw
@@ -972,8 +883,7 @@ function _add_global_oa_cuts_infinite(
     result::NamedTuple,
     method::DP.LOA
     )
-    _, penalty_sign = DP._disjunct_cut_coefficients(
-        Val(master.objective_sense))
+    penalty_sign = DP._penalty_sign(Val(master.objective_sense))
     variable_type = InfiniteOpt.GeneralVariableRef
     reform_set = DP.is_gdp_model(model) ?
         Set(DP._reformulation_constraints(model)) : Set()
@@ -1033,8 +943,7 @@ function DP.add_disjunct_oa_cuts(
     result::NamedTuple,
     method::DP.LOA
     )
-    sign_factor, penalty_sign = DP._disjunct_cut_coefficients(
-        Val(master.objective_sense))
+    penalty_sign = DP._penalty_sign(Val(master.objective_sense))
     transcribed_to_master = Ref{Any}(nothing)
     transcribed_xk = Ref{Any}(nothing)
     ensure_transcribed = function ()
@@ -1047,8 +956,7 @@ function DP.add_disjunct_oa_cuts(
         return
     end
     for (indicator, active) in result.combination
-        DP.any_active(active) || continue
-        haskey(master.binary_map, indicator) || continue
+        DP.is_active(active) || continue
         haskey(DP._indicator_to_constraints(model), indicator) ||
             continue
         for orig_constraint_ref in
@@ -1057,8 +965,6 @@ function DP.add_disjunct_oa_cuts(
                 continue
             constraint = DP._disjunct_constraints(model)[
                 JuMP.index(orig_constraint_ref)].constraint
-            dual = get(result.duals, orig_constraint_ref, nothing)
-            dual === nothing && continue
             if _has_aggregate_ref(constraint.func)
                 ensure_transcribed()
                 transcribed_func =
@@ -1066,42 +972,40 @@ function DP.add_disjunct_oa_cuts(
                         constraint.func)
                 transcribed_constraint = JuMP.ScalarConstraint(
                     transcribed_func, constraint.set)
-                for (binary_ref, _, _, dual_value) in DP.cut_info(
+                for (binary_ref, _, _) in _infinite_cut_info(
                     master.binary_map[indicator], active,
-                    transcribed_constraint,
-                    result.linearization_point,
-                    master.variable_map, dual)
+                    transcribed_func, result.linearization_point,
+                    master.variable_map)
                     DP._add_oa_cut_for_constraint(
                         transcribed_constraint, master, binary_ref,
                         transcribed_xk[], transcribed_to_master[],
-                        dual_value, method, sign_factor,
-                        penalty_sign, result.feasible)
+                        method, penalty_sign)
                 end
                 continue
             end
-            for (binary_ref, linearization_point, var_map,
-                    dual_value) in DP.cut_info(
-                    master.binary_map[indicator], active, constraint,
-                    result.linearization_point,
-                    master.variable_map, dual)
+            for (binary_ref, linearization_point, var_map) in
+                    _infinite_cut_info(
+                    master.binary_map[indicator], active,
+                    constraint.func, result.linearization_point,
+                    master.variable_map)
                 DP._add_oa_cut_for_constraint(
                     constraint, master, binary_ref,
-                    linearization_point, var_map, dual_value,
-                    method, sign_factor, penalty_sign,
-                    result.feasible)
+                    linearization_point, var_map, method, penalty_sign)
             end
         end
     end
 end
 
-# Apply per-indicator fixes for `combination` and return a closure
-# that reverses them. Scalar (`Bool`) values delegate to base
-# `fix_indicator` (which unwraps complement-form `1 - y` AffExprs to
-# the underlying binary and inverts the target). Per-support
-# `AbstractVector{Bool}` values fix each support via a point-equality
-# constraint on the underlying infinite var. State lives in the
-# closure — no `model.ext` stash. Used by base `with_fixed_combination`
-# and `commit_combination`.
+# Apply per-indicator fixes for `combination` and return a closure that
+# reverses them. A scalar (`Bool`) value delegates to base
+# `fix_indicator` (force-fix, which unwraps complement-form `1 - y`
+# AffExprs). A per-support `AbstractVector{Bool}` value pins each support
+# of the underlying infinite binary with a point-equality constraint.
+# The returned closure deletes those constraints and unfixes, so the
+# extension's `with_fixed_combination` can tear the fix down each
+# iteration — a stale per-support pin would clash with the next
+# combination. `commit_combination` ignores the closure, persisting the
+# committed fix.
 function DP.fix_combination(
     model::InfiniteOpt.InfiniteModel, combination::AbstractDict
     )
@@ -1135,20 +1039,44 @@ function DP.fix_combination(
     end
 end
 
-# Per-support binary pin on an NLPF copy of an `InfiniteModel`.
-# Triggered when the combination value is `AbstractVector{Bool}` —
-# i.e., the indicator is itself infinite, so each support k must be
-# pinned independently via a point-equality `binary(t_k) == value[k]`.
-# Finite indicators on an `InfiniteModel` dispatch to the base scalar
-# `JuMP.fix` path because `combination_val` returns a scalar `Bool`.
-# Complement-form binaries are handled by base recursion before this
-# dispatch fires.
-function DP._nlpf_fix_on_copy(
-    copy::InfiniteOpt.InfiniteModel,
-    binary::InfiniteOpt.GeneralVariableRef,
-    value::AbstractVector{Bool}
+# OVERRIDE for InfiniteModel: fix the combination, run `f()`, then
+# always undo. The finite base fixes in place and needs no teardown, but
+# the infinite path pins per-support combinations with point-equality
+# constraints (and scalar seeds with `JuMP.fix`) that must be cleared
+# between iterations — a stale per-support pin would clash with the next
+# combination — so this lifecycle needs the `try/finally` the base
+# omits. The model is relaxed once in `reformulate_model`, so there is
+# no relax/unrelax here.
+function DP.with_fixed_combination(
+    f, model::InfiniteOpt.InfiniteModel, combination::AbstractDict
     )
-    for (k, support) in enumerate(_supports_of(binary))
+    undo = DP.fix_combination(model, combination)
+    try
+        return f()
+    finally
+        undo()
+    end
+end
+
+# Pin a copy-side binary on an NLPF copy of an `InfiniteModel`. The
+# infinite `with_fixed_combination` undoes the original's fix before the
+# NLPF fall-through, so the copy arrives unfixed and is pinned here. The
+# copy is discarded after the solve, so a point-equality constraint
+# needs no teardown; using constraints rather than `JuMP.fix` avoids
+# force-deleting bounds on the relaxed copy (whose bound refs may not
+# survive `copy_model`).
+function DP.nlpf_fix_on_copy(
+    copy::InfiniteOpt.InfiniteModel, binary, value::Bool
+    )
+    JuMP.@constraint(copy, binary == (value ? 1.0 : 0.0))
+    return
+end
+function DP.nlpf_fix_on_copy(
+    copy::InfiniteOpt.InfiniteModel, binary, value::AbstractVector{Bool}
+    )
+    underlying = binary isa JuMP.GenericAffExpr ?
+        only(keys(binary.terms)) : binary
+    for (k, support) in enumerate(_supports_of(underlying))
         JuMP.@constraint(copy,
             _at_support(binary, support) == (value[k] ? 1.0 : 0.0))
     end

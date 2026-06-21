@@ -5,23 +5,23 @@ function test_loa_datatype()
     @test method.nlp_optimizer == HiGHS.Optimizer
     @test method.mip_optimizer == HiGHS.Optimizer
     @test method.max_iter == 10
-    @test method.atol == 1e-6
-    @test method.rtol == 1e-4
     @test method.M_value == 1e9
     @test method.max_slack == 1000.0
     @test method.oa_penalty == 1000.0
+    @test method.convergence_tol == 1e-6
+    @test method.slack_tol == 1e-4
     @test method.inner_method isa BigM
     @test method.inner_method.value == 1e9
 
-    method = LOA(HiGHS.Optimizer; max_iter = 50, atol = 1e-8,
-        rtol = 1e-6, M_value = 1e6, max_slack = 500.0,
-        oa_penalty = 200.0)
+    method = LOA(HiGHS.Optimizer; max_iter = 50, M_value = 1e6,
+        max_slack = 500.0, oa_penalty = 200.0,
+        convergence_tol = 1e-4, slack_tol = 1e-3)
     @test method.max_iter == 50
-    @test method.atol == 1e-8
-    @test method.rtol == 1e-6
     @test method.M_value == 1e6
     @test method.max_slack == 500.0
     @test method.oa_penalty == 200.0
+    @test method.convergence_tol == 1e-4
+    @test method.slack_tol == 1e-3
     @test method.inner_method isa BigM
     @test method.inner_method.value == 1e6
 
@@ -73,16 +73,6 @@ function test_no_good_cut()
         include_variable_in_set_constraints = false))
 
     @test num_cons_after == num_cons_before + 1
-end
-
-function test_loa_convergence_check()
-    method = LOA(HiGHS.Optimizer; atol = 1e-6, rtol = 1e-4)
-
-    sense = Val(MOI.MIN_SENSE)
-    @test DP._loa_converged(1.0, 1.0, sense, method) == true
-    @test DP._loa_converged(1.0, 0.9999, sense, method) == true
-    @test DP._loa_converged(1.0, 0.5, sense, method) == false
-    @test DP._loa_converged(1e-8, 0.0, sense, method) == true
 end
 
 function test_loa_reformulate_simple()
@@ -193,8 +183,9 @@ end
 function test_loa_complement_indicator_nonlinear_disjunct()
     # Regression: complement-form indicators store `1 - y_base` (an
     # AffExpr) in `binary_map`. When the complement disjunct has a
-    # nonlinear constraint, `add_disjunct_oa_cuts` calls `cut_info`
-    # on that AffExpr; the AffExpr method must dispatch.
+    # nonlinear constraint, `add_disjunct_oa_cuts` feeds that AffExpr
+    # straight into the OA cut gating term `M(1 - binary)`, which must
+    # accept an AffExpr binary (not just a plain variable ref).
     #
     # Setup: 0 <= x <= 10, Y2 ≡ ¬Y1.
     #   Disjunct(Y1): x <= 3     (linear)
@@ -319,11 +310,119 @@ function test_loa_nlpf_infeasible_disjunct()
     @test value(Y[1]) ≈ 0.0 atol = 1e-6
 end
 
+function test_loa_sense_primitives()
+    # Sense-dispatched primitives the main loop reads through. The
+    # finite/infinite solve tests cover every branch except the
+    # minimize-sense gap (no minimizing model reaches a master bound in
+    # those tests), so pin all six here for both senses directly.
+    minv = Val(MOI.MIN_SENSE)
+    maxv = Val(MOI.MAX_SENSE)
+    @test DP._penalty_sign(minv) == 1
+    @test DP._penalty_sign(maxv) == -1
+    @test DP._worst_objective(minv) == Inf
+    @test DP._worst_objective(maxv) == -Inf
+    @test DP._is_better(minv, 3.0, 5.0)
+    @test !DP._is_better(minv, 5.0, 3.0)
+    @test DP._is_better(maxv, 5.0, 3.0)
+    @test !DP._is_better(maxv, 3.0, 5.0)
+    @test DP._gap(minv, 5.0, 3.0) == 2.0
+    @test DP._gap(maxv, 3.0, 5.0) == 2.0
+end
+
+function test_loa_iteration_loop()
+    # Force the master/NLP refinement loop to run its body rather than
+    # exhaust the master on the seeds or converge on the first master
+    # solve. Two disjunctions over disjoint x/z half-lines put the
+    # optimum on an OFF-diagonal combination the set-covering seeds (the
+    # diagonal (Y1,W1) and (Y2,W2)) never try. After seeding, the master
+    # stays feasible and its bound beats the seed incumbent, so LOA
+    # enters the loop body, extracts the off-diagonal combination, solves
+    # its NLP, and updates the incumbent before converging. `Min` sense
+    # also drives the minimize-sense gap path.
+    #   min x - z
+    #   D1: (x <= 4) [Y1]  v  (x >= 6) [Y2]
+    #   D2: (z <= 4) [W1]  v  (z >= 6) [W2]
+    # Optimum: Y1 & W2 -> x = 0, z = 10, obj = -10 (off-diagonal).
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, 0 <= z <= 10)
+    @variable(model, Y[1:2], Logical)
+    @variable(model, W[1:2], Logical)
+    @constraint(model, x <= 4, Disjunct(Y[1]))
+    @constraint(model, x >= 6, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @constraint(model, z <= 4, Disjunct(W[1]))
+    @constraint(model, z >= 6, Disjunct(W[2]))
+    @disjunction(model, W)
+    @objective(model, Min, x - z)
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ -10.0 atol = 1e-4
+    @test value(Y[1]) ≈ 1.0 atol = 1e-6
+    @test value(W[2]) ≈ 1.0 atol = 1e-6
+end
+
+function test_loa_time_limits()
+    # Exercise the wall-clock budget paths. A finite `time_limit`
+    # (overall cap) drives `_cap_remaining_time` during the subproblem
+    # solves and the final-solve budget reset; a finite
+    # `iteration_time_limit` (loop-only budget) drives the post-loop
+    # time-limit restore from no prior limit (the `::Nothing` path).
+    # Both limits are generous: they govern the path taken, not the
+    # result.
+    function build_model()
+        model = GDPModel(HiGHS.Optimizer)
+        set_silent(model)
+        @variable(model, 0 <= x <= 10)
+        @variable(model, Y[1:2], Logical)
+        @constraint(model, x <= 3, Disjunct(Y[1]))
+        @constraint(model, x <= 7, Disjunct(Y[2]))
+        @disjunction(model, Y)
+        @objective(model, Max, x)
+        return model
+    end
+
+    model = build_model()
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer; time_limit = 60.0))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 7.0 atol = 1e-4
+
+    model = build_model()
+    optimize!(model,
+        gdp_method = LOA(HiGHS.Optimizer; iteration_time_limit = 60.0))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 7.0 atol = 1e-4
+end
+
+function test_loa_no_feasible_incumbent()
+    # Every disjunct combination is NLP-infeasible: the global x == 20
+    # contradicts the x <= 10 bound under any selection. NLPF does not
+    # slack equalities, so NLPF also fails (no values) and `_solve_nlp`
+    # returns its infeasible fallback. No seed or loop NLP yields a
+    # feasible incumbent, so `best_result` stays `nothing`, the master
+    # is infeasible (no bound), and LOA exits on the "no feasible
+    # incumbent" warning from `_report_loa_gap`.
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @constraint(model, x == 20)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    method = LOA(HiGHS.Optimizer)
+    @test_logs (:warn, r"no feasible incumbent") match_mode = :any begin
+        DP.reformulate_model(model, method)
+    end
+    @test DP._ready_to_optimize(model)
+end
+
 @testset "LOA" begin
     test_loa_datatype()
     test_set_covering_combos()
     test_no_good_cut()
-    test_loa_convergence_check()
     test_loa_reformulate_simple()
     test_loa_solve_simple()
     test_loa_solve_simple_with_mbm()
@@ -336,4 +435,8 @@ end
     test_linearize_nonlinear_sin()
     test_linearize_nonlinear_multivar()
     test_to_nlp_expr()
+    test_loa_sense_primitives()
+    test_loa_iteration_loop()
+    test_loa_time_limits()
+    test_loa_no_feasible_incumbent()
 end

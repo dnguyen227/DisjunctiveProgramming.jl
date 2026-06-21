@@ -828,8 +828,8 @@ function test_loa_infinite_complement_indicator()
     #
     # Linear disjuncts only — a nonlinear disjunct constraint on an
     # infinite variable would also hit a separate gap where
-    # `cut_info` for a finite indicator does not slice the per-support
-    # linearization point. Out of scope for this regression.
+    # `_infinite_cut_info` for a finite indicator does not slice the
+    # per-support linearization point. Out of scope for this regression.
     #
     # max ∫ x dt with 0 ≤ x ≤ 10 over t ∈ [0,1]:
     #   Y1: x ≤ 3       Y2 ≡ ¬Y1: x ≤ 8
@@ -855,7 +855,7 @@ end
 function test_loa_infinite_complement_nonlinear_disjunct()
     # Regression: a finite (or complement-form AffExpr) indicator
     # gating a NONLINEAR constraint on an infinite variable. Earlier
-    # `cut_info` decided fan-out from the indicator only — finite
+    # `_infinite_cut_info` decided fan-out from the indicator only — finite
     # indicator → single un-sliced site → `_linearize_at` received
     # per-support `Vector{Float64}` values and tripped on
     # `_unwrap_scalar`'s `only(v)`. Fixed by inspecting the constraint
@@ -917,14 +917,18 @@ function test_loa_infinite_multidim_parameter()
 end
 
 function test_loa_infinite_nlpf_infeasible_disjunct()
-    # InfiniteOpt LOA: Y[1]'s per-support constraint x^2 >= 200 is
-    # NLP-infeasible against the bound x in [0, 10] (max x^2 = 100).
-    # With infinite indicators `Y[1:2], InfiniteLogical(t)`, the
-    # combination value is `Vector{Bool}` — exercising the extension
-    # override `_nlpf_fix_on_copy(::InfiniteModel,
-    # ::GeneralVariableRef, ::AbstractVector{Bool})` that pins each
-    # support via point-equality. LOA must still converge to Y[2]
-    # active everywhere (x = 5), giving objective ∫x dt = 5.
+    # InfiniteOpt LOA: Y[1]'s per-support constraint x >= 200 is
+    # NLP-infeasible against the bound x in [0, 10]. With infinite
+    # indicators `Y[1:2], InfiniteLogical(t)`, the infeasible
+    # Y[1]-everywhere seed makes the primary NLP fail, so NLPF runs: it
+    # copies the model, re-pins the binaries on the copy via
+    # `nlpf_fix_on_copy`, slacks the inequality, and returns a
+    # linearization point. The disjunct is deliberately LINEAR:
+    # the model is then convex, so LOA's master bound is rigorous and
+    # it converges to Y[2] active everywhere (x = 5), giving ∫x dt = 5.
+    # (A nonconvex infeasible disjunct such as x^2 >= 200 would make LOA
+    # a heuristic and let the local NLP solver report a constraint-
+    # violating point as solved — out of scope for the NLPF path here.)
     ipopt = optimizer_with_attributes(Ipopt.Optimizer,
         "print_level" => 0, "sb" => "yes")
     juniper = optimizer_with_attributes(Juniper.Optimizer,
@@ -934,7 +938,7 @@ function test_loa_infinite_nlpf_infeasible_disjunct()
     @infinite_parameter(model, t ∈ [0, 1], num_supports = 3)
     @variable(model, 0 <= x <= 10, Infinite(t))
     @variable(model, Y[1:2], InfiniteLogical(t))
-    @constraint(model, x^2 >= 200, Disjunct(Y[1]))
+    @constraint(model, x >= 200, Disjunct(Y[1]))
     @constraint(model, x <= 5, Disjunct(Y[2]))
     @disjunction(model, Y)
     @objective(model, Max, ∫(x, t))
@@ -972,6 +976,38 @@ function test_loa_infinite_aggregate_global()
     @test termination_status(model) in
         (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
     @test objective_value(model) ≈ 1.0 atol = 1e-2
+end
+
+function test_loa_infinite_iteration_loop()
+    # Force the InfiniteModel LOA main loop to fix per-support
+    # Vector{Bool} combinations, exercising the in-place fix-constraint
+    # stash: create on the first main-loop fix, update via
+    # set_normalized_rhs on the committed re-fix. Two disjunctions over
+    # disjoint x/z half-lines put the optimum on an off-diagonal
+    # combination the scalar set-covering seeds never try, so the master
+    # stays feasible and the loop body runs with per-support values.
+    #   min ∫(x - z) dt
+    #   D1: (x <= 4) [Y1]  ∨  (x >= 6) [Y2]
+    #   D2: (z <= 4) [W1]  ∨  (z >= 6) [W2]
+    # Optimum: Y1 & W2 everywhere → x = 0, z = 10, ∫(x - z) = -10.
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 3)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, 0 <= z <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @variable(model, W[1:2], InfiniteLogical(t))
+    @constraint(model, x <= 4, Disjunct(Y[1]))
+    @constraint(model, x >= 6, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @constraint(model, z <= 4, Disjunct(W[1]))
+    @constraint(model, z >= 6, Disjunct(W[2]))
+    @disjunction(model, W)
+    @objective(model, Min, ∫(x - z, t))
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
+    @test termination_status(model) in
+        (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ -10.0 atol = 1e-3
 end
 
 @testset "InfiniteDisjunctiveProgramming" begin
@@ -1051,6 +1087,7 @@ end
             test_loa_infinite_complement_nonlinear_disjunct()
             test_loa_infinite_multidim_parameter()
             test_loa_infinite_nlpf_infeasible_disjunct()
+            test_loa_infinite_iteration_loop()
         else
             @info "Skipping InfiniteOpt LOA tests: " *
                 "JuMP.copy_model(::InfiniteModel) unavailable " *
