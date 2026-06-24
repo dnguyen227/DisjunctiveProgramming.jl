@@ -210,7 +210,10 @@ end
 # Allows for building DisjunctConstraints for VectorConstraints since these get parsed differently by JuMP (JuMP changes the set to a MOI.AbstractScalarSet)
 for SetType in (
     JuMP.Nonnegatives, JuMP.Nonpositives, JuMP.Zeros,
-    _MOI.Nonnegatives, _MOI.Nonpositives, _MOI.Zeros
+    _MOI.Nonnegatives, _MOI.Nonpositives, _MOI.Zeros,
+    JuMP.SecondOrderCone, JuMP.RotatedSecondOrderCone,
+    _MOI.SecondOrderCone, _MOI.RotatedSecondOrderCone,
+    _MOI.ExponentialCone, _MOI.PowerCone
 )
     @eval begin
         @doc """

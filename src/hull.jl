@@ -281,6 +281,24 @@ function reformulate_disjunct_constraint(
     reform_con = JuMP.build_constraint(error, new_func, con.set)
     return [reform_con]
 end
+
+function reformulate_disjunct_constraint(
+    model::JuMP.AbstractModel,
+    con::JuMP.VectorConstraint{T, S, R},
+    bvref::Union{JuMP.AbstractVariableRef, JuMP.GenericAffExpr},
+    method::_Hull
+) where {
+    T <: Union{JuMP.AbstractVariableRef, JuMP.GenericAffExpr},
+    S <: Union{_MOI.SecondOrderCone, _MOI.RotatedSecondOrderCone,
+        _MOI.ExponentialCone, _MOI.PowerCone},
+    R
+}
+    new_func = JuMP.@expression(model, [i=1:_MOI.dimension(con.set)],
+        disaggregate_expression(model, con.func[i], bvref, method)
+    )
+    reform_con = JuMP.build_constraint(error, new_func, con.set)
+    return [reform_con]
+end
 function reformulate_disjunct_constraint(
     model::JuMP.AbstractModel, 
     con::JuMP.ScalarConstraint{T, S}, 

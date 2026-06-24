@@ -1,4 +1,4 @@
-using HiGHS, Ipopt, Juniper
+using HiGHS, Ipopt, Juniper, Pajarito, Hypatia
 function test_linear_gdp_example(m, use_complements = false)
     set_attribute(m, MOI.Silent(), true)
     @variable(m, 1 ≤ x[1:2] ≤ 9)
@@ -167,4 +167,38 @@ end
         )
     test_quadratic_gdp_example()
     test_generic_model(GDPModel{Float32}(mockoptimizer))
+end
+
+function test_conic_gdp_example()
+    # Circle-containment idea from Bernal Neira & Grossmann (2021),
+    # Eq. 4.3: the point (x, y) must lie in the unit circle around
+    # (0, 0) OR around (5, 0), expressed as second-order cones. The
+    # disjunction picks one circle; minimizing x selects the first and
+    # lands on its leftmost point, (x, y) = (-1, 0).
+    oa = optimizer_with_attributes(HiGHS.Optimizer, MOI.Silent() => true)
+    cs = optimizer_with_attributes(Hypatia.Optimizer, MOI.Silent() => true)
+    paj = optimizer_with_attributes(Pajarito.Optimizer,
+        "oa_solver" => oa, "conic_solver" => cs, "verbose" => false)
+    for meth in (BigM(100), Hull())
+        m = GDPModel(paj)
+        set_attribute(m, MOI.Silent(), true)
+        @variable(m, -10 <= x <= 10)
+        @variable(m, -10 <= y <= 10)
+        @variable(m, Y[1:2], Logical)
+        @objective(m, Min, x)
+        @constraint(m, c1, [1, x, y] in SecondOrderCone(), Disjunct(Y[1]))
+        @constraint(m, c2, [1, x - 5, y] in SecondOrderCone(), Disjunct(Y[2]))
+        @disjunction(m, Y)
+        @test optimize!(m, gdp_method = meth) isa Nothing
+        @test termination_status(m) == MOI.OPTIMAL
+        @test isapprox(objective_value(m), -1, atol = 1e-4)
+        @test isapprox(value(x), -1, atol = 1e-4)
+        @test isapprox(value(y), 0, atol = 1e-4)
+        @test value(Y[1])
+        @test !value(Y[2])
+    end
+end
+
+@testset "Solve Conic GDP" begin
+    test_conic_gdp_example()
 end

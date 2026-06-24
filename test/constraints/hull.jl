@@ -662,6 +662,62 @@ function test_extension_hull()
     # TODO add more tests
 end
 
+function test_vector_soc_hull()
+    model = GDPModel()
+    @variable(model, 10 <= x <= 100)
+    @variable(model, 10 <= t <= 100)
+    @variable(model, z, Logical)
+    @constraint(model, con, [t - 5, x - 5] in SecondOrderCone(), Disjunct(z))
+    zbin = variable_by_name(model, "z")
+    method = DP._Hull(Hull(1e-3), Set([x, t]))
+    prep_bounds([x, t], model, Hull())
+    @test DP._disaggregate_variables(model, z, Set([x, t]), method) isa Nothing
+    x_z = variable_by_name(model, "x_z")
+    t_z = variable_by_name(model, "t_z")
+    ref = reformulate_disjunct_constraint(model, constraint_object(con), zbin, method)
+    @test length(ref) == 1
+    @test ref[1].func == [t_z - 5*zbin, x_z - 5*zbin]
+    @test ref[1].set == MOI.SecondOrderCone(2)
+end
+
+function test_vector_rsoc_hull()
+    model = GDPModel()
+    @variable(model, 10 <= x <= 100)
+    @variable(model, 10 <= t <= 100)
+    @variable(model, z, Logical)
+    @constraint(model, con, [0.5, t - 2, x - 3] in RotatedSecondOrderCone(), Disjunct(z))
+    zbin = variable_by_name(model, "z")
+    method = DP._Hull(Hull(1e-3), Set([x, t]))
+    prep_bounds([x, t], model, Hull())
+    @test DP._disaggregate_variables(model, z, Set([x, t]), method) isa Nothing
+    x_z = variable_by_name(model, "x_z")
+    t_z = variable_by_name(model, "t_z")
+    ref = reformulate_disjunct_constraint(model, constraint_object(con), zbin, method)
+    @test length(ref) == 1
+    @test ref[1].func == [0.5*zbin, t_z - 2*zbin, x_z - 3*zbin]
+    @test ref[1].set == MOI.RotatedSecondOrderCone(3)
+end
+
+function test_vector_exp_hull()
+    model = GDPModel()
+    @variable(model, 10 <= x <= 100)
+    @variable(model, 10 <= t <= 100)
+    @variable(model, 10 <= w <= 100)
+    @variable(model, z, Logical)
+    @constraint(model, con, [x - 1, t - 1, w - 1] in MOI.ExponentialCone(), Disjunct(z))
+    zbin = variable_by_name(model, "z")
+    method = DP._Hull(Hull(1e-3), Set([x, t, w]))
+    prep_bounds([x, t, w], model, Hull())
+    @test DP._disaggregate_variables(model, z, Set([x, t, w]), method) isa Nothing
+    x_z = variable_by_name(model, "x_z")
+    t_z = variable_by_name(model, "t_z")
+    w_z = variable_by_name(model, "w_z")
+    ref = reformulate_disjunct_constraint(model, constraint_object(con), zbin, method)
+    @test length(ref) == 1
+    @test ref[1].func == [x_z - zbin, t_z - zbin, w_z - zbin]
+    @test ref[1].set == MOI.ExponentialCone()
+end
+
 @testset "Hull Reformulation" begin
     test_default_hull()
     test_set_hull()
@@ -703,4 +759,7 @@ end
     test_scalar_nonlinear_hull_2sided_error()
     test_exactly1_error()
     test_extension_hull()
+    test_vector_soc_hull()
+    test_vector_rsoc_hull()
+    test_vector_exp_hull()
 end
