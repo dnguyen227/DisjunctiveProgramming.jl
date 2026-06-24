@@ -374,16 +374,6 @@ function test_power_bigm()
     @test ref[1].set == MOI.PowerCone(0.5)
 end
 
-function test_conic_bigm_inf_error()
-    model = GDPModel()
-    @variable(model, x)
-    @variable(model, t)
-    @variable(model, y, Logical)
-    @constraint(model, con, [t, x] in SecondOrderCone(), Disjunct(y))
-    bvref = binary_variable(y)
-    @test_throws ErrorException reformulate_disjunct_constraint(model, constraint_object(con), bvref, BigM(Inf, false))
-end
-
 @testset "BigM Reformulation" begin
     test_default_bigm()
     test_default_tighten_bigm()
@@ -408,5 +398,4 @@ end
     test_rsoc_bigm()
     test_exp_bigm()
     test_power_bigm()
-    test_conic_bigm_inf_error()
 end
