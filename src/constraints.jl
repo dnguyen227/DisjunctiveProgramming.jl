@@ -207,6 +207,16 @@ function JuMP.build_constraint(
     return _DisjunctConstraint(constr, tag.indicator)
 end
 
+# MOI conic sets handled by the BigM and Hull conic reformulations
+# (Bernal Neira & Grossmann 2021). The affine map A*x - b sits inside
+# the cone; the nonlinearity is carried by the cone itself.
+const _ConicSets = Union{
+    _MOI.SecondOrderCone,
+    _MOI.RotatedSecondOrderCone,
+    _MOI.ExponentialCone,
+    _MOI.PowerCone,
+}
+
 # Allows for building DisjunctConstraints for VectorConstraints since these get parsed differently by JuMP (JuMP changes the set to a MOI.AbstractScalarSet)
 for SetType in (
     JuMP.Nonnegatives, JuMP.Nonpositives, JuMP.Zeros,

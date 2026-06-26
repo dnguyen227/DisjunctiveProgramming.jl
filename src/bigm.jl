@@ -283,9 +283,7 @@ function reformulate_disjunct_constraint(
     method::BigM
 ) where {
     T <: Union{JuMP.AbstractVariableRef, JuMP.GenericAffExpr},
-    S <: Union{_MOI.SecondOrderCone, _MOI.RotatedSecondOrderCone,
-        _MOI.ExponentialCone, _MOI.PowerCone},
-    R
+    S <: _ConicSets, R
 }
     M = method.value
     d = _conic_bigm_direction(con.set)
