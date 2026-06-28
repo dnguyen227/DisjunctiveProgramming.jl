@@ -797,7 +797,7 @@ function test_loa_infinite_nonlinear_global()
     # Disjunct Y[2] permits x up to 8 but the global x^2 <= 25 caps
     # x at 5. The per-support global transcribes to an `AbstractArray`
     # of scalar constraints, so this exercises the array branch of
-    # `_add_global_oa_cuts_infinite`. Without the global cut the
+    # `_add_global_oa_cuts`. Without the global cut the
     # master would allow x = 8 and report 8.0; the binding optimum
     # is ∫5 dt = 5.
     ipopt = optimizer_with_attributes(Ipopt.Optimizer,
@@ -954,7 +954,7 @@ function test_loa_infinite_aggregate_global()
     #   (y >= 1) ∨ (y >= 3), 0 <= x, y <= 10 over t ∈ [0, 1].
     # The aggregate global transcribes to a single scalar (the
     # measure is flattened), exercising the non-array branch of
-    # `_add_global_oa_cuts_infinite`. Y[1] (y >= 1) is the cheaper
+    # `_add_global_oa_cuts`. Y[1] (y >= 1) is the cheaper
     # disjunct: x = 1 satisfies x >= y and ∫x^2 = 1 <= 4, giving
     # objective ∫1 dt = 1.
     ipopt = optimizer_with_attributes(Ipopt.Optimizer,
@@ -1008,6 +1008,105 @@ function test_loa_infinite_iteration_loop()
     @test termination_status(model) in
         (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
     @test objective_value(model) ≈ -10.0 atol = 1e-3
+end
+
+function test_loa_infinite_hull_linear()
+    # InfiniteOpt LOA with inner_method = Hull. Linear disjuncts enter
+    # the master as exact per-support Hull perspectives over
+    # disaggregated infinite variables. max ∫x dt, Y1: x <= 3,
+    # Y2: x <= 8. Optimum: x = 8 across t → ∫8 dt = 8.
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 8, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, ∫(x, t))
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer;
+        inner_method = Hull()))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 8.0 atol = 1e-2
+end
+
+function test_loa_infinite_hull_nonlinear_disjunct()
+    # The infinite Hull case big-M differs from: a NONLINEAR constraint
+    # on an infinite variable inside a disjunct, under a plain infinite
+    # indicator. The convex-hull OA cut is built per support over the
+    # disaggregated infinite variable (point-evaluated). max ∫x dt,
+    # Y1: x <= 3, Y2: x^2 <= 64. Optimum: x = 8 via Y2.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = InfiniteGDPModel(juniper)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x^2 <= 64, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, ∫(x, t))
+    optimize!(model, gdp_method = LOA(juniper;
+        mip_optimizer = HiGHS.Optimizer, inner_method = Hull()))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 8.0 atol = 1e-2
+end
+
+function test_loa_infinite_hull_complement_nonlinear()
+    # Hull with a complement indicator Y2 ≡ ¬Y1 gating a nonlinear
+    # constraint on an infinite variable. The per-support disaggregator
+    # is keyed by the point-evaluated complement binary `1 - y1(t_k)`
+    # (an AffExpr). max ∫x dt, Y1: x <= 3, Y2: x^2 <= 64. Optimum 8.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = InfiniteGDPModel(juniper)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y1, Logical)
+    @variable(model, Y2, Logical, logical_complement = Y1)
+    @constraint(model, x <= 3, Disjunct(Y1))
+    @constraint(model, x^2 <= 64, Disjunct(Y2))
+    @disjunction(model, [Y1, Y2])
+    @objective(model, Max, ∫(x, t))
+    optimize!(model, gdp_method = LOA(juniper;
+        mip_optimizer = HiGHS.Optimizer, inner_method = Hull()))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 8.0 atol = 1e-2
+end
+
+function test_loa_infinite_hull_finite_var()
+    # A FINITE variable disaggregated inside a nonlinear disjunct
+    # constraint gated by an INFINITE indicator. The fan-out slices the
+    # binary per support, so the disaggregator must key the finite
+    # variable's copy by the per-support binary `y(t_k)` (driven off the
+    # binary, not the variable). max ∫x dt + w over t ∈ [0,1]:
+    #   Y1: x^2 + w^2 <= 25      Y2: x <= 0
+    # Y1 is active; x(t) = w = sqrt(12.5), so the optimum is
+    # ∫sqrt(12.5) dt + sqrt(12.5) = 2 sqrt(12.5) ≈ 7.0711.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = InfiniteGDPModel(juniper)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 4)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, 0 <= w <= 10)
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x^2 + w^2 <= 25, Disjunct(Y[1]))
+    @constraint(model, x <= 0, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, ∫(x, t) + w)
+    optimize!(model, gdp_method = LOA(juniper;
+        mip_optimizer = HiGHS.Optimizer, inner_method = Hull()))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 7.0711 atol = 1e-2
 end
 
 @testset "InfiniteDisjunctiveProgramming" begin
@@ -1088,6 +1187,10 @@ end
             test_loa_infinite_multidim_parameter()
             test_loa_infinite_nlpf_infeasible_disjunct()
             test_loa_infinite_iteration_loop()
+            test_loa_infinite_hull_linear()
+            test_loa_infinite_hull_nonlinear_disjunct()
+            test_loa_infinite_hull_complement_nonlinear()
+            test_loa_infinite_hull_finite_var()
         else
             @info "Skipping InfiniteOpt LOA tests: " *
                 "JuMP.copy_model(::InfiniteModel) unavailable " *

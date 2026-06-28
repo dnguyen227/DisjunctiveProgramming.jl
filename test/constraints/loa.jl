@@ -389,8 +389,8 @@ function test_loa_time_limits()
     @test objective_value(model) ≈ 7.0 atol = 1e-4
 
     model = build_model()
-    optimize!(model,
-        gdp_method = LOA(HiGHS.Optimizer; iteration_time_limit = 60.0))
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer;
+        iteration_time_limit = 60.0, time_limit = Inf))
     @test termination_status(model) == MOI.OPTIMAL
     @test objective_value(model) ≈ 7.0 atol = 1e-4
 end
@@ -419,6 +419,116 @@ function test_loa_no_feasible_incumbent()
     @test DP._ready_to_optimize(model)
 end
 
+function test_loa_hull_linear()
+    # Same GDP as test_loa_solve_simple, but inner_method = Hull so the
+    # NLP and master carry disaggregated variables and the disjunct
+    # cuts are convex-hull cuts rather than big-M. Optimum unchanged:
+    # x = 7 via the second disjunct.
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer;
+        inner_method = Hull()))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 7.0 atol = 1e-4
+end
+
+function test_loa_hull_two_disjunctions()
+    # Two independent disjunctions under Hull; optimum x = 7, z = 5.
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, 0 <= z <= 10)
+    @variable(model, Y[1:2], Logical)
+    @variable(model, W[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @constraint(model, z <= 2, Disjunct(W[1]))
+    @constraint(model, z <= 5, Disjunct(W[2]))
+    @disjunction(model, W)
+    @objective(model, Max, x + z)
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer;
+        inner_method = Hull()))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 12.0 atol = 1e-4
+end
+
+function test_loa_hull_nonlinear_global()
+    # max x s.t. x^2 <= 25 (global), (x <= 3) ∨ (x <= 8) under Hull.
+    # Linear disjuncts enter the master as exact Hull perspectives; the
+    # global nonlinear enters via global OA cuts. Optimum: x = 5.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = GDPModel(juniper)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @constraint(model, x^2 <= 25)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 8, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    optimize!(model, gdp_method = LOA(juniper;
+        mip_optimizer = HiGHS.Optimizer, inner_method = Hull()))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 5.0 atol = 1e-3
+end
+
+function test_loa_hull_nonlinear_disjunct()
+    # Nonlinear disjunct constraint under Hull: this is the case big-M
+    # and Hull genuinely differ on. 0 <= x <= 10, Y1: x <= 3,
+    # Y2: x^2 <= 64. The convex-hull OA cut disaggregates the
+    # linearization of x^2. Optimum: x = 8 via Y2.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = GDPModel(juniper)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x^2 <= 64, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    optimize!(model, gdp_method = LOA(juniper;
+        mip_optimizer = HiGHS.Optimizer, inner_method = Hull()))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 8.0 atol = 1e-3
+end
+
+function test_loa_hull_complement_nonlinear()
+    # Hull with a complement indicator Y2 ≡ ¬Y1 and a nonlinear
+    # disjunct under Y2. The disaggregator is keyed by the complement
+    # binary `1 - y1` (an AffExpr); the cut must disaggregate against
+    # it. Optimum: x = 8 via Y2.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = GDPModel(juniper)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y1, Logical)
+    @variable(model, Y2, Logical, logical_complement = Y1)
+    @constraint(model, x <= 3, Disjunct(Y1))
+    @constraint(model, x^2 <= 64, Disjunct(Y2))
+    @disjunction(model, [Y1, Y2])
+    @objective(model, Max, x)
+    optimize!(model, gdp_method = LOA(juniper;
+        mip_optimizer = HiGHS.Optimizer, inner_method = Hull()))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 8.0 atol = 1e-3
+end
+
 @testset "LOA" begin
     test_loa_datatype()
     test_set_covering_combos()
@@ -439,4 +549,9 @@ end
     test_loa_iteration_loop()
     test_loa_time_limits()
     test_loa_no_feasible_incumbent()
+    test_loa_hull_linear()
+    test_loa_hull_two_disjunctions()
+    test_loa_hull_nonlinear_global()
+    test_loa_hull_nonlinear_disjunct()
+    test_loa_hull_complement_nonlinear()
 end

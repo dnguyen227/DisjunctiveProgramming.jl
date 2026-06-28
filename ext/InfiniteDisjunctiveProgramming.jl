@@ -341,9 +341,9 @@ _per_support_values(variable::InfiniteOpt.GeneralVariableRef) =
 
 # Read per-support values from the transformation backend, keyed by
 # InfiniteOpt vars. Skips fixed vars. The objective-side translation
-# (transcribe-then-AD when the objective has aggregate refs) lives
-# in the `add_oa_cuts(::InfiniteModel, ...)` override below — base
-# `extract_solution` doesn't need to anticipate it.
+# (transcribe-then-AD when the objective has aggregate refs) lives in
+# the `_objective_linearization_point(::InfiniteModel, ...)` override
+# below — base `extract_solution` doesn't need to anticipate it.
 function DP.extract_solution(model::InfiniteOpt.InfiniteModel)
     return Dict(var => _per_support_values(var)
         for var in DP.collect_all_vars(model)
@@ -603,34 +603,19 @@ function _at_support(
     return result
 end
 
-# Build map: transcribed input JuMP var → master point variable.
-# For an infinite input var v, every transcribed support `v_k`
-# maps to `ref_map[v](d_k)` (master point variable). Used as
-# `objective_ref_map` so the objective OA cut can linearize the
-# (already flat) transcribed objective and land in master point
-# variables.
-#
-# Why the transcribe-then-AD detour exists: MOI Nonlinear AD has
-# no walker for `InfiniteOpt.MeasureRef`, so an objective like
-# `∫(f(z, t), t)` cannot be differentiated directly. The objective
-# OA cut therefore transcribes the input model once, ADs the
-# resulting flat scalar objective, and uses this map to translate
-# the gradient back into master point variables. Per-support
-# DISJUNCT cuts do NOT need this — they linearize natively in
-# InfiniteModel space via `_infinite_cut_info`. If the objective has no
-# measures, this whole layer is dead weight; killing it would
-# require either banning measure objectives or hand-writing a
-# `_linearize_at` that walks `MeasureRef` symbolically.
+# Map transcribed input JuMP var → master point variable, used as
+# `objective_ref_map`. Needed because MOI AD can't walk a `MeasureRef`,
+# so a measure objective is transcribed, AD'd flat, and the gradient
+# mapped back to master point vars. Per-support disjunct cuts skip this
+# (they linearize natively via `_infinite_cut_info`).
 function _transcribed_to_master_point(
     model::InfiniteOpt.InfiniteModel,
     ref_map::AbstractDict
     )
     result = Dict{JuMP.VariableRef, InfiniteOpt.GeneralVariableRef}()
     for v in DP.collect_all_vars(model)
-        # Point vars share their transcribed instance with the
-        # underlying infinite var's per-support transcription, so
-        # skipping them here doesn't lose any transcribed→master
-        # mappings.
+        # Point vars share the infinite var's transcription, so skipping
+        # them loses no mappings.
         _is_point_var(v) && continue
         master_var = ref_map[v]
         transcribed = InfiniteOpt.transformation_variable(v)
@@ -638,12 +623,9 @@ function _transcribed_to_master_point(
         if isempty(prefs)
             result[transcribed] = master_var
         else
-            # `_supports_of` returns scalars for 1-D parameters and
-            # vectors for multi-D dependent groups; `_at_support`
-            # routes both shapes through `v(support)`. Using
-            # `vec(InfiniteOpt.supports(...))` here would silently
-            # flatten a multi-D matrix into scalars and break point
-            # evaluation on dependent parameter groups.
+            # `_supports_of`/`_at_support` handle 1-D (scalar) and
+            # multi-D (vector) supports; `vec(supports(...))` would
+            # flatten multi-D and break point evaluation.
             for (k, support) in enumerate(_supports_of(v))
                 result[vec(transcribed)[k]] =
                     _at_support(master_var, support)
@@ -653,33 +635,19 @@ function _transcribed_to_master_point(
     return result
 end
 
-# Build the LOA master from `JuMP.copy_model(model)` and strip the
-# nonlinear constraints (they re-enter via OA cuts). `binary_map[
-# indicator]` and `variable_map[v]` hold single InfiniteOpt vars on
-# the master; per-support handling happens downstream via point
-# evaluation on those refs. OA cuts added in the LOA loop are
-# point-evaluated scalar constraints on the master InfiniteModel;
-# transcription is rebuilt before each master solve.
-#
-# Objective handling branches on `_has_aggregate_ref`. When the
-# objective is aggregate-free (no MeasureRef / ParameterFunctionRef),
-# `original_objective` is the InfiniteOpt objective itself and
-# `objective_ref_map = ref_map`, so AD walks the InfiniteOpt
-# expression directly. When it contains an aggregate, AD cannot see
-# inside it; we fall back to transcribing the input model and using
-# the flat scalar objective with a transcribed-to-master point map.
+# Build the master from `JuMP.copy_model(model)`, keeping linear
+# constraints and the InfiniteOpt vars (per-support handling is done
+# downstream by point evaluation). The objective branches on
+# `_has_aggregate_ref`: aggregate-free objectives AD the InfiniteOpt
+# expression directly; aggregate ones are transcribed flat and mapped
+# back via `_transcribed_to_master_point`.
 function DP.build_loa_master(
     model::InfiniteOpt.InfiniteModel, method::DP.LOA
     )::DP._LOAMaster
-    # Linear, non-aggregate constraints stay on the master. Nonlinear
-    # constraints — and aggregate-wrapped affine ones like
-    # `∫(x^2,t) ≤ c`, which read linear via `_is_linear_F` over a
-    # `MeasureRef` but expand to a nonlinear form on transcription —
-    # re-enter as OA cuts after each NLP solve, so they are dropped
-    # at copy time instead of copied then deleted. Variable bounds
-    # proper live on VariableInfo and survive `copy_model` regardless;
-    # the `F === GeneralVariableRef` early-return covers
-    # variable-ref-as-constraint registrations.
+    # Keep only linear, non-aggregate constraints. Nonlinear and
+    # aggregate-wrapped ones (e.g. `∫(x^2,t) ≤ c`) re-enter as OA cuts,
+    # so they are dropped at copy time. Variable bounds survive on
+    # VariableInfo regardless.
     variable_type = InfiniteOpt.GeneralVariableRef
     master, copy_ref_map = JuMP.copy_model(
         model;
@@ -742,32 +710,60 @@ function DP.build_loa_master(
         variable_map[v] = ref_map[v]
     end
 
-    # Aggregate-wrapped LINEAR constraints (e.g. `𝔼(W, ξ) ≥ α`)
-    # were filtered out at `copy_model` time because `copy_model`
-    # cannot transfer MeasureRefs across InfiniteModels. The
-    # nonlinear-aggregate path re-adds them as OA cuts after each
-    # NLP solve, but `_add_global_oa_cuts_infinite` short-circuits
-    # on linear `F` — so without this step a linear chance
-    # constraint is missing from the master entirely, and the
-    # master will pick combinations that violate it. Transcribe
-    # each such constraint once and add the flat scalar form to
-    # the master directly.
+    # Aggregate-wrapped LINEAR constraints (e.g. `𝔼(W, ξ) ≥ α`) were
+    # dropped at copy time and the OA-cut path skips linear `F`, so add
+    # each one to the master directly as a transcribed flat scalar.
     _add_aggregate_linear_constraints(
         master, model, ref_map, variable_type)
 
     return DP._LOAMaster(master, binary_map, variable_map,
         objective_sense, original_objective, alpha_oa,
-        objective_ref_map)
+        objective_ref_map, DP._build_disaggregator(
+            model, method.inner_method, variable_map, binary_map))
 end
 
-# Walk the original model's linear-`F` constraints, transcribe those
-# containing a `MeasureRef` / `ParameterFunctionRef`, and append the
-# resulting flat scalar constraint to the master. No linearization
-# needed (the constraint is already affine post-transcription) —
-# `_linearize_at` on an `AffExpr` just substitutes variables via
-# `transcribed_to_master`. Reuses the transformation backend that
-# `_add_global_oa_cuts_infinite` will rebuild later; building it
-# now is cheap and idempotent.
+# Record one master-space disaggregation for `InfiniteModel`. The Hull
+# cut emitter runs through the per-support fan-out over point-evaluated
+# variables, so key the map by `(point variable, point binary)` at each
+# support — `disaggregate_expression` then substitutes the point
+# disaggregated variable per support. Finite (parameter-free) entries
+# key once, unsliced.
+function DP._record_disaggregation(
+    hull::DP._Hull,
+    ::InfiniteOpt.InfiniteModel,
+    variable,
+    binary,
+    disaggregated
+    )
+    supports = _disaggregator_supports(variable, binary)
+    if supports === nothing
+        hull.disjunct_variables[(variable, binary)] = disaggregated
+    else
+        for support in supports
+            hull.disjunct_variables[(_at_support(variable, support),
+                _at_support(binary, support))] =
+                    _at_support(disaggregated, support)
+        end
+    end
+    return
+end
+
+# Supports the per-support fan-out gates this disjunct on (mirrors
+# `_relevant_supports`): the binary's if the indicator is infinite, else
+# the variable's if it is infinite, else `nothing` (both finite, one
+# unsliced key). Keying off the binary lets a finite variable under an
+# infinite indicator match the sliced binary the emitter looks up.
+function _disaggregator_supports(master_var, master_bin)
+    binary_var = _find_infinite_var(master_bin)
+    binary_var === nothing || return _supports_of(binary_var)
+    isempty(InfiniteOpt.parameter_refs(master_var)) && return nothing
+    return _supports_of(master_var)
+end
+
+# Transcribe each linear constraint containing a `MeasureRef` /
+# `ParameterFunctionRef` and append the flat scalar form to the master.
+# Already affine post-transcription, so `_linearize_at` just substitutes
+# variables via `transcribed_to_master`.
 function _add_aggregate_linear_constraints(
     master::InfiniteOpt.InfiniteModel,
     model::InfiniteOpt.InfiniteModel,
@@ -790,14 +786,11 @@ function _add_aggregate_linear_constraints(
 
     InfiniteOpt.build_transformation_backend!(model)
     transcribed_to_master = _transcribed_to_master_point(model, ref_map)
-    # `_transcribed_to_master_point` only walks decision vars. Finite
-    # parameters (`@finite_parameter`) survive transcription as
-    # scalar JuMP variables and can appear in transcribed
-    # constraints (e.g. the `α` on the RHS of an event constraint).
-    # Map each transcribed-parameter JuMP var to the master's
-    # corresponding parameter so the constraint stays
-    # parameter-relative (the master then honors `set_value(α, ...)`
-    # without rebuild).
+    # Finite parameters survive transcription as scalar JuMP vars and can
+    # appear in transcribed constraints, but `_transcribed_to_master_point`
+    # only walks decision vars. Map them to the master's parameters so the
+    # constraint stays parameter-relative (honors `set_value` without
+    # rebuild).
     for p in InfiniteOpt.all_parameters(model)
         InfiniteOpt.dispatch_variable_ref(p) isa
             InfiniteOpt.FiniteParameterRef || continue
@@ -834,50 +827,34 @@ function _add_aggregate_linear_constraints(
     return
 end
 
-# Override `add_oa_cuts` for `InfiniteModel`: translate the
-# linearization point into the form the master's `original_objective`
-# expects, and route global OA cuts through transcription so they
-# work over infinite vars and aggregate refs. The base
-# `result.linearization_point` has per-support `Vector` values keyed
-# on InfiniteOpt vars; the master's objective is either the raw
-# InfiniteOpt expression (non-aggregate, expects scalar `xk[v]`) or
-# the transcribed flat scalar expression (aggregate, expects
-# transcribed-`JuMP.VariableRef`-keyed scalar dict). The translation
-# produces whichever shape `_linearize_at` needs.
-function DP.add_oa_cuts(
+# Objective linearization point for `InfiniteModel` (the seam the shared
+# base `add_oa_cuts` calls). The master objective is either the raw
+# InfiniteOpt expression (non-aggregate, expects a scalar `xk[v]` keyed
+# on InfiniteOpt vars) or the transcribed flat scalar expression
+# (aggregate, expects a transcribed-`JuMP.VariableRef`-keyed scalar
+# dict). Translate the base per-support `Vector`-valued point into
+# whichever shape `original_objective` needs.
+function DP._objective_linearization_point(
     model::InfiniteOpt.InfiniteModel,
-    master::DP._LOAMaster,
-    result::NamedTuple,
-    method::DP.LOA
+    linearization_point::AbstractDict
     )
-    isempty(result.linearization_point) && return
-    obj_point = if _has_aggregate_ref(JuMP.objective_function(model))
-        _transcribe_linearization_point(
-            model, result.linearization_point)
-    else
-        T = eltype(valtype(result.linearization_point))
-        Dict{InfiniteOpt.GeneralVariableRef, T}(
-            var => values[1]
-            for (var, values) in result.linearization_point
-            if isempty(InfiniteOpt.parameter_refs(var)))
-    end
-    linearization = DP._linearize_at(master.original_objective,
-        obj_point, master.objective_ref_map)
-    DP._add_objective_cut(
-        Val(master.objective_sense), master, linearization, method)
-    _add_global_oa_cuts_infinite(model, master, result, method)
-    DP.add_disjunct_oa_cuts(model, master, result, method)
-    return
+    _has_aggregate_ref(JuMP.objective_function(model)) &&
+        return _transcribe_linearization_point(model, linearization_point)
+    T = eltype(valtype(linearization_point))
+    return Dict{InfiniteOpt.GeneralVariableRef, T}(
+        var => values[1]
+        for (var, values) in linearization_point
+        if isempty(InfiniteOpt.parameter_refs(var)))
 end
 
-# Global OA cuts for `InfiniteModel`. Mirrors base `_add_global_oa_cuts`
-# but routes through transcription so per-support / aggregate-ref
-# expressions reach `_linearize_at` as flat scalars over `JuMP.VariableRef`s.
-# Aggregate-containing constraints (e.g. `∫f(x,t)dt ≤ 0`) transcribe
-# to a single scalar expression. Constraints with infinite-parameter
-# dependence (e.g. `x(t) ≥ 0`) transcribe to a per-support `AbstractArray`
-# of scalar expressions — one OA cut is emitted per support.
-function _add_global_oa_cuts_infinite(
+# Global OA cuts for `InfiniteModel`: route through transcription so
+# per-support / aggregate-ref expressions reach `_linearize_at` as flat
+# scalars over `JuMP.VariableRef`s. Aggregate-containing constraints
+# (e.g. `∫f(x,t)dt ≤ 0`) transcribe to a single scalar expression.
+# Constraints with infinite-parameter dependence (e.g. `x(t) ≥ 0`)
+# transcribe to a per-support `AbstractArray` of scalar expressions —
+# one OA cut is emitted per support.
+function DP._add_global_oa_cuts(
     model::InfiniteOpt.InfiniteModel,
     master::DP._LOAMaster,
     result::NamedTuple,
@@ -926,86 +903,56 @@ function _add_global_oa_cuts_infinite(
     return
 end
 
-# Override `add_disjunct_oa_cuts` for `InfiniteModel`. Same shape as
-# the base loop, but each constraint is checked for aggregate refs.
-# Aggregate constraints (e.g. those containing a `MeasureRef`) are
-# transcribed via `InfiniteOpt.transformation_expression`, then
-# handed back to the base `_add_oa_cut_for_constraint` as a regular
-# `JuMP.ScalarConstraint` over flat `JuMP.VariableRef`s — which the
-# base AD pipeline can linearize correctly.
-#
-# `transcribed_to_master` and `transcribed_xk` are built lazily once
-# per `add_disjunct_oa_cuts` call and shared across all aggregate
-# constraints in the iteration.
-function DP.add_disjunct_oa_cuts(
+# Per-constraint OA cut emission for `InfiniteModel` (the seam the base
+# `add_disjunct_oa_cuts` driver calls). Non-aggregate constraints fan out
+# per support via `_infinite_cut_info`; aggregate ones (`MeasureRef`) are
+# transcribed flat and handed to the base `_add_oa_cut_for_constraint`.
+# Transcription is rebuilt per aggregate constraint, not cached — a rare
+# path (Hull errors on it), so the redundancy is a non-issue.
+function DP._add_disjunct_constraint_oa_cuts(
     model::InfiniteOpt.InfiniteModel,
+    constraint::JuMP.AbstractConstraint,
     master::DP._LOAMaster,
+    binary_ref,
+    active,
     result::NamedTuple,
-    method::DP.LOA
+    method::DP.LOA,
+    penalty_sign::Int
     )
-    penalty_sign = DP._penalty_sign(Val(master.objective_sense))
-    transcribed_to_master = Ref{Any}(nothing)
-    transcribed_xk = Ref{Any}(nothing)
-    ensure_transcribed = function ()
-        transcribed_to_master[] === nothing || return
+    if _has_aggregate_ref(constraint.func)
         InfiniteOpt.build_transformation_backend!(model)
-        transcribed_to_master[] = _transcribed_to_master_point(
-            model, master.variable_map)
-        transcribed_xk[] = _transcribe_linearization_point(
+        transcribed_func = InfiniteOpt.transformation_expression(
+            constraint.func)
+        transcribed_constraint = JuMP.ScalarConstraint(
+            transcribed_func, constraint.set)
+        transcribed_xk = _transcribe_linearization_point(
             model, result.linearization_point)
+        transcribed_to_master = _transcribed_to_master_point(
+            model, master.variable_map)
+        for (point_binary, _, _) in _infinite_cut_info(binary_ref,
+            active, transcribed_func, result.linearization_point,
+            master.variable_map)
+            DP._add_oa_cut_for_constraint(transcribed_constraint, master,
+                point_binary, transcribed_xk, transcribed_to_master,
+                method, penalty_sign)
+        end
         return
     end
-    for (indicator, active) in result.combination
-        DP.is_active(active) || continue
-        haskey(DP._indicator_to_constraints(model), indicator) ||
-            continue
-        for orig_constraint_ref in
-                DP._indicator_to_constraints(model)[indicator]
-            orig_constraint_ref isa DP.DisjunctConstraintRef ||
-                continue
-            constraint = DP._disjunct_constraints(model)[
-                JuMP.index(orig_constraint_ref)].constraint
-            if _has_aggregate_ref(constraint.func)
-                ensure_transcribed()
-                transcribed_func =
-                    InfiniteOpt.transformation_expression(
-                        constraint.func)
-                transcribed_constraint = JuMP.ScalarConstraint(
-                    transcribed_func, constraint.set)
-                for (binary_ref, _, _) in _infinite_cut_info(
-                    master.binary_map[indicator], active,
-                    transcribed_func, result.linearization_point,
-                    master.variable_map)
-                    DP._add_oa_cut_for_constraint(
-                        transcribed_constraint, master, binary_ref,
-                        transcribed_xk[], transcribed_to_master[],
-                        method, penalty_sign)
-                end
-                continue
-            end
-            for (binary_ref, linearization_point, var_map) in
-                    _infinite_cut_info(
-                    master.binary_map[indicator], active,
-                    constraint.func, result.linearization_point,
-                    master.variable_map)
-                DP._add_oa_cut_for_constraint(
-                    constraint, master, binary_ref,
-                    linearization_point, var_map, method, penalty_sign)
-            end
-        end
+    for (point_binary, point, var_map) in _infinite_cut_info(binary_ref,
+        active, constraint.func, result.linearization_point,
+        master.variable_map)
+        DP._add_oa_cut_for_constraint(constraint, master, point_binary,
+            point, var_map, method, penalty_sign)
     end
+    return
 end
 
-# Apply per-indicator fixes for `combination` and return a closure that
-# reverses them. A scalar (`Bool`) value delegates to base
-# `fix_indicator` (force-fix, which unwraps complement-form `1 - y`
-# AffExprs). A per-support `AbstractVector{Bool}` value pins each support
-# of the underlying infinite binary with a point-equality constraint.
-# The returned closure deletes those constraints and unfixes, so the
-# extension's `with_fixed_combination` can tear the fix down each
-# iteration — a stale per-support pin would clash with the next
-# combination. `commit_combination` ignores the closure, persisting the
-# committed fix.
+# Apply the combination's fixes and return a closure that reverses them.
+# A `Bool` delegates to base `fix_indicator`; a per-support `Vector{Bool}`
+# pins each support of the infinite binary with a point-equality
+# constraint. The closure (used by `with_fixed_combination` to tear down
+# each iteration) deletes those pins and unfixes; `commit_combination`
+# ignores it to persist the committed fix.
 function DP.fix_combination(
     model::InfiniteOpt.InfiniteModel, combination::AbstractDict
     )
@@ -1039,14 +986,9 @@ function DP.fix_combination(
     end
 end
 
-# OVERRIDE for InfiniteModel: fix the combination, run `f()`, then
-# always undo. The finite base fixes in place and needs no teardown, but
-# the infinite path pins per-support combinations with point-equality
-# constraints (and scalar seeds with `JuMP.fix`) that must be cleared
-# between iterations — a stale per-support pin would clash with the next
-# combination — so this lifecycle needs the `try/finally` the base
-# omits. The model is relaxed once in `reformulate_model`, so there is
-# no relax/unrelax here.
+# Fix the combination, run `f()`, then always undo. The infinite path's
+# per-support point-equality pins must be cleared between iterations, so
+# this needs the `try/finally` the finite base omits.
 function DP.with_fixed_combination(
     f, model::InfiniteOpt.InfiniteModel, combination::AbstractDict
     )

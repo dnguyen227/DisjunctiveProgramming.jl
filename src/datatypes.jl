@@ -596,6 +596,11 @@ mutable struct GDPData{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, C
     reformulation_variables::Vector{V}
     reformulation_constraints::Vector{C}
 
+    # Hull disaggregated variable for each (original variable, indicator).
+    # Recorded so logic-based OA can rebuild convex-hull cuts after the
+    # reformulation's temporary `_Hull` disaggregation state is discarded.
+    disaggregations::Dict{Tuple{V, LogicalVariableRef{M}}, V}
+
     # Solution data
     solution_method::Union{Nothing, AbstractSolutionMethod}
     ready_to_optimize::Bool
@@ -614,6 +619,7 @@ mutable struct GDPData{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, C
             Dict{V, Tuple{T, T}}(),
             Vector{V}(),
             Vector{C}(),
+            Dict{Tuple{V, LogicalVariableRef{M}}, V}(),
             nothing,
             false,
         )

@@ -42,6 +42,8 @@ function _disaggregate_variable(
     #temp storage
     push!(method.disjunction_variables[vref], dvref)
     method.disjunct_variables[vref, bvref] = dvref
+    #persist for logic-based OA, which needs the map after reformulation
+    _disaggregations(model)[(vref, lvref)] = dvref
     #create bounding constraints
     dvname = JuMP.name(dvref)
     lbname = isempty(dvname) ? "" : "$(dvname)_lower_bound"
