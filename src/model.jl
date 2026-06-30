@@ -83,7 +83,6 @@ _indicator_to_constraints(model::JuMP.AbstractModel) = gdp_data(model).indicator
 _constraint_to_indicator(model::JuMP.AbstractModel) = gdp_data(model).constraint_to_indicator
 _reformulation_variables(model::JuMP.AbstractModel) = gdp_data(model).reformulation_variables
 _reformulation_constraints(model::JuMP.AbstractModel) = gdp_data(model).reformulation_constraints
-_disaggregations(model::JuMP.AbstractModel) = gdp_data(model).disaggregations
 _variable_bounds(model::JuMP.AbstractModel) = gdp_data(model).variable_bounds
 _solution_method(model::JuMP.AbstractModel) = gdp_data(model).solution_method # Get the current solution method
 _ready_to_optimize(model::JuMP.AbstractModel) = gdp_data(model).ready_to_optimize # Determine if the model is ready to call `optimize!` without a optimize hook

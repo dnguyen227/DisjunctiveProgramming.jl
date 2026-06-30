@@ -42,8 +42,8 @@ function _disaggregate_variable(
     #temp storage
     push!(method.disjunction_variables[vref], dvref)
     method.disjunct_variables[vref, bvref] = dvref
-    #persist for logic-based OA, which needs the map after reformulation
-    _disaggregations(model)[(vref, lvref)] = dvref
+    #record into the LOA sink when one is installed (LOA-Hull only)
+    method.sink === nothing || (method.sink[(vref, lvref)] = dvref)
     #create bounding constraints
     dvname = JuMP.name(dvref)
     lbname = isempty(dvname) ? "" : "$(dvname)_lower_bound"
@@ -256,7 +256,8 @@ function reformulate_disjunction(model::JuMP.AbstractModel, disj::Disjunction, m
     return ref_cons
 end
 function reformulate_disjunction(model::JuMP.AbstractModel, disj::Disjunction, method::_Hull)
-    return reformulate_disjunction(model, disj, Hull(method.value))
+    return reformulate_disjunction(model, disj,
+        Hull(method.value; sink = method.sink))
 end
 
 function reformulate_disjunct_constraint(

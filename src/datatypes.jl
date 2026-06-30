@@ -417,8 +417,11 @@ constraints.
 """
 struct Hull{T} <: AbstractReformulationMethod
     value::T
-    function Hull(ϵ::T = 1e-6) where {T}
-        new{T}(ϵ)
+    # Internal: LOA installs a Dict here to collect the disaggregation
+    # map during reformulation; `nothing` for every other use.
+    sink::Any
+    function Hull(ϵ::T = 1e-6; sink = nothing) where {T}
+        new{T}(ϵ, sink)
     end
 end
 
@@ -427,11 +430,13 @@ mutable struct _Hull{V <: JuMP.AbstractVariableRef, T} <: AbstractReformulationM
     value::T
     disjunction_variables::Dict{V, Vector{V}}
     disjunct_variables::Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}
+    sink::Any
     function _Hull(method::Hull{T}, vrefs::Set{V}) where {T, V <: JuMP.AbstractVariableRef}
         new{V, T}(
             method.value,
-            Dict{V, Vector{V}}(vref => V[] for vref in vrefs), 
-            Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}()
+            Dict{V, Vector{V}}(vref => V[] for vref in vrefs),
+            Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}(),
+            method.sink
         )
     end
 end
@@ -596,11 +601,6 @@ mutable struct GDPData{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, C
     reformulation_variables::Vector{V}
     reformulation_constraints::Vector{C}
 
-    # Hull disaggregated variable for each (original variable, indicator).
-    # Recorded so logic-based OA can rebuild convex-hull cuts after the
-    # reformulation's temporary `_Hull` disaggregation state is discarded.
-    disaggregations::Dict{Tuple{V, LogicalVariableRef{M}}, V}
-
     # Solution data
     solution_method::Union{Nothing, AbstractSolutionMethod}
     ready_to_optimize::Bool
@@ -619,7 +619,6 @@ mutable struct GDPData{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, C
             Dict{V, Tuple{T, T}}(),
             Vector{V}(),
             Vector{C}(),
-            Dict{Tuple{V, LogicalVariableRef{M}}, V}(),
             nothing,
             false,
         )

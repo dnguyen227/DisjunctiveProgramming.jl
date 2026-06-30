@@ -797,7 +797,7 @@ function test_loa_infinite_nonlinear_global()
     # Disjunct Y[2] permits x up to 8 but the global x^2 <= 25 caps
     # x at 5. The per-support global transcribes to an `AbstractArray`
     # of scalar constraints, so this exercises the array branch of
-    # `_add_global_oa_cuts`. Without the global cut the
+    # `add_global_oa_cuts`. Without the global cut the
     # master would allow x = 8 and report 8.0; the binding optimum
     # is ∫5 dt = 5.
     ipopt = optimizer_with_attributes(Ipopt.Optimizer,
@@ -954,7 +954,7 @@ function test_loa_infinite_aggregate_global()
     #   (y >= 1) ∨ (y >= 3), 0 <= x, y <= 10 over t ∈ [0, 1].
     # The aggregate global transcribes to a single scalar (the
     # measure is flattened), exercising the non-array branch of
-    # `_add_global_oa_cuts`. Y[1] (y >= 1) is the cheaper
+    # `add_global_oa_cuts`. Y[1] (y >= 1) is the cheaper
     # disjunct: x = 1 satisfies x >= y and ∫x^2 = 1 <= 4, giving
     # objective ∫1 dt = 1.
     ipopt = optimizer_with_attributes(Ipopt.Optimizer,

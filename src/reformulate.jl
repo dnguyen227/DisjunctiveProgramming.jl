@@ -24,7 +24,6 @@ function _clear_reformulations(model::JuMP.AbstractModel)
     delete.(model, _reformulation_variables(model))
     empty!(gdp_data(model).reformulation_constraints)
     empty!(gdp_data(model).reformulation_variables)
-    empty!(gdp_data(model).disaggregations)
     empty!(gdp_data(model).variable_bounds)
     return
 end
