@@ -530,5 +530,106 @@ function _remap_constraint_to_indicator(
     ::Dict{DisjunctConstraintRef{M}, DisjunctConstraintRef{M}},
     disj_map::Dict{DisjunctionRef{M}, DisjunctionRef{M}}
 ) where {M <: JuMP.AbstractModel}
-    return disj_map[con_ref]   
+    return disj_map[con_ref]
 end
+
+################################################################################
+#                    LINEARIZATION & EXPRESSION CONVERSION
+################################################################################
+# First-order Taylor for a single var or affine expression mapped into
+# master space.
+function _linearize_at(
+    variable::JuMP.AbstractVariableRef,
+    ::AbstractDict,
+    ref_map::AbstractDict
+    )
+    target = ref_map[variable]
+    return JuMP.GenericAffExpr{Float64, typeof(target)}(0.0, target => 1.0)
+end
+function _linearize_at(
+    func::JuMP.GenericAffExpr,
+    ::AbstractDict,
+    ref_map::AbstractDict
+    )
+    V = valtype(ref_map)
+    T = JuMP.value_type(V) <: Number ? JuMP.value_type(V) : Float64
+    result = JuMP.GenericAffExpr{T, V}(T(func.constant))
+    for (variable, coefficient) in func.terms
+        JuMP.add_to_expression!(result, coefficient, ref_map[variable])
+    end
+    return result
+end
+
+# Convert JuMP expression trees to Julia Expr with
+# MOI.VariableIndex leaves for MOI.Nonlinear evaluation.
+function _to_nlp_expr(expr::JuMP.GenericNonlinearExpr, idx::Dict)
+    args = Any[_to_nlp_expr(a, idx) for a in expr.args]
+    return Expr(:call, expr.head, args...)
+end
+function _to_nlp_expr(expr::JuMP.GenericAffExpr, idx::Dict)
+    parts = Any[expr.constant]
+    for (var, coef) in expr.terms
+        push!(parts, Expr(:call, :*, coef, _MOI.VariableIndex(idx[var])))
+    end
+    length(parts) == 1 && return parts[1]
+    return Expr(:call, :+, parts...)
+end
+function _to_nlp_expr(expr::JuMP.GenericQuadExpr, idx::Dict)
+    parts = Any[_to_nlp_expr(expr.aff, idx)]
+    for (pair, coef) in expr.terms
+        push!(parts, Expr(:call, :*, coef,
+            _MOI.VariableIndex(idx[pair.a]),
+            _MOI.VariableIndex(idx[pair.b])))
+    end
+    length(parts) == 1 && return parts[1]
+    return Expr(:call, :+, parts...)
+end
+function _to_nlp_expr(var::JuMP.AbstractVariableRef, idx::Dict)
+    return _MOI.VariableIndex(idx[var])
+end
+_to_nlp_expr(x::Number, ::Dict) = x
+
+# First-order Taylor linearization of a quadratic or nonlinear
+# expression at point xk via MOI.Nonlinear reverse-mode AD.
+function _linearize_at(
+    func::Union{JuMP.GenericQuadExpr, JuMP.GenericNonlinearExpr},
+    xk::Dict,
+    ref_map
+    )
+    vars = JuMP.AbstractVariableRef[]
+    _interrogate_variables(v -> push!(vars, v), func)
+    unique!(vars)
+    isempty(vars) && return JuMP.AffExpr(JuMP.value(v -> 0.0, func))
+
+    n = length(vars)
+    T = JuMP.value_type(typeof(JuMP.owner_model(vars[1])))
+    idx = Dict(vars[i] => i for i in 1:n)
+    nlp = _MOI.Nonlinear.Model()
+    _MOI.Nonlinear.set_objective(nlp, _to_nlp_expr(func, idx))
+    ord = [_MOI.VariableIndex(i) for i in 1:n]
+    evaluator = _MOI.Nonlinear.Evaluator(
+        nlp, _MOI.Nonlinear.SparseReverseMode(), ord)
+    _MOI.initialize(evaluator, [:Grad])
+
+    xk_vec = [_unwrap_scalar(get(xk, v, zero(T))) for v in vars]
+    f_xk = _MOI.eval_objective(evaluator, xk_vec)
+    grad = zeros(T, n)
+    _MOI.eval_objective_gradient(evaluator, grad, xk_vec)
+
+    constant = T(f_xk)
+    for i in 1:n
+        constant -= grad[i] * xk_vec[i]
+    end
+    V = typeof(ref_map[vars[1]])
+    result = JuMP.GenericAffExpr{T, V}(constant)
+    for i in 1:n
+        iszero(grad[i]) && continue
+        JuMP.add_to_expression!(result, grad[i], ref_map[vars[i]])
+    end
+    return result
+end
+
+# Unwrap a 1-element `Vector` to its scalar; scalars pass through
+# (`extract_solution` returns length-1 vectors for scalar variables).
+_unwrap_scalar(v::Real) = v
+_unwrap_scalar(v::AbstractVector) = only(v)

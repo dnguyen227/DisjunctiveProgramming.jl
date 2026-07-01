@@ -572,6 +572,82 @@ A type for using indicator constraint approach for linear disjunctive constraint
 struct Indicator <: AbstractReformulationMethod end
 
 ################################################################################
+#                              LOA
+################################################################################
+"""
+    LOA{O, P, R, T} <: AbstractReformulationMethod
+
+Logic-based Outer Approximation solver for GDP models. Iterates a primary
+NLP (original model reformulated by `inner_method`, binaries fixed per
+iteration) and a master MILP accumulating OA and no-good cuts.
+`inner_method` is `BigM` (default), `MBM`, or `Hull`.
+
+## Fields
+- `nlp_optimizer::O`: solver for the primary NLP.
+- `mip_optimizer::P`: solver for the master MILP (default `nlp_optimizer`).
+- `inner_method::R`: NLP reformulation — `BigM`, `MBM`, or `Hull`.
+- `max_iter::Int`: max iterations after set-covering seeding.
+- `M_value::T`: big-M for the disjunct OA cut gating term.
+- `max_slack::T`: upper bound per slack variable.
+- `oa_penalty::T`: penalty on slacks in the master objective.
+- `convergence_tol::Float64`: relative gap tolerance for the early stop.
+- `slack_tol::Float64`: max total slack for which the bound still counts
+  as converged (positive slack = nonconvex crossing, keep iterating).
+- `iteration_time_limit::Float64`: budget (s) for the iteration loop.
+- `time_limit::Float64`: overall budget (s) incl. the final solve
+  (default 3600; `Inf` disables).
+"""
+struct LOA{O, P, R, T} <: AbstractReformulationMethod
+    nlp_optimizer::O
+    mip_optimizer::P
+    inner_method::R
+    max_iter::Int
+    M_value::T
+    max_slack::T
+    oa_penalty::T
+    convergence_tol::Float64
+    slack_tol::Float64
+    iteration_time_limit::Float64
+    time_limit::Float64
+    function LOA(
+        nlp_optimizer::O;
+        mip_optimizer::P = nlp_optimizer,
+        max_iter::Int = 10,
+        M_value::T = 1e9,
+        max_slack::T = 1e3,
+        oa_penalty::T = 1e3,
+        inner_method::R = BigM(M_value),
+        convergence_tol::Float64 = 1e-6,
+        slack_tol::Float64 = 1e-4,
+        iteration_time_limit::Float64 = Inf,
+        time_limit::Float64 = 3600.0
+        ) where {O, P, R <: AbstractReformulationMethod, T}
+        R <: Union{BigM, MBM, Hull} || error(
+            "LOA inner_method must be BigM, MBM, or Hull (got $R). " *
+            "PSplit is not yet supported.")
+        new{O, P, R, T}(nlp_optimizer, mip_optimizer, inner_method,
+            max_iter, M_value, max_slack, oa_penalty,
+            convergence_tol, slack_tol,
+            iteration_time_limit, time_limit)
+    end
+end
+
+# The LOA master MILP plus maps from original- to master-model refs.
+# `objective_ref_map` splits from `variable_map` so an extension can map
+# objective vars separately (identical in base); `disaggregator` is the
+# master `_Hull` for Hull cuts, `nothing` for Big-M / MBM.
+mutable struct _LOAMaster{M <: JuMP.AbstractModel, OF, AO, BM, VM, RM, DG}
+    model::M
+    binary_map::BM
+    variable_map::VM
+    objective_sense::_MOI.OptimizationSense
+    original_objective::OF
+    alpha_oa::AO
+    objective_ref_map::RM
+    disaggregator::DG
+end
+
+################################################################################
 #                              GDP Data
 ################################################################################
 """

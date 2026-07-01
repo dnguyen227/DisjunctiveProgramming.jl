@@ -633,12 +633,10 @@ end
 # expression directly; aggregate ones are transcribed flat and mapped
 # back via `_transcribed_to_master_point`.
 function DP.build_loa_master(
-    model::InfiniteOpt.InfiniteModel, method::DP.LOA, sink = nothing
-    )::DP._LOAMaster
-    # Keep only linear, non-aggregate constraints. Nonlinear and
-    # aggregate-wrapped ones (e.g. `∫(x^2,t) ≤ c`) re-enter as OA cuts,
-    # so they are dropped at copy time. Variable bounds survive on
-    # VariableInfo regardless.
+    model::InfiniteOpt.InfiniteModel, 
+    method::DP.LOA, 
+    sink = nothing
+    )
     variable_type = InfiniteOpt.GeneralVariableRef
     master, copy_ref_map = JuMP.copy_model(
         model;
@@ -650,16 +648,10 @@ function DP.build_loa_master(
             return !_has_aggregate_ref(con.func)
         end
         )
-    # `copy_model` copies the GDP optimize-hook; clear it so
-    # `optimize!(master)` doesn't re-trigger reformulation on the
-    # (empty-GDP-data) master copy.
     JuMP.set_optimize_hook(master, nothing)
     JuMP.set_optimizer(master, method.mip_optimizer)
     JuMP.set_silent(master)
 
-    # InfiniteReferenceMap supports indexing but not iteration; build
-    # a Dict so downstream LOA code can `haskey` / iterate over the
-    # source-side refs LOA cares about.
     ref_map = Dict{InfiniteOpt.GeneralVariableRef,
         InfiniteOpt.GeneralVariableRef}()
     for v in DP.collect_all_vars(model)
@@ -701,7 +693,7 @@ function DP.build_loa_master(
         variable_map[v] = ref_map[v]
     end
 
-    # Aggregate-wrapped LINEAR constraints (e.g. `𝔼(W, ξ) ≥ α`) were
+    # Aggregate-wrapped LINEAR constraints (e.g. `E(W, e) ≥ alpha`) were
     # dropped at copy time and the OA-cut path skips linear `F`, so add
     # each one to the master directly as a transcribed flat scalar.
     _add_aggregate_linear_constraints(
@@ -713,12 +705,6 @@ function DP.build_loa_master(
             model, method.inner_method, variable_map, binary_map, sink))
 end
 
-# Record one master-space disaggregation for `InfiniteModel`. The Hull
-# cut emitter runs through the per-support fan-out over point-evaluated
-# variables, so key the map by `(point variable, point binary)` at each
-# support — `disaggregate_expression` then substitutes the point
-# disaggregated variable per support. Finite (parameter-free) entries
-# key once, unsliced.
 function DP.record_disaggregation(
     hull::DP._Hull,
     ::InfiniteOpt.InfiniteModel,
@@ -894,22 +880,36 @@ function DP.add_global_oa_cuts(
     return
 end
 
-# Per-constraint OA cut emission for `InfiniteModel` (the seam the base
-# `add_disjunct_oa_cuts` driver calls). Non-aggregate constraints fan out
-# per support via `_infinite_cut_info`; aggregate ones (`MeasureRef`) are
-# transcribed flat and handed to the base `_add_oa_cut_for_constraint`.
-# `cache` memoizes the transcription maps once per pass (lazily, on the
-# first aggregate constraint) so they are not rebuilt per constraint.
-function DP.add_disjunct_constraint_oa_cuts(
+# Override the disjunct-OA-cut pass for `InfiniteModel`: own the per-pass
+# transcription `cache` and delegate each active disjunct constraint to
+# the emitter below. Reuses the base active-disjunct walk so only the
+# per-constraint emission differs from base.
+function DP.add_disjunct_oa_cuts(
     model::InfiniteOpt.InfiniteModel,
-    constraint::JuMP.AbstractConstraint,
     master::DP._LOAMaster,
-    binary_ref,
-    active,
     result::NamedTuple,
-    method::DP.LOA,
-    penalty_sign::Int,
-    cache
+    method::DP.LOA
+    )
+    penalty_sign = DP._penalty_sign(Val(master.objective_sense))
+    cache = Ref{Any}(nothing)
+    DP._each_active_disjunct_constraint(model, master,
+        result) do binary_ref, active, constraint
+        _add_infinite_disjunct_constraint_oa_cuts(model, constraint,
+            master, binary_ref, active, result, method, penalty_sign,
+            cache)
+    end
+    return
+end
+
+# Emit the OA cut(s) for one active disjunct constraint on an
+# `InfiniteModel`. Non-aggregate constraints fan out per support via
+# `_infinite_cut_info`; aggregate ones (`MeasureRef`) are transcribed flat
+# and handed to `_add_oa_cut_for_constraint`. `cache` memoizes the
+# transcription maps once per pass (lazily, on the first aggregate
+# constraint).
+function _add_infinite_disjunct_constraint_oa_cuts(
+    model, constraint, master, binary_ref, active, result, method,
+    penalty_sign, cache
     )
     if _has_aggregate_ref(constraint.func)
         if cache[] === nothing

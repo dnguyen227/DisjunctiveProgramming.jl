@@ -61,7 +61,7 @@ A [`GDPModel`](@ref) is a `JuMP Model` with a [`GDPData`](@ref) field in the mod
 - `Logical Constraints`: Selector (cardinality) or proposition (Boolean) constraints describing the relationships between the logical variables.
 - `Disjunct Constraints`: Constraints associated with each disjunct in the model.
 - `Disjunctions`: Disjunction constraints.
-- `Solution Method`: The reformulation technique or solution method. Currently, supported methods include Big-M, Hull, and Indicator Constraints.
+- `Solution Method`: The reformulation technique or solution method. Currently, supported methods include Big-M, Multiple Big-M, Hull, P-Split, Indicator Constraints, and Logic-based Outer Approximation (LOA).
 - `Reformulation Variables`: List of JuMP variables created when reformulating a GDP model into a MIP model.
 - `Reformulation Constraints`: List of constraints created when reformulating a GDP model into a MIP model.
 - `Ready to Optimize`: Flag indicating if the model can be optimized.
@@ -163,9 +163,15 @@ The following reformulation methods are currently supported:
 
 1. [Big-M](https://optimization.cbe.cornell.edu/index.php?title=Disjunctive_inequalities#Big-M_Reformulation[1][2]): The [`BigM`](@ref) struct is used.
 
-2. [Hull](https://optimization.cbe.cornell.edu/index.php?title=Disjunctive_inequalities#Convex-Hull_Reformulation[1][2]): The [`Hull`](@ref) struct is used.
+2. Multiple Big-M: A tighter big-M reformulation that computes a separate big-M value for each disjunct constraint (rather than a single global value) by solving auxiliary mini-models. This is invoked with the [`MBM`](@ref) struct, which requires an optimizer.
 
-3. [Indicator](https://jump.dev/JuMP.jl/stable/manual/constraints/#Indicator-constraints): This method reformulates each disjunct constraint into an indicator constraint with the Boolean reformulation counterpart of the Logical variable used to define the disjunct constraint. This is invoked with [`Indicator`](@ref).
+3. [Hull](https://optimization.cbe.cornell.edu/index.php?title=Disjunctive_inequalities#Convex-Hull_Reformulation[1][2]): The [`Hull`](@ref) struct is used.
+
+4. P-Split: A partitioned reformulation that splits the variables into groups and applies a P-split formulation to each group, giving a relaxation between Big-M and Hull in tightness. This is invoked with the [`PSplit`](@ref) struct.
+
+5. [Indicator](https://jump.dev/JuMP.jl/stable/manual/constraints/#Indicator-constraints): This method reformulates each disjunct constraint into an indicator constraint with the Boolean reformulation counterpart of the Logical variable used to define the disjunct constraint. This is invoked with [`Indicator`](@ref).
+
+6. Logic-based Outer Approximation (LOA): An iterative solution method for nonlinear GDPs, rather than a single-shot reformulation. It alternates between a primal NLP (the model reformulated by an inner method — `BigM`, `MBM`, or `Hull` — with the disjunct binaries fixed at the current selection) and a master MILP that accumulates outer-approximation and no-good cuts until the bound meets the incumbent. This is invoked with the [`LOA`](@ref) struct, e.g. `optimize!(m, gdp_method = LOA(Ipopt.Optimizer))`.
 
 ## Release Notes
 
