@@ -516,6 +516,76 @@ end
 function test_mbm_infinite_simple()
     model = InfiniteGDPModel(HiGHS.Optimizer)
     set_silent(model)
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    K = 4
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = K)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    JuMP.fix(Y[2], true)  # force disj 2 active
+    @objective(model, Min, ∫(x, t))
+    DP.reformulate_model(model, BigM(10.0))
+    set_optimizer(model, HiGHS.Optimizer)
+    set_silent(model)
+    optimize!(model, ignore_optimize_hook = true)
+    sol = DP.extract_solution(model)
+    @test haskey(sol, x)
+    @test length(sol[x]) == K
+    @test all(v -> isapprox(v, 0.0; atol=1e-6), sol[x])
+end
+
+# add_cut adds one pointwise-sum cut to the transformation backend and
+# marks the backend ready so the next optimize! does NOT re-transcribe.
+function test_add_cut_infinite()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    K = 3
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = K)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    DP.reformulate_model(model, BigM(10.0))
+    InfiniteOpt.build_transformation_backend!(model)
+    transcribed = InfiniteOpt.transformation_model(model)
+    n_before = JuMP.num_constraints(transcribed;
+        count_variable_in_set_constraints = false)
+    rBM_sol = Dict(x => [1.0, 2.0, 3.0])
+    sep_sol = Dict(x => [0.5, 1.5, 2.5])
+    DP.add_cut(model, [x], rBM_sol, sep_sol)
+    n_after = JuMP.num_constraints(transcribed;
+        count_variable_in_set_constraints = false)
+    @test n_after == n_before + 1
+    # set_transformation_backend_ready(true) — next optimize! should
+    # reuse without re-transcribing (otherwise our cut would be lost)
+    @test InfiniteOpt.transformation_backend_ready(model)
+end
+
+# MBM with finite + integer variables in an InfiniteModel.
+function test_mbm_finite_and_integer_var()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 10)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, 0 <= w <= 5, Int)
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x + w >= 5, Disjunct(Y[1]))
+    @constraint(model, x + w <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, ∫(x, t) + w)
+    @test optimize!(model,
+        gdp_method = MBM(HiGHS.Optimizer)) isa Nothing
+    @test termination_status(model) in
+        [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
+end
+
+function test_mbm_infinite_simple()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
 
     @infinite_parameter(model, t ∈ [0, 1], num_supports = 10)
     @variable(model, 0 <= x <= 10, Infinite(t))

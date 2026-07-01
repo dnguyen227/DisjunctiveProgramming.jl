@@ -1056,4 +1056,83 @@ _add_to_transcribed_dict(
     ) =
     (d[ts] = values[1]; nothing)
 
+################################################################################
+
+# Build CP subproblem: reformulate the InfiniteModel in-place, transcribe,
+# copy, and wrap in GDPSubmodel with forward variable map.
+function DP.copy_and_reformulate(
+    model::InfiniteOpt.InfiniteModel,
+    decision_vars::Vector{InfiniteOpt.GeneralVariableRef},
+    reform_method::DP.AbstractReformulationMethod,
+    method::DP.CuttingPlanes
+    )
+    DP.reformulate_model(model, reform_method)
+    InfiniteOpt.build_transformation_backend!(model)
+    transcribed = InfiniteOpt.transformation_model(model)
+    transcription_fwd = Dict{InfiniteOpt.GeneralVariableRef,
+        Vector{JuMP.VariableRef}}()
+    for v in DP.collect_all_vars(model)
+        transcription_var = InfiniteOpt.transformation_variable(v)
+        var_prefs = InfiniteOpt.parameter_refs(v)
+        transcription_fwd[v] = isempty(var_prefs) ?
+            [transcription_var] : vec(transcription_var)
+    end
+    sub_copy, copy_map = JuMP.copy_model(transcribed)
+    fwd_map = Dict{InfiniteOpt.GeneralVariableRef, Vector{JuMP.VariableRef}}()
+    for v in decision_vars
+        haskey(transcription_fwd, v) || continue
+        fwd_map[v] = [copy_map[transcribed_var] for transcribed_var in transcription_fwd[v]]
+    end
+    sub = DP.GDPSubmodel(sub_copy, decision_vars, fwd_map)
+    JuMP.set_optimizer(sub.model, method.optimizer)
+    JuMP.set_silent(sub.model)
+    return sub
+end
+
+# Read per-support values from the transformation backend.
+function DP.extract_solution(model::InfiniteOpt.InfiniteModel)
+    dvars = DP.collect_cutting_planes_vars(model)
+    V = eltype(dvars)
+    T = JuMP.value_type(typeof(model))
+    sol = Dict{V, Vector{T}}()
+    for v in dvars
+        transcription_var = InfiniteOpt.transformation_variable(v)
+        var_prefs = InfiniteOpt.parameter_refs(v)
+        sol[v] = isempty(var_prefs) ? [JuMP.value(transcription_var)] :
+            JuMP.value.(vec(transcription_var))
+    end
+    return sol
+end
+
+# Add a pointwise-sum cut directly to the transformation backend and mark
+# it ready so the next optimize! doesn't re-transcribe and wipe the cut.
+function DP.add_cut(
+    model::InfiniteOpt.InfiniteModel,
+    decision_vars::Vector{InfiniteOpt.GeneralVariableRef},
+    rBM_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}},
+    sep_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}}
+    )
+    transcribed = InfiniteOpt.transformation_model(model)
+    cut_expr = zero(JuMP.GenericAffExpr{
+        JuMP.value_type(typeof(transcribed)),
+        JuMP.variable_ref_type(transcribed)})
+    for var in decision_vars
+        haskey(rBM_sol, var) || continue
+        haskey(sep_sol, var) || continue
+        rbm_vals = rBM_sol[var]
+        sep_vals = sep_sol[var]
+        transcription_var = InfiniteOpt.transformation_variable(var)
+        transcribed_vars = transcription_var isa AbstractArray ?
+            vec(transcription_var) : [transcription_var]
+        for k in eachindex(transcribed_vars)
+            xi = 2 * (sep_vals[k] - rbm_vals[k])
+            JuMP.add_to_expression!(cut_expr, xi, transcribed_vars[k])
+            JuMP.add_to_expression!(cut_expr, -xi * sep_vals[k])
+        end
+    end
+    JuMP.@constraint(transcribed, cut_expr >= 0)
+    InfiniteOpt.set_transformation_backend_ready(model, true)
+    return
+end
+
 end

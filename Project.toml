@@ -1,7 +1,7 @@
 name = "DisjunctiveProgramming"
 uuid = "0d27d021-0159-4c7d-b4a7-9ccb5d9366cf"
 authors = ["hdavid16 <hperez16@gmail.com>"]
-version = "0.6.0"
+version = "0.6.1"
 
 [deps]
 JuMP = "4076af6c-e467-56ae-b986-b466b2749572"
@@ -21,6 +21,9 @@ JuMP = "1.18"
 Juniper = "0.9.3"
 Reexport = "1"
 julia = "1.10"
+Juniper = "0.9.3"
+Ipopt = "1.9.0"
+InfiniteOpt = "0.6.3"
 
 [extras]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
