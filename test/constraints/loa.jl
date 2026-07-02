@@ -478,6 +478,34 @@ function test_loa_hull_nested_sink()
     @test haskey(sink, (x, y[2]))
 end
 
+function test_reformulate_after_loa_restores_binaries()
+    # LOA relaxes the logical binaries and fixes them to its incumbent, so
+    # a later reformulation of the same model must restore binary
+    # integrality. Regression: a nested disjunction's tight-M looked up a
+    # relaxed binary's bounds and threw a KeyError.
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 1 <= x <= 9)
+    @variable(model, Y[1:2], Logical)
+    @variable(model, W[1:2], Logical)
+    @constraint(model, 1 <= x <= 2, Disjunct(W[1]))
+    @constraint(model, 2 <= x <= 3, Disjunct(W[2]))
+    @constraint(model, x >= 8, Disjunct(Y[2]))
+    @disjunction(model, [W[1], W[2]], Disjunct(Y[1]))
+    @disjunction(model, [Y[1], Y[2]])
+    @objective(model, Max, x)
+
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
+    bins = [v for (_, v) in DP._indicator_to_binary(model)
+        if v isa JuMP.VariableRef]
+    @test all(!JuMP.is_binary, bins)          # LOA left them relaxed
+
+    @test optimize!(model, gdp_method = BigM()) isa Nothing
+    @test all(JuMP.is_binary, bins)           # restored by reformulation
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 9
+end
+
 @testset "LOA" begin
     test_loa_datatype()
     test_set_covering_combos()
@@ -500,4 +528,5 @@ end
     test_loa_hull_nonlinear_disjunct()
     test_loa_hull_complement_nonlinear()
     test_loa_hull_nested_sink()
+    test_reformulate_after_loa_restores_binaries()
 end
