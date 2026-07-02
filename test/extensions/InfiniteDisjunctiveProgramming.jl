@@ -866,8 +866,8 @@ function test_loa_infinite_nonlinear_global()
     #   (x <= 3) ∨ (x <= 8), 0 <= x <= 10 over t ∈ [0, 1].
     # Disjunct Y[2] permits x up to 8 but the global x^2 <= 25 caps
     # x at 5. The per-support global transcribes to an `AbstractArray`
-    # of scalar constraints, so this exercises the array branch of
-    # `add_global_oa_cuts`. Without the global cut the
+    # of scalar constraints, so this exercises the per-support fan-out
+    # of the transcribed global constraints. Without the global cut the
     # master would allow x = 8 and report 8.0; the binding optimum
     # is ∫5 dt = 5.
     ipopt = optimizer_with_attributes(Ipopt.Optimizer,
@@ -891,15 +891,9 @@ end
 
 function test_loa_infinite_complement_indicator()
     # Regression: `_indicator_to_binary(model)[Y2]` returns the AffExpr
-    # `1 - binary(Y1)` for a logical-complement indicator. Earlier the
-    # extension's `fix_combination` called `JuMP.fix` directly on that
-    # AffExpr and crashed; now it delegates to base `fix_indicator`
-    # which unwraps and inverts.
-    #
-    # Linear disjuncts only — a nonlinear disjunct constraint on an
-    # infinite variable would also hit a separate gap where
-    # `_infinite_cut_info` for a finite indicator does not slice the
-    # per-support linearization point. Out of scope for this regression.
+    # `1 - binary(Y1)` for a logical-complement indicator. Fixing and
+    # gating must resolve it onto the underlying binary's transcription
+    # with the value inverted.
     #
     # max ∫ x dt with 0 ≤ x ≤ 10 over t ∈ [0,1]:
     #   Y1: x ≤ 3       Y2 ≡ ¬Y1: x ≤ 8
@@ -923,14 +917,11 @@ function test_loa_infinite_complement_indicator()
 end
 
 function test_loa_infinite_complement_nonlinear_disjunct()
-    # Regression: a finite (or complement-form AffExpr) indicator
-    # gating a NONLINEAR constraint on an infinite variable. Earlier
-    # `_infinite_cut_info` decided fan-out from the indicator only — finite
-    # indicator → single un-sliced site → `_linearize_at` received
-    # per-support `Vector{Float64}` values and tripped on
-    # `_unwrap_scalar`'s `only(v)`. Fixed by inspecting the constraint
-    # expression too: any infinite var found there governs the fan-out
-    # supports, even when the indicator is scalar.
+    # Regression: a finite (complement-form AffExpr) indicator gating a
+    # NONLINEAR constraint on an infinite variable. The constraint
+    # transcribes to one scalar row per support while the binary
+    # reference is a single expression, so the fan-out must broadcast
+    # it across the constraint's supports.
     #
     # max ∫ x dt with 0 ≤ x ≤ 10 over t ∈ [0,1]:
     #   Y1: x ≤ 3        Y2 ≡ ¬Y1: x² ≤ 64
@@ -956,12 +947,9 @@ function test_loa_infinite_complement_nonlinear_disjunct()
 end
 
 function test_loa_infinite_multidim_parameter()
-    # Regression: multi-D dependent parameter group. `supports(ξ)` is
-    # a 2 × N matrix, not a vector. Earlier the extension called
-    # `vec(supports(ξ))`, flattened to 2·N scalars, then called
-    # `binary_ref(scalar)` on a 2-D infinite var — dim mismatch.
-    # Fixed by returning `eachcol(supports(ξ))` and splatting vector
-    # supports through `_at_support`.
+    # Regression: multi-D dependent parameter group. Transcription
+    # expands a variable over ξ[1:2] across its joint supports; the
+    # transcribed binaries and constraint rows must stay aligned.
     #
     # max w with 0 ≤ x ≤ 10 over ξ[1:2] ∈ [0,1]², w ≤ x at every joint
     # support:
@@ -991,9 +979,9 @@ function test_loa_infinite_nlpf_infeasible_disjunct()
     # NLP-infeasible against the bound x in [0, 10]. With infinite
     # indicators `Y[1:2], InfiniteLogical(t)`, the infeasible
     # Y[1]-everywhere seed makes the primary NLP fail, so NLPF runs: it
-    # copies the model, re-pins the binaries on the copy via
-    # `nlpf_fix_on_copy`, slacks the inequality, and returns a
-    # linearization point. The disjunct is deliberately LINEAR:
+    # copies the transcribed NLP (per-support binary fixes included),
+    # slacks the inequality, and returns a linearization point. The
+    # disjunct is deliberately LINEAR:
     # the model is then convex, so LOA's master bound is rigorous and
     # it converges to Y[2] active everywhere (x = 5), giving ∫x dt = 5.
     # (A nonconvex infeasible disjunct such as x^2 >= 200 would make LOA
@@ -1023,8 +1011,8 @@ function test_loa_infinite_aggregate_global()
     # min ∫x dt s.t. ∫(x^2, t) <= 4 (aggregate global), x >= y,
     #   (y >= 1) ∨ (y >= 3), 0 <= x, y <= 10 over t ∈ [0, 1].
     # The aggregate global transcribes to a single scalar (the
-    # measure is flattened), exercising the non-array branch of
-    # `add_global_oa_cuts`. Y[1] (y >= 1) is the cheaper
+    # measure is expanded), exercising the single-row branch of
+    # the transcribed global constraints. Y[1] (y >= 1) is the cheaper
     # disjunct: x = 1 satisfies x >= y and ∫x^2 = 1 <= 4, giving
     # objective ∫1 dt = 1.
     ipopt = optimizer_with_attributes(Ipopt.Optimizer,
@@ -1049,13 +1037,11 @@ function test_loa_infinite_aggregate_global()
 end
 
 function test_loa_infinite_iteration_loop()
-    # Force the InfiniteModel LOA main loop to fix per-support
-    # Vector{Bool} combinations, exercising the in-place fix-constraint
-    # stash: create on the first main-loop fix, update via
-    # set_normalized_rhs on the committed re-fix. Two disjunctions over
-    # disjoint x/z half-lines put the optimum on an off-diagonal
-    # combination the scalar set-covering seeds never try, so the master
-    # stays feasible and the loop body runs with per-support values.
+    # Force the InfiniteModel LOA main loop to fix combinations that
+    # vary per support. Two disjunctions over disjoint x/z half-lines
+    # put the optimum on an off-diagonal combination the set-covering
+    # seeds never try, so the master stays feasible and the loop body
+    # runs with master-extracted per-support values.
     #   min ∫(x - z) dt
     #   D1: (x <= 4) [Y1]  ∨  (x >= 6) [Y2]
     #   D2: (z <= 4) [W1]  ∨  (z >= 6) [W2]
@@ -1104,7 +1090,7 @@ function test_loa_infinite_hull_nonlinear_disjunct()
     # The infinite Hull case big-M differs from: a NONLINEAR constraint
     # on an infinite variable inside a disjunct, under a plain infinite
     # indicator. The convex-hull OA cut is built per support over the
-    # disaggregated infinite variable (point-evaluated). max ∫x dt,
+    # transcribed disaggregated infinite variable. max ∫x dt,
     # Y1: x <= 3, Y2: x^2 <= 64. Optimum: x = 8 via Y2.
     ipopt = optimizer_with_attributes(Ipopt.Optimizer,
         "print_level" => 0, "sb" => "yes")
@@ -1128,7 +1114,7 @@ end
 function test_loa_infinite_hull_complement_nonlinear()
     # Hull with a complement indicator Y2 ≡ ¬Y1 gating a nonlinear
     # constraint on an infinite variable. The per-support disaggregator
-    # is keyed by the point-evaluated complement binary `1 - y1(t_k)`
+    # is keyed by the transcribed complement binary `1 - y1_k`
     # (an AffExpr). max ∫x dt, Y1: x <= 3, Y2: x^2 <= 64. Optimum 8.
     ipopt = optimizer_with_attributes(Ipopt.Optimizer,
         "print_level" => 0, "sb" => "yes")
@@ -1154,11 +1140,12 @@ function test_loa_infinite_hull_finite_var()
     # A FINITE variable disaggregated inside a nonlinear disjunct
     # constraint gated by an INFINITE indicator. The fan-out slices the
     # binary per support, so the disaggregator must key the finite
-    # variable's copy by the per-support binary `y(t_k)` (driven off the
+    # variable's single copy by each per-support binary (driven off the
     # binary, not the variable). max ∫x dt + w over t ∈ [0,1]:
-    #   Y1: x^2 + w^2 <= 25      Y2: x <= 0
-    # Y1 is active; x(t) = w = sqrt(12.5), so the optimum is
-    # ∫sqrt(12.5) dt + sqrt(12.5) = 2 sqrt(12.5) ≈ 7.0711.
+    #   Y1: x^2 + w^2 <= 25      Y2: x <= 0, w <= 3
+    # Y1 is active (Y2 caps the objective at 3); x(t) = w = sqrt(12.5),
+    # so the optimum is ∫sqrt(12.5) dt + sqrt(12.5) = 2 sqrt(12.5)
+    # ≈ 7.0711.
     ipopt = optimizer_with_attributes(Ipopt.Optimizer,
         "print_level" => 0, "sb" => "yes")
     juniper = optimizer_with_attributes(Juniper.Optimizer,
@@ -1171,6 +1158,7 @@ function test_loa_infinite_hull_finite_var()
     @variable(model, Y[1:2], InfiniteLogical(t))
     @constraint(model, x^2 + w^2 <= 25, Disjunct(Y[1]))
     @constraint(model, x <= 0, Disjunct(Y[2]))
+    @constraint(model, w <= 3, Disjunct(Y[2]))
     @disjunction(model, Y)
     @objective(model, Max, ∫(x, t) + w)
     optimize!(model, gdp_method = LOA(juniper;
@@ -1243,29 +1231,21 @@ end
         test_CuttingPlanes_multiparameter()
     end
 
-    # LOA on InfiniteOpt needs `JuMP.copy_model(::InfiniteModel)`
-    # (build_loa_master). That lives in the InfiniteOpt fork and is
-    # not in the registered release, so guard the suite: it runs
-    # (and validates the global-cut paths) when the fork is dev'd
-    # into the env, and skips cleanly otherwise.
+    # LOA runs on the transcribed backend, a plain JuMP model, so it
+    # needs no `JuMP.copy_model(::InfiniteModel)` from the InfiniteOpt
+    # fork (unlike MBM).
     @testset "LOA" begin
-        if hasmethod(JuMP.copy_model, Tuple{InfiniteModel})
-            test_loa_infinite_nonlinear_global()
-            test_loa_infinite_aggregate_global()
-            test_loa_infinite_complement_indicator()
-            test_loa_infinite_complement_nonlinear_disjunct()
-            test_loa_infinite_multidim_parameter()
-            test_loa_infinite_nlpf_infeasible_disjunct()
-            test_loa_infinite_iteration_loop()
-            test_loa_infinite_hull_linear()
-            test_loa_infinite_hull_nonlinear_disjunct()
-            test_loa_infinite_hull_complement_nonlinear()
-            test_loa_infinite_hull_finite_var()
-        else
-            @info "Skipping InfiniteOpt LOA tests: " *
-                "JuMP.copy_model(::InfiniteModel) unavailable " *
-                "(registered InfiniteOpt; dev the fork to run)."
-        end
+        test_loa_infinite_nonlinear_global()
+        test_loa_infinite_aggregate_global()
+        test_loa_infinite_complement_indicator()
+        test_loa_infinite_complement_nonlinear_disjunct()
+        test_loa_infinite_multidim_parameter()
+        test_loa_infinite_nlpf_infeasible_disjunct()
+        test_loa_infinite_iteration_loop()
+        test_loa_infinite_hull_linear()
+        test_loa_infinite_hull_nonlinear_disjunct()
+        test_loa_infinite_hull_complement_nonlinear()
+        test_loa_infinite_hull_finite_var()
     end
 
 end

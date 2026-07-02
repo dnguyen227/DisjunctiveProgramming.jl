@@ -419,9 +419,9 @@ struct Hull{T} <: AbstractReformulationMethod
     value::T
     # Internal: LOA installs a Dict here to collect the disaggregation
     # map during reformulation; `nothing` for every other use.
-    sink::Any
-    function Hull(ϵ::T = 1e-6; sink = nothing) where {T}
-        new{T}(ϵ, sink)
+    disaggregation_map::Any
+    function Hull(ϵ::T = 1e-6; disaggregation_map = nothing) where {T}
+        new{T}(ϵ, disaggregation_map)
     end
 end
 
@@ -430,13 +430,13 @@ mutable struct _Hull{V <: JuMP.AbstractVariableRef, T} <: AbstractReformulationM
     value::T
     disjunction_variables::Dict{V, Vector{V}}
     disjunct_variables::Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}
-    sink::Any
+    disaggregation_map::Any
     function _Hull(method::Hull{T}, vrefs::Set{V}) where {T, V <: JuMP.AbstractVariableRef}
         new{V, T}(
             method.value,
             Dict{V, Vector{V}}(vref => V[] for vref in vrefs),
             Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}(),
-            method.sink
+            method.disaggregation_map
         )
     end
 end
@@ -632,18 +632,33 @@ struct LOA{O, P, R, T} <: AbstractReformulationMethod
     end
 end
 
-# The LOA master MILP plus maps from original- to master-model refs.
-# `objective_ref_map` splits from `variable_map` so an extension can map
-# objective vars separately (identical in base); `disaggregator` is the
-# master `_Hull` for Hull cuts, `nothing` for Big-M / MBM.
-mutable struct _LOAMaster{M <: JuMP.AbstractModel, OF, AO, BM, VM, RM, DG}
+# The problem the LOA loop operates on: the model solved as the NLP
+# subproblem, the binary variables backing the indicators, the
+# set-covering seed combinations, the nonlinear disjunct
+# `(binary_ref, function, set)` triples (`binary_ref` is the binary or
+# its `1 - y` complement expression), the nonlinear global
+# `(function, set)` pairs, and the `(variable, binary_ref) ->
+# disaggregated variable` map from an inner Hull reformulation
+# (`nothing` for Big-M / MBM). Built by `build_loa_problem`.
+struct _LOAProblem{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef}
+    nlp::M
+    binaries::Vector{V}
+    covering_combinations::Vector{Dict{V, Bool}}
+    disjunct_constraints::Vector{Tuple{Any, Any, Any}}
+    global_constraints::Vector{Tuple{Any, Any}}
+    disaggregation_map::Any
+end
+
+# The LOA master MILP plus the NLP-to-master variable map.
+# `objective` is the NLP's objective, linearized per iteration for
+# the objective cuts; `disaggregator` is the master `_Hull` for Hull
+# cuts, `nothing` for Big-M / MBM.
+struct _LOAMaster{M <: JuMP.AbstractModel, VM, OF, AO, DG}
     model::M
-    binary_map::BM
     variable_map::VM
     objective_sense::_MOI.OptimizationSense
-    original_objective::OF
+    objective::OF
     alpha_oa::AO
-    objective_ref_map::RM
     disaggregator::DG
 end
 

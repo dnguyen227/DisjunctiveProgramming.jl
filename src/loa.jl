@@ -17,26 +17,29 @@ _gap(::Val{_MOI.MAX_SENSE}, best, bound) = bound - best
 ################################################################################
 #                            MAIN LOOP
 ################################################################################
-# LOA entry: set-covering seeds, the master/NLP loop, commit the best combo
+# LOA entry: build the problem, seed with set-covering combinations,
+# iterate the master/NLP loop, and commit the best combination.
 function reformulate_model(model::JuMP.AbstractModel, method::LOA)
     _clear_reformulations(model)
-    combinations = _set_covering_combinations(model)
     # Hull needs the disaggregation map if its used as inner function
-    inner, sink = _loa_inner_method(model, method.inner_method)
+    inner, disaggregation_map = _loa_inner_method(model, method.inner_method)
     reformulate_model(model, inner)
 
-    master = build_loa_master(model, method, sink)
-    # The original is only ever the NLP (build_loa_master keeps the
-    # master's binaries), so relax it once; fixing overwrites in place.
-    relax_logical_vars(model)
-    JuMP.set_optimizer(model, method.nlp_optimizer)
-    JuMP.set_silent(model)
+    problem = build_loa_problem(model, method, disaggregation_map)
+    # The master copies the NLP while its binaries still carry
+    # integrality; the NLP is then relaxed once and each iteration
+    # overwrites the binary fixes in place.
+    master = _build_loa_master(problem, method)
+    _relax_binaries(problem)
+    nlp = problem.nlp
+    JuMP.set_optimizer(nlp, method.nlp_optimizer)
+    JuMP.set_silent(nlp)
     t_start = time()
     overall_deadline = t_start + method.time_limit
     loop_deadline =
         min(t_start + method.iteration_time_limit, overall_deadline)
-    original_time_limit = JuMP.time_limit_sec(model)
-    sense_token = Val(JuMP.objective_sense(model))
+    original_time_limit = JuMP.time_limit_sec(nlp)
+    sense_token = Val(master.objective_sense)
     best_objective = _worst_objective(sense_token)
     best_result = nothing
     master_bound = nothing
@@ -44,13 +47,13 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
     # Seed the master with an OA cut per set-covering combination, each
     # NLP warm-started from the last feasible primal.
     previous_result = nothing
-    for combination in combinations
+    for combination in problem.covering_combinations
         time() < loop_deadline || break
         _set_nlp_warm_start(previous_result)
-        result = _solve_nlp(model, combination, method;
+        result = _solve_nlp(problem, combination, method;
             deadline = loop_deadline)
-        avoid_combination(master.model, combination, master.binary_map)
-        add_oa_cuts(model, master, result, method)
+        avoid_combination(master.model, combination, master.variable_map)
+        _add_oa_cuts(problem, master, result, method)
         if result.feasible &&
                 _is_better(sense_token, result.objective, best_objective)
             best_objective = result.objective
@@ -78,12 +81,12 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
                 break
             end
         end
-        combination = _extract_combination(model, master)
+        combination = _extract_combination(problem, master)
         _set_nlp_warm_start(previous_result)
-        result = _solve_nlp(model, combination, method;
+        result = _solve_nlp(problem, combination, method;
             deadline = loop_deadline)
-        avoid_combination(master.model, combination, master.binary_map)
-        add_oa_cuts(model, master, result, method)
+        avoid_combination(master.model, combination, master.variable_map)
+        _add_oa_cuts(problem, master, result, method)
         if result.feasible &&
                 _is_better(sense_token, result.objective, best_objective)
             best_objective = result.objective
@@ -92,16 +95,13 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
         result.feasible && (previous_result = result)
     end
 
-    if best_result !== nothing
-        commit_combination(model, best_result.combination,
-            best_result.linearization_point)
-    end
+    best_result === nothing || _commit_combination(best_result)
     if isfinite(method.time_limit)
         # Overall cap: the final committed solve gets the budget left.
-        JuMP.set_time_limit_sec(model, max(0.0, overall_deadline - time()))
+        JuMP.set_time_limit_sec(nlp, max(0.0, overall_deadline - time()))
     elseif isfinite(method.iteration_time_limit)
         # Loop-only budget: restore so the final solve isn't crippled.
-        _restore_time_limit(model, original_time_limit)
+        _restore_time_limit(nlp, original_time_limit)
     end
     _report_loa_gap(best_objective, best_result, master_bound, sense_token,
         converged)
@@ -165,6 +165,125 @@ function _set_covering_combinations(model::JuMP.AbstractModel)
 end
 
 ################################################################################
+#                       FINITE PROBLEM CONSTRUCTION
+################################################################################
+# The concrete variable behind an indicator's binary reference (the
+# underlying variable of a `1 - y` complement expression), and the value
+# it takes when the indicator is active.
+_underlying_binary(binary_ref::JuMP.AbstractVariableRef) = binary_ref
+_underlying_binary(binary_ref::JuMP.GenericAffExpr) =
+    only(keys(binary_ref.terms))
+_underlying_value(::JuMP.AbstractVariableRef, active::Bool) = active
+_underlying_value(::JuMP.GenericAffExpr, active::Bool) = !active
+
+# Translate an indicator-level combination onto the underlying binary
+# variables, inverting the value for complement-form indicators.
+function _binary_combination(model::JuMP.AbstractModel, combination)
+    V = JuMP.variable_ref_type(typeof(model))
+    binary_map = _indicator_to_binary(model)
+    result = Dict{V, Bool}()
+    for (indicator, active) in combination
+        binary_ref = binary_map[indicator]
+        result[_underlying_binary(binary_ref)] =
+            _underlying_value(binary_ref, active)
+    end
+    return result
+end
+
+"""
+    build_loa_problem(
+        model::JuMP.AbstractModel,
+        method::LOA,
+        [disaggregation_map = nothing]
+        )::_LOAProblem
+
+Build the problem the LOA loop operates on from `model` (already
+reformulated by the LOA inner method): the NLP subproblem, the binary
+variables backing the indicators, the set-covering seed combinations,
+the nonlinear disjunct `(binary_ref, function, set)` triples, the
+nonlinear global `(function, set)` pairs, and the Hull disaggregation
+map. The NLP is `model` itself; the InfiniteOpt extension overloads
+this to build the problem from the transcribed backend instead.
+
+## Returns
+- `_LOAProblem`: the problem.
+"""
+function build_loa_problem(
+    model::JuMP.AbstractModel,
+    method::LOA,
+    disaggregation_map = nothing
+    )
+    V = JuMP.variable_ref_type(typeof(model))
+    binary_map = _indicator_to_binary(model)
+
+    binaries = V[_underlying_binary(binary_ref)
+        for (_, binary_ref) in binary_map]
+    unique!(binaries)
+    combinations = [_binary_combination(model, combination)
+        for combination in _set_covering_combinations(model)]
+
+    disjunct_constraints = Tuple{Any, Any, Any}[]
+    for (_, disjunction) in _disjunctions(model)
+        for indicator in disjunction.constraint.indicators
+            haskey(_indicator_to_constraints(model), indicator) || continue
+            binary_ref = binary_map[indicator]
+            for cref in _indicator_to_constraints(model)[indicator]
+                cref isa DisjunctConstraintRef || continue
+                constraint = _disjunct_constraints(model)[
+                    JuMP.index(cref)].constraint
+                constraint isa JuMP.ScalarConstraint || continue
+                _is_linear_F(typeof(constraint.func)) && continue
+                push!(disjunct_constraints,
+                    (binary_ref, constraint.func, constraint.set))
+            end
+        end
+    end
+
+    global_constraints = Tuple{Any, Any}[]
+    reform_set = Set(_reformulation_constraints(model))
+    for (F, S) in JuMP.list_of_constraint_types(model)
+        F === V && continue
+        _is_linear_F(F) && continue
+        for cref in JuMP.all_constraints(model, F, S)
+            cref in reform_set && continue
+            constraint = JuMP.constraint_object(cref)
+            constraint isa JuMP.ScalarConstraint || continue
+            push!(global_constraints, (constraint.func, constraint.set))
+        end
+    end
+
+    binary_disaggregations = disaggregation_map === nothing ? nothing :
+        Dict((variable, binary_map[indicator]) => disaggregated
+            for ((variable, indicator), disaggregated) in disaggregation_map)
+    return _LOAProblem(model, binaries, combinations, disjunct_constraints,
+        global_constraints, binary_disaggregations)
+end
+
+# The inner reformulation method LOA runs, plus the disaggregation map
+# to collect (Big-M / MBM need none). For Hull, return a map-carrying
+# copy so the reformulation records its `(variable, indicator) ->
+# disaggregated variable` map into a fresh LOA-owned `Dict`.
+_loa_inner_method(::JuMP.AbstractModel, inner::Union{BigM, MBM}) =
+    (inner, nothing)
+function _loa_inner_method(model::JuMP.AbstractModel, inner::Hull)
+    V = JuMP.variable_ref_type(typeof(model))
+    disaggregations = Dict{Tuple{V, LogicalVariableRef{typeof(model)}}, V}()
+    return (Hull(inner.value; disaggregation_map = disaggregations),
+        disaggregations)
+end
+
+# Relax the binaries to continuous in [0, 1]; each NLP solve then
+# overwrites their fixes in place.
+function _relax_binaries(problem::_LOAProblem)
+    for binary in problem.binaries
+        JuMP.unset_binary(binary)
+        JuMP.set_lower_bound(binary, 0.0)
+        JuMP.set_upper_bound(binary, 1.0)
+    end
+    return
+end
+
+################################################################################
 #                         MASTER CONSTRUCTION
 ################################################################################
 # True for linear constraint function types (variable refs / affine).
@@ -175,39 +294,26 @@ _is_linear_F(::Type{<:AbstractVector{<:JuMP.AbstractVariableRef}}) = true
 _is_linear_F(::Type{<:AbstractVector{<:JuMP.GenericAffExpr}}) = true
 _is_linear_F(::Type) = false
 
-"""
-    build_loa_master(model, method::LOA, sink = nothing)::_LOAMaster
+# Build the LOA master MILP: copy the NLP's variables and linear
+# constraints, install the `alpha_oa` objective auxiliary, and record
+# the NLP-to-master variable map. Nonlinear constraints are not
+# copied; they enter later as OA cuts per NLP solve.
+function _build_loa_master(problem::_LOAProblem, method::LOA)
+    nlp = problem.nlp
+    objective = JuMP.objective_function(nlp)
+    objective_sense = JuMP.objective_sense(nlp)
+    variable_type = JuMP.variable_ref_type(typeof(nlp))
 
-Build the LOA master MILP: copy `model`'s variables and linear
-constraints, install the `alpha_oa` objective auxiliary, and record the
-original-to-master reference maps. Nonlinear objective and disjunct
-constraints are not copied; they enter later as OA cuts per NLP solve.
-`sink` is the `(variable, indicator) -> disaggregated variable` map from
-an inner Hull reformulation (`nothing` for Big-M / MBM).
-
-## Returns
-- `_LOAMaster`: the master model with its reference maps and
-  disaggregator.
-"""
-function build_loa_master(
-    model::JuMP.AbstractModel,
-    method::LOA,
-    sink = nothing
-    )
-    original_objective = JuMP.objective_function(model)
-    objective_sense = JuMP.objective_sense(model)
-    variable_type = JuMP.variable_ref_type(typeof(model))
-
-    master = _copy_model(model)
+    master = _copy_model(nlp)
     JuMP.set_optimizer(master, method.mip_optimizer)
     JuMP.set_silent(master)
 
-    variable_map = copy_variables_onto_model(master, model)
+    variable_map = copy_variables_onto_model(master, nlp)
 
-    for (F, S) in JuMP.list_of_constraint_types(model)
+    for (F, S) in JuMP.list_of_constraint_types(nlp)
         F === variable_type && continue
         _is_linear_F(F) || continue
-        for constraint_ref in JuMP.all_constraints(model, F, S)
+        for constraint_ref in JuMP.all_constraints(nlp, F, S)
             constraint = JuMP.constraint_object(constraint_ref)
             new_func = replace_variables_in_constraint(
                 constraint.func, variable_map)
@@ -215,69 +321,32 @@ function build_loa_master(
         end
     end
 
-    binary_map = Dict{LogicalVariableRef, Any}()
-    for (indicator, binary_ref) in _indicator_to_binary(model)
-        binary_map[indicator] = _remap_indicator_to_binary(
-            binary_ref, variable_map)
-    end
-
     alpha_oa = JuMP.@variable(master, base_name = "alpha_oa")
     JuMP.@objective(master, objective_sense, alpha_oa)
 
-    disaggregator = _build_disaggregator(model, method.inner_method,
-        variable_map, binary_map, sink)
-    return _LOAMaster(master, binary_map, variable_map, objective_sense,
-        original_objective, alpha_oa, variable_map, disaggregator)
-end
-
-# The inner reformulation method LOA runs, plus the disaggregation sink to
-# collect (Big-M / MBM need none). 
-#For Hull, return a sink-carrying copy so the reformulation records its `(variable, indicator) 
-# -> disaggregated variable` map into a fresh LOA-owned `Dict`.
-_loa_inner_method(::JuMP.AbstractModel, inner::Union{BigM, MBM}) =
-    (inner, nothing)
-function _loa_inner_method(model::JuMP.AbstractModel, inner::Hull)
-    V = JuMP.variable_ref_type(typeof(model))
-    sink = Dict{Tuple{V, LogicalVariableRef{typeof(model)}}, V}()
-    return (Hull(inner.value; sink = sink), sink)
+    disaggregator = _build_disaggregator(problem, variable_map,
+        method.inner_method)
+    return _LOAMaster(master, variable_map, objective_sense, objective,
+        alpha_oa, disaggregator)
 end
 
 # Master-space Hull disaggregator for the convex-hull cut emitter
-# (`nothing` for Big-M / MBM). Remaps the collected `(variable, indicator)
-# -> disaggregated variable` sink into master refs.
-_build_disaggregator(::JuMP.AbstractModel, ::Union{BigM, MBM},
-    variable_map, binary_map, sink) = nothing
+# (`nothing` for Big-M / MBM): remap the `(variable, binary_ref) ->
+# disaggregated variable` map into master refs.
+_build_disaggregator(::_LOAProblem, ::AbstractDict, ::Union{BigM, MBM}) =
+    nothing
 function _build_disaggregator(
-    model::JuMP.AbstractModel,
-    inner::Hull,
+    problem::_LOAProblem,
     variable_map::AbstractDict,
-    binary_map::AbstractDict,
-    sink
+    inner::Hull
     )
     hull = _Hull(inner, Set{valtype(variable_map)}())
-    for ((variable, indicator), disaggregated) in sink
-        record_disaggregation(hull, model, variable_map[variable],
-            binary_map[indicator], variable_map[disaggregated])
+    for ((variable, binary_ref), disaggregated) in problem.disaggregation_map
+        hull.disjunct_variables[(variable_map[variable],
+            _remap_indicator_to_binary(binary_ref, variable_map))] =
+            variable_map[disaggregated]
     end
     return hull
-end
-
-"""
-    record_disaggregation(hull::_Hull, model, variable, binary,
-        disaggregated)
-
-Record one master-space disaggregation in the Hull `hull` used to gate
-Hull OA cuts, keyed by `(variable, binary)`.
-"""
-function record_disaggregation(
-    hull::_Hull,
-    ::JuMP.AbstractModel,
-    variable,
-    binary,
-    disaggregated
-    )
-    hull.disjunct_variables[(variable, binary)] = disaggregated
-    return
 end
 
 ################################################################################
@@ -293,52 +362,68 @@ _restore_time_limit(model::JuMP.AbstractModel, ::Nothing) =
 _restore_time_limit(model::JuMP.AbstractModel, seconds::Real) =
     JuMP.set_time_limit_sec(model, seconds)
 
-# Solve the primary NLP at a fixed combination. If infeasible, fall
+# Fix each binary at its combination value, overwriting any previous
+# fix in place.
+function _fix_combination(combination::AbstractDict)
+    for (binary, value) in combination
+        JuMP.fix(binary, value ? 1.0 : 0.0; force = true)
+    end
+    return
+end
+
+# Primal values keyed by the NLP's variables, skipping fixed ones
+# (the combination binaries and any user-fixed variables).
+function _extract_solution(nlp::JuMP.AbstractModel)
+    V = JuMP.variable_ref_type(typeof(nlp))
+    T = JuMP.value_type(typeof(nlp))
+    return Dict{V, T}(v => JuMP.value(v)
+        for v in JuMP.all_variables(nlp) if !JuMP.is_fixed(v))
+end
+
+# Solve the NLP at a fixed combination. If infeasible, fall
 # through to NLPF (a slacked version that always solves) so the master
 # still gets a linearization site, not just a no-good cut.
 function _solve_nlp(
-    model::M,
+    problem::_LOAProblem,
     combination,
     method::LOA;
     deadline::Float64 = Inf
-    ) where {M <: JuMP.AbstractModel}
-    _cap_remaining_time(model, deadline)
-    primary = with_fixed_combination(model, combination) do
-        JuMP.optimize!(model, ignore_optimize_hook = true)
-        if JuMP.is_solved_and_feasible(model)
-            return (combination = combination,
-                linearization_point = extract_solution(model),
-                objective = JuMP.objective_value(model), feasible = true)
-        end
-        return nothing
+    )
+    nlp = problem.nlp
+    _cap_remaining_time(nlp, deadline)
+    _fix_combination(combination)
+    JuMP.optimize!(nlp, ignore_optimize_hook = true)
+    if JuMP.is_solved_and_feasible(nlp)
+        return (combination = combination,
+            linearization_point = _extract_solution(nlp),
+            objective = JuMP.objective_value(nlp), feasible = true)
     end
-    primary === nothing || return primary
 
     # Primary NLP infeasible — try NLPF.
-    nlpf = _solve_nlpf(model, combination, method; deadline = deadline)
+    nlpf = _solve_nlpf(problem, combination, method; deadline = deadline)
     nlpf === nothing || return nlpf
 
+    V = JuMP.variable_ref_type(typeof(nlp))
+    T = JuMP.value_type(typeof(nlp))
     return (combination = combination,
-        linearization_point = Dict{JuMP.AbstractVariableRef, Any}(),
+        linearization_point = Dict{V, T}(),
         objective = Inf, feasible = false)
 end
 
 ################################################################################
 #                       NLPF (FEASIBILITY SUBPROBLEM)
 ################################################################################
-# When the primary NLP is infeasible, copy the model, slack every scalar
-# inequality with one nonnegative `u`, minimize `u`, and return the
-# primal as the linearization site (equalities/bounds exact, inequalities
-# violated by at most `u`).
+# When the primary NLP is infeasible, copy the NLP (fixes included),
+# slack every scalar inequality with one nonnegative `u`, minimize `u`,
+# and return the primal as the linearization site (equalities/bounds
+# exact, inequalities violated by at most `u`).
 function _solve_nlpf(
-    model::M,
+    problem::_LOAProblem,
     combination,
     method::LOA;
     deadline::Float64 = Inf
-    ) where {M <: JuMP.AbstractModel}
-    # The original's binaries are permanently relaxed, so this copy is
-    # continuous — any NLP solver (e.g. Ipopt) can solve NLPF.
-    copy, ref_map = JuMP.copy_model(model)
+    )
+    copy, ref_map = JuMP.copy_model(problem.nlp)
     JuMP.set_optimizer(copy, method.nlp_optimizer)
     JuMP.set_silent(copy)
     _cap_remaining_time(copy, deadline)
@@ -359,43 +444,19 @@ function _solve_nlpf(
 
     JuMP.@objective(copy, Min, u)
 
-    # Fix the combination on the copy so NLPF solves at the chosen
-    # binaries, not by leaning on the copy inheriting the original's fix.
-    fix_combination_on_copy(copy, model, combination, ref_map)
-
     JuMP.optimize!(copy, ignore_optimize_hook = true)
     # Use the primal only at a genuine feasible point; a solver can report
     # `has_values` with a nonfeasible/NaN primal that would poison the cut.
     JuMP.is_solved_and_feasible(copy) || return nothing
 
-    linearization_point = _nlpf_extract_primal(model, ref_map)
+    V = JuMP.variable_ref_type(typeof(problem.nlp))
+    T = JuMP.value_type(typeof(problem.nlp))
+    linearization_point = Dict{V, T}(v => JuMP.value(ref_map[v])
+        for v in JuMP.all_variables(problem.nlp) if !JuMP.is_fixed(v))
     return (combination = combination,
         linearization_point = linearization_point,
         objective = Inf, feasible = false)
 end
-
-# Fix each indicator's binary on the NLPF copy at its combination value,
-# mapped into copy space. Explicit so NLPF is self-contained rather than
-# relying on the copy inheriting the original's fix.
-function fix_combination_on_copy(copy, model, combination, ref_map)
-    for (indicator, value) in combination
-        binary = _binary_on_copy(
-            _indicator_to_binary(model)[indicator], ref_map)
-        _fix_binary_on_copy(copy, binary, value)
-    end
-    return
-end
-
-# Map an original binary (or its `1 - y` complement) into NLPF-copy space.
-_binary_on_copy(binary::JuMP.AbstractVariableRef, ref_map) = ref_map[binary]
-_binary_on_copy(binary::JuMP.GenericAffExpr, ref_map) =
-    1.0 - ref_map[only(keys(binary.terms))]
-
-# OVERRIDABLE. Fix one binary on the copy at a scalar value via an
-# equality (the copy is discarded, so the fix needs no teardown). The
-# InfiniteOpt extension adds a per-support method for a `Vector{Bool}`.
-_fix_binary_on_copy(copy, binary, value::Bool) =
-    JuMP.@constraint(copy, binary == (value ? 1.0 : 0.0))
 
 _nlpf_should_slack(::Type{<:_MOI.LessThan}) = true
 _nlpf_should_slack(::Type{<:_MOI.GreaterThan}) = true
@@ -404,149 +465,80 @@ _nlpf_should_slack(::Type) = false
 _nlpf_slacked_func(func, u, ::_MOI.LessThan) = func - u
 _nlpf_slacked_func(func, u, ::_MOI.GreaterThan) = func + u
 
-# Read primal values from `copy` keyed by the original model's
-# variables, in the same vector shape `extract_solution` would have
-# produced on the original.
-function _nlpf_extract_primal(model::JuMP.AbstractModel, ref_map)
-    V = JuMP.variable_ref_type(typeof(model))
-    T = JuMP.value_type(typeof(model))
-    result = Dict{V, Vector{T}}()
-    for v in collect_all_vars(model)
-        JuMP.is_fixed(v) && continue
-        target = ref_map[v]
-        val = JuMP.value(target)
-        result[v] = val isa AbstractArray ? vec(val) : [val]
-    end
-    return result
-end
-
-# Fix `combination`, run `f()`, then undo. The finite undo is a no-op
-# (fixes overwrite in place); the infinite `fix_combination` clears its
-# per-support fixed values.
-
-# TODO: Refactor to avoid this.
-function with_fixed_combination(
-    f,
-    model::JuMP.AbstractModel,
-    combination::AbstractDict
-    )
-    undo = fix_combination(model, combination)
-    try
-        return f()
-    finally
-        undo()
-    end
-end
-
 # Iter-to-iter NLP warm start: seed the next NLP from the last FEASIBLE
 # primal (no-op on the first seed and after an NLPF fall-through, whose
-# primal is slack-distorted). Routes through `set_linearization_start`.
+# primal is slack-distorted).
 function _set_nlp_warm_start(previous)
     previous === nothing && return
-    for (variable, values) in previous.linearization_point
-        set_linearization_start(variable, values)
+    for (variable, value) in previous.linearization_point
+        JuMP.set_start_value(variable, value)
     end
     return
 end
 
-# Finalize the model with the LOA-optimal combination: fix indicators
-# at the committed values (in place; the model is already permanently
-# relaxed by reformulate_model) and warm-start from the linearization
-# point. After this, the model is no longer in a state suitable for
-# re-running with a different `gdp_method`.
-function commit_combination(
-    model::JuMP.AbstractModel,
-    combination::AbstractDict,
-    linearization_point::AbstractDict
-    )
-    fix_combination(model, combination)
-    for (variable, values) in linearization_point
-        set_linearization_start(variable, values)
+# Finalize the NLP with the LOA-optimal combination: fix the
+# binaries at the committed values (in place; the NLP is already
+# permanently relaxed) and warm-start from the linearization point.
+# After this, the model is no longer in a state suitable for re-running
+# with a different `gdp_method`.
+function _commit_combination(result)
+    _fix_combination(result.combination)
+    for (variable, value) in result.linearization_point
+        JuMP.set_start_value(variable, value)
     end
     return
 end
-
-"""
-    fix_combination(model, combination::AbstractDict)::Function
-
-Fix each indicator in `combination` to its value on `model`, in place,
-and return a zero-argument closure that undoes the fixes.
-
-## Returns
-- `Function`: an undo closure called by `with_fixed_combination`.
-"""
-function fix_combination(model::JuMP.AbstractModel, combination::AbstractDict)
-    for (indicator, value) in combination
-        fix_indicator(model, indicator, value)
-    end
-    return () -> nothing
-end
-
-"""
-    set_linearization_start(variable, values::AbstractVector)
-
-Warm-start `variable` from the linearization point, unwrapping the single
-element of `values` as its start value.
-"""
-set_linearization_start(variable, values::AbstractVector) =
-    JuMP.set_start_value(variable, only(values))
 
 ################################################################################
 #                       COMBO EXTRACTION (master -> NLP)
 ################################################################################
-# Read each indicator's binary value from the master MILP solution.
-# `combination_val` returns a `Bool` (finite indicator) or per-support
-# `Vector{Bool}` (infinite); downstream dispatches on that.
-function _extract_combination(
-    model::M,
-    master::_LOAMaster
-    ) where {M <: JuMP.AbstractModel}
-    combination = Dict{LogicalVariableRef{M}, Any}()
-    for (_, disjunction_data) in _disjunctions(model)
-        for indicator in disjunction_data.constraint.indicators
-            combination[indicator] =
-                combination_val(master.binary_map[indicator])
-        end
-    end
-    return combination
-end
-
-# Read the master binary and round to `Bool` (a MILP solver returns
-# values within its integer tolerance, never exactly 0/1). Branches on
-# the value: scalar (finite) or per-support array (infinite).
-function combination_val(binary_ref)
-    val = JuMP.value(binary_ref)
-    return val isa AbstractArray ? vec(round.(Bool, val)) : round(Bool, val)
+# Read each binary's master value, rounded to `Bool` (a MILP solver
+# returns values within its integer tolerance, never exactly 0/1).
+function _extract_combination(problem::_LOAProblem, master::_LOAMaster)
+    return Dict(binary => round(Bool, JuMP.value(master.variable_map[binary]))
+        for binary in problem.binaries)
 end
 
 ################################################################################
 #                          OA CUT EMISSION
 ################################################################################
-function add_oa_cuts(
-    model::JuMP.AbstractModel,
+# Whether the disjunct behind `binary_ref` is active in `combination`
+# (a complement reference inverts its underlying binary's value).
+_disjunct_active(combination::AbstractDict,
+    binary_ref::JuMP.AbstractVariableRef) = combination[binary_ref]
+_disjunct_active(combination::AbstractDict, binary_ref::JuMP.GenericAffExpr) =
+    !combination[_underlying_binary(binary_ref)]
+
+# Emit all OA cuts for one NLP result: the objective cut, a slacked row
+# per nonlinear global, and a gated cut per active nonlinear disjunct
+# constraint (Big-M / MBM or Hull gating per the inner method).
+function _add_oa_cuts(
+    problem::_LOAProblem,
     master::_LOAMaster,
     result::NamedTuple,
     method::LOA
     )
     isempty(result.linearization_point) && return
-    linearization = _linearize_at(master.original_objective,
-        objective_linearization_point(model, result.linearization_point),
-        master.objective_ref_map)
-    _add_objective_cut(
-        Val(master.objective_sense), master, linearization, method)
-    add_global_oa_cuts(model, master, result, method)
-    add_disjunct_oa_cuts(model, master, result, method)
+    sense_token = Val(master.objective_sense)
+    penalty_sign = _penalty_sign(sense_token)
+    linearization = _linearize_at(master.objective,
+        result.linearization_point, master.variable_map)
+    _add_objective_cut(sense_token, master, linearization, method)
+    for (func, set) in problem.global_constraints
+        linearization = _linearize_at(func, result.linearization_point,
+            master.variable_map)
+        _add_global_oa_row(master, linearization, set, method, penalty_sign)
+    end
+    for (binary_ref, func, set) in problem.disjunct_constraints
+        _disjunct_active(result.combination, binary_ref) || continue
+        linearization = _linearize_at(func, result.linearization_point,
+            master.variable_map)
+        _emit_disjunct_oa_cut(method.inner_method, set, master,
+            _remap_indicator_to_binary(binary_ref, master.variable_map),
+            linearization, method, penalty_sign)
+    end
     return
 end
-
-"""
-    objective_linearization_point(model, linearization_point)
-
-Return the point at which the master objective is linearized. Returns
-`linearization_point` unchanged.
-"""
-objective_linearization_point(::JuMP.AbstractModel, linearization_point) =
-    linearization_point
 
 # Slacked objective cut. MIN: `lin <= alpha_oa + sigma`; MAX symmetric.
 # The slack (like the disjunct/global cuts) keeps a nonconvex objective
@@ -566,83 +558,6 @@ _add_objective_cut_body(::Val{_MOI.MIN_SENSE}, master, lin, slack) =
 _add_objective_cut_body(::Val{_MOI.MAX_SENSE}, master, lin, slack) =
     JuMP.@constraint(master.model, lin >= master.alpha_oa - slack)
 
-"""
-    add_global_oa_cuts(model, master::_LOAMaster, result::NamedTuple,
-        method::LOA)
-
-Add a slacked OA cut to `master` for every nonlinear global (non-disjunct)
-constraint of `model`, linearized at `result.linearization_point`.
-Variable bounds, linear functions, and reformulation constraints are
-skipped.
-"""
-function add_global_oa_cuts(
-    model::JuMP.AbstractModel,
-    master::_LOAMaster,
-    result::NamedTuple,
-    method::LOA
-    )
-    penalty_sign = _penalty_sign(Val(master.objective_sense))
-    variable_type = JuMP.variable_ref_type(typeof(model))
-    reform_set = is_gdp_model(model) ?
-        Set(_reformulation_constraints(model)) : Set()
-    for (F, S) in JuMP.list_of_constraint_types(model)
-        F === variable_type && continue
-        _is_linear_F(F) && continue
-        for cref in JuMP.all_constraints(model, F, S)
-            cref in reform_set && continue
-            con = JuMP.constraint_object(cref)
-            con isa JuMP.ScalarConstraint || continue
-            linearization = _linearize_at(con.func,
-                result.linearization_point, master.variable_map)
-            _add_global_oa_row(master, linearization, con.set,
-                method, penalty_sign)
-        end
-    end
-    return
-end
-
-# Iterate each active disjunct's disjunct constraints, invoking
-# `f(binary_ref, active, constraint)` per constraint. Shared by the base
-# and InfiniteOpt `add_disjunct_oa_cuts` drivers so neither reimplements
-# the active-disjunct walk.
-function _each_active_disjunct_constraint(f, model, master, result)
-    for (indicator, active) in result.combination
-        is_active(active) || continue
-        haskey(_indicator_to_constraints(model), indicator) || continue
-        for cref in _indicator_to_constraints(model)[indicator]
-            cref isa DisjunctConstraintRef || continue
-            constraint = _disjunct_constraints(model)[
-                JuMP.index(cref)].constraint
-            f(master.binary_map[indicator], active, constraint)
-        end
-    end
-    return
-end
-
-"""
-    add_disjunct_oa_cuts(model, master::_LOAMaster, result::NamedTuple,
-        method::LOA)
-
-Add a slacked OA cut to `master` for each active disjunct's nonlinear
-constraints, linearized at `result.linearization_point` and gated to
-match the inner reformulation. Emits one cut per constraint.
-"""
-function add_disjunct_oa_cuts(
-    model::JuMP.AbstractModel,
-    master::_LOAMaster,
-    result::NamedTuple,
-    method::LOA
-    )
-    penalty_sign = _penalty_sign(Val(master.objective_sense))
-    _each_active_disjunct_constraint(model, master,
-        result) do binary_ref, _active, constraint
-        _add_oa_cut_for_constraint(constraint, master, binary_ref,
-            result.linearization_point, master.variable_map, method,
-            penalty_sign)
-    end
-    return
-end
-
 # Fresh penalized slack added to the master objective. Shared by the
 # disjunct, global, and objective cuts so a nonconvex (invalid)
 # linearization can't make the master infeasible.
@@ -653,27 +568,6 @@ function _penalized_slack(master::_LOAMaster, method::LOA, penalty_sign::Int)
         JuMP.objective_function(master.model) +
             penalty_sign * method.oa_penalty * slack)
     return slack
-end
-
-# Linearize the constraint at `linearization_point`, then emit slacked OA
-# cut(s) gated to match the inner reformulation (Big-M / MBM or Hull).
-# Linear constraints are exact via the reformulation and skipped.
-function _add_oa_cut_for_constraint(
-    constraint::JuMP.AbstractConstraint,
-    master::_LOAMaster,
-    binary_ref,
-    linearization_point::AbstractDict,
-    var_map::AbstractDict,
-    method::LOA,
-    penalty_sign::Int
-    )
-    _is_linear_F(typeof(constraint.func)) && return
-    linearization = _linearize_at(
-        constraint.func, linearization_point, var_map)
-    _emit_disjunct_oa_cut(method.inner_method,
-        constraint.set, master, binary_ref, linearization, method,
-        penalty_sign)
-    return
 end
 
 # Extract RHS from an MOI set.
@@ -752,9 +646,3 @@ function _add_global_oa_row(master::_LOAMaster, lin, set, ::LOA, ::Int)
     JuMP.@constraint(master.model, lin in set)
     return
 end
-
-# Is this indicator active anywhere? Finite: a `Bool`; infinite: a
-# per-support `Vector{Bool}`. Skips disjuncts that are off everywhere.
-is_active(active::Bool) = active
-is_active(active::AbstractVector{Bool}) = any(active)
-

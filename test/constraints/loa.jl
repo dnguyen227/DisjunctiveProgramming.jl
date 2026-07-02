@@ -58,16 +58,17 @@ function test_no_good_cut()
     @disjunction(model, Y)
 
     DP.reformulate_model(model, BigM(1e9))
-    master = DP.build_loa_master(
-        model, LOA(HiGHS.Optimizer))
+    method = LOA(HiGHS.Optimizer)
+    problem = DP.build_loa_problem(model, method)
+    master = DP._build_loa_master(problem, method)
     master_model = master.model
 
-    combo = Dict(Y[1] => true, Y[2] => false)
+    combo = DP._binary_combination(model, Dict(Y[1] => true, Y[2] => false))
 
     num_cons_before = length(JuMP.all_constraints(
         master_model;
         include_variable_in_set_constraints = false))
-    DP.avoid_combination(master.model, combo, master.binary_map)
+    DP.avoid_combination(master.model, combo, master.variable_map)
     num_cons_after = length(JuMP.all_constraints(
         master_model;
         include_variable_in_set_constraints = false))
@@ -158,7 +159,7 @@ end
 function test_loa_nonlinear_global()
     # max x s.t. x^2 <= 25 (global), (x <= 3) ∨ (x <= 8), 0 <= x <= 10.
     # Disjunct Y[2] permits x up to 8 but the global x^2 <= 25 bounds
-    # x to 5. Verifies that `add_global_oa_cuts` emits the
+    # x to 5. Verifies that the global-cut pass emits the
     # linearization of the global into the master without breaking
     # the loop. Result must hit the global-binding optimum.
     ipopt = optimizer_with_attributes(Ipopt.Optimizer,
@@ -181,9 +182,9 @@ function test_loa_nonlinear_global()
 end
 
 function test_loa_complement_indicator_nonlinear_disjunct()
-    # Regression: complement-form indicators store `1 - y_base` (an
-    # AffExpr) in `binary_map`. When the complement disjunct has a
-    # nonlinear constraint, `add_disjunct_oa_cuts` feeds that AffExpr
+    # Regression: complement-form indicators carry `1 - y_base` (an
+    # AffExpr) as their binary reference. When the complement disjunct has a
+    # nonlinear constraint, the disjunct-cut pass feeds that AffExpr
     # straight into the OA cut gating term `M(1 - binary)`, which must
     # accept an AffExpr binary (not just a plain variable ref).
     #
@@ -458,11 +459,11 @@ function test_loa_hull_complement_nonlinear()
     @test objective_value(model) ≈ 8.0 atol = 1e-3
 end
 
-function test_loa_hull_nested_sink()
+function test_loa_hull_nested_disaggregation_map()
     # The inner disjunction (over y) is a disjunct of the outer (gated by
-    # z[1]). Hull's nested redispatch must propagate the LOA sink so the
-    # inner disaggregations are recorded, else LOA-Hull emits the nested
-    # cut on the aggregated variable.
+    # z[1]). Hull's nested redispatch must propagate the LOA
+    # disaggregation map so the inner disaggregations are recorded, else
+    # LOA-Hull emits the nested cut on the aggregated variable.
     model = GDPModel()
     @variable(model, 0 <= x <= 10)
     @variable(model, y[1:2], Logical)
@@ -472,10 +473,10 @@ function test_loa_hull_nested_sink()
     @disjunction(model, y, Disjunct(z[1]))
     @constraint(model, x <= 1, Disjunct(z[2]))
     @disjunction(model, z)
-    sink = Dict{Any, Any}()
-    DP.reformulate_model(model, Hull(; sink = sink))
-    @test haskey(sink, (x, y[1]))
-    @test haskey(sink, (x, y[2]))
+    disaggregations = Dict{Any, Any}()
+    DP.reformulate_model(model, Hull(; disaggregation_map = disaggregations))
+    @test haskey(disaggregations, (x, y[1]))
+    @test haskey(disaggregations, (x, y[2]))
 end
 
 function test_reformulate_after_loa_restores_binaries()
@@ -527,6 +528,6 @@ end
     test_loa_hull_nonlinear_global()
     test_loa_hull_nonlinear_disjunct()
     test_loa_hull_complement_nonlinear()
-    test_loa_hull_nested_sink()
+    test_loa_hull_nested_disaggregation_map()
     test_reformulate_after_loa_restores_binaries()
 end

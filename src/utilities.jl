@@ -152,11 +152,12 @@ solution. The added constraint
     Σ_{j active} (1 - y_j) + Σ_{j inactive} y_j ≥ 1
 forces at least one indicator to differ from `combination`.
 
-`combination` maps `LogicalVariableRef` → `Bool` (whether each
-indicator was active). The 3-arg form lets you supply an explicit
-`binary_map` (defaulting to `_indicator_to_binary(model)`) when the
-binaries used in the cut belong to a copy of the original model
-(e.g. an LOA master).
+`combination` maps `LogicalVariableRef` (or a binary variable) →
+`Bool` (whether it was active). The 3-arg form lets you supply an
+explicit `binary_map` (defaulting to `_indicator_to_binary(model)`)
+translating each combination key to the binary used in the cut, e.g.
+when the binaries belong to a copy of the original model (an LOA
+master).
 
 Returns the constraint reference of the added cut.
 """
