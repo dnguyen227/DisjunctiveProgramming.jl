@@ -50,13 +50,11 @@ end
 function test_oa_cut_terms()
     # The `<= 0` cut directions per set, at a scalar linearization value
     # of 5: LessThan/GreaterThan give one signed direction, EqualTo and
-    # Interval give both, unknown sets fall back to RHS 0.
+    # Interval give both.
     @test DP._oa_cut_terms(MOI.LessThan(2.0), 5.0) == (3.0,)
     @test DP._oa_cut_terms(MOI.GreaterThan(2.0), 5.0) == (-3.0,)
     @test DP._oa_cut_terms(MOI.EqualTo(2.0), 5.0) == (3.0, -3.0)
     @test DP._oa_cut_terms(MOI.Interval(1.0, 4.0), 5.0) == (1.0, -4.0)
-    @test DP._set_rhs(MOI.ZeroOne()) == 0.0
-    @test DP._oa_cut_terms(MOI.ZeroOne(), 5.0) == (5.0,)
 end
 
 function test_no_good_cut()

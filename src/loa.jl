@@ -573,16 +573,15 @@ end
 # Extract RHS from an MOI set.
 _set_rhs(s::Union{_MOI.LessThan, _MOI.GreaterThan, _MOI.EqualTo}) =
     _MOI.constant(s)
-_set_rhs(::Any) = 0.0
 
 # The `<= 0` directions of an OA cut for `set`: `lin - rhs` for LessThan,
 # `rhs - lin` for GreaterThan, both for EqualTo / Interval. The caller
 # adds the gating, slack, and (for Hull) disaggregation per direction.
+_oa_cut_terms(set::_MOI.LessThan, lin) = (lin - _set_rhs(set),)
 _oa_cut_terms(set::_MOI.GreaterThan, lin) = (_set_rhs(set) - lin,)
 _oa_cut_terms(set::_MOI.EqualTo, lin) =
     (lin - _MOI.constant(set), _MOI.constant(set) - lin)
 _oa_cut_terms(set::_MOI.Interval, lin) = (lin - set.upper, set.lower - lin)
-_oa_cut_terms(set, lin) = (lin - _set_rhs(set),)
 
 # Big-M / MBM disjunct cut: each direction slacked and gated by
 # `M(1 - binary)`.
@@ -627,12 +626,11 @@ function _emit_disjunct_oa_cut(
 end
 
 # Slacked global OA row(s): each direction carries a penalized slack so a
-# nonconvex linearization can't make the master infeasible. Unknown sets
-# fall back to a hard cut.
+# nonconvex linearization can't make the master infeasible.
 function _add_global_oa_row(
     master::_LOAMaster,
     lin,
-    set::Union{_MOI.LessThan, _MOI.GreaterThan, _MOI.EqualTo, _MOI.Interval},
+    set,
     method::LOA,
     penalty_sign::Int
     )
@@ -640,9 +638,5 @@ function _add_global_oa_row(
     for term in _oa_cut_terms(set, lin)
         JuMP.@constraint(master.model, term <= slack)
     end
-    return
-end
-function _add_global_oa_row(master::_LOAMaster, lin, set, ::LOA, ::Int)
-    JuMP.@constraint(master.model, lin in set)
     return
 end

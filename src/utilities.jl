@@ -612,7 +612,7 @@ function _linearize_at(
         nlp, _MOI.Nonlinear.SparseReverseMode(), ord)
     _MOI.initialize(evaluator, [:Grad])
 
-    xk_vec = [_unwrap_scalar(get(xk, v, zero(T))) for v in vars]
+    xk_vec = [get(xk, v, zero(T)) for v in vars]
     f_xk = _MOI.eval_objective(evaluator, xk_vec)
     grad = zeros(T, n)
     _MOI.eval_objective_gradient(evaluator, grad, xk_vec)
@@ -629,8 +629,3 @@ function _linearize_at(
     end
     return result
 end
-
-# Unwrap a 1-element `Vector` to its scalar; scalars pass through
-# (`extract_solution` returns length-1 vectors for scalar variables).
-_unwrap_scalar(v::Real) = v
-_unwrap_scalar(v::AbstractVector) = only(v)

@@ -309,6 +309,54 @@ function test_to_nlp_expr()
     @test DP._to_nlp_expr(42, idx) == 42
 end
 
+function test_fix_unfix_indicator()
+    # `fix_indicator` drives the backing binary: a plain indicator fixes
+    # it at the value, a complement indicator fixes the underlying
+    # binary at the inverse. `unfix_indicator` undoes both forms.
+    model = GDPModel()
+    @variable(model, x)
+    @variable(model, Y1, Logical)
+    @variable(model, Y2, Logical, logical_complement = Y1)
+    @constraint(model, x <= 3, Disjunct(Y1))
+    @constraint(model, x >= 5, Disjunct(Y2))
+    @disjunction(model, [Y1, Y2])
+    DP.reformulate_model(model, BigM())
+    y1 = DP._indicator_to_binary(model)[Y1]
+
+    DP.fix_indicator(model, Y1, true)
+    @test JuMP.is_fixed(y1) && JuMP.fix_value(y1) == 1.0
+    DP.fix_indicator(model, Y1, false)
+    @test JuMP.fix_value(y1) == 0.0
+    DP.unfix_indicator(model, Y1)
+    @test !JuMP.is_fixed(y1)
+
+    DP.fix_indicator(model, Y2, true)     # complement: underlying -> 0
+    @test JuMP.fix_value(y1) == 0.0
+    DP.fix_indicator(model, Y2, false)
+    @test JuMP.fix_value(y1) == 1.0
+    DP.unfix_indicator(model, Y2)
+    @test !JuMP.is_fixed(y1)
+end
+
+function test_avoid_combination_default_map()
+    # The 2-arg form resolves binaries via the model's own
+    # indicator-to-binary map. Excluding (Y1 active, Y2 inactive) adds
+    # (1 - y1) + y2 >= 1, i.e. normalized -y1 + y2 >= 0.
+    model = GDPModel()
+    @variable(model, x)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x >= 5, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    DP.reformulate_model(model, BigM())
+    binary_map = DP._indicator_to_binary(model)
+
+    cref = DP.avoid_combination(model, Dict(Y[1] => true, Y[2] => false))
+    @test JuMP.normalized_coefficient(cref, binary_map[Y[1]]) == -1.0
+    @test JuMP.normalized_coefficient(cref, binary_map[Y[2]]) == 1.0
+    @test JuMP.normalized_rhs(cref) == 0.0
+end
+
 @testset "Utility Functions" begin
     test_all_variables()
     test_collect_all_vars()
@@ -320,4 +368,6 @@ end
     test_linearize_nonlinear_sin()
     test_linearize_nonlinear_multivar()
     test_to_nlp_expr()
+    test_fix_unfix_indicator()
+    test_avoid_combination_default_map()
 end
