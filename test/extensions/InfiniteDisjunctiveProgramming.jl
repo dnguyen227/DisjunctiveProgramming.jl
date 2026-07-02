@@ -852,13 +852,13 @@ function test_CuttingPlanes_multiparameter()
 
     @objective(model, Min, ∫(∫(x, t), s))
 
-    # Should not throw
-    @test optimize!(model,
-        gdp_method = CuttingPlanes(
-            HiGHS.Optimizer; max_iter = 5)
-    ) isa Nothing
+    optimize!(model,
+        gdp_method = CuttingPlanes(HiGHS.Optimizer; max_iter = 5))
     @test termination_status(model) in
         [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
+    # Y[2] (x <= 3) is the minimizer: x = 0 across (t, s) → ∫∫x = 0.
+    @test objective_value(model) ≈ 0.0 atol = 1e-4
+    @test all(isapprox.(value(x), 0.0; atol = 1e-6))
 end
 
 function test_loa_infinite_nonlinear_global()
@@ -887,6 +887,8 @@ function test_loa_infinite_nonlinear_global()
     @test termination_status(model) in
         (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
     @test objective_value(model) ≈ 5.0 atol = 1e-2
+    @test all(value(Y[2]))
+    @test all(isapprox.(value(x), 5.0; atol = 1e-2))
 end
 
 function test_loa_infinite_complement_indicator()
@@ -1036,6 +1038,32 @@ function test_loa_infinite_aggregate_global()
     @test objective_value(model) ≈ 1.0 atol = 1e-2
 end
 
+function test_loa_infinite_aggregate_disjunct()
+    # An aggregate (measure) constraint INSIDE a disjunct: it
+    # transcribes to a single scalar row that must be gated by the
+    # indicator's binary. max ∫x dt with Y[1]: ∫(x^2, t) <= 4 and
+    # Y[2]: x <= 0. Y[1] is optimal: constant x = 2 gives ∫x^2 = 4
+    # and ∫x dt = 2 (Y[2] caps the objective at 0). Big-M tightening
+    # is disabled: it needs bounds of every constraint variable and a
+    # `MeasureRef` has none.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    model = InfiniteGDPModel(ipopt)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 10)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, ∫(x^2, t) <= 4, Disjunct(Y[1]))
+    @constraint(model, x <= 0, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, ∫(x, t))
+    optimize!(model, gdp_method = LOA(ipopt;
+        mip_optimizer = HiGHS.Optimizer, inner_method = BigM(1e4, false)))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 2.0 atol = 1e-2
+    @test value(Y[1])
+end
+
 function test_loa_infinite_iteration_loop()
     # Force the InfiniteModel LOA main loop to fix combinations that
     # vary per support. Two disjunctions over disjoint x/z half-lines
@@ -1064,6 +1092,10 @@ function test_loa_infinite_iteration_loop()
     @test termination_status(model) in
         (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
     @test objective_value(model) ≈ -10.0 atol = 1e-3
+    @test all(value(Y[1]))
+    @test all(value(W[2]))
+    @test all(isapprox.(value(x), 0.0; atol = 1e-6))
+    @test all(isapprox.(value(z), 10.0; atol = 1e-6))
 end
 
 function test_loa_infinite_hull_linear()
@@ -1109,6 +1141,8 @@ function test_loa_infinite_hull_nonlinear_disjunct()
         mip_optimizer = HiGHS.Optimizer, inner_method = Hull()))
     @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
     @test objective_value(model) ≈ 8.0 atol = 1e-2
+    @test all(value(Y[2]))
+    @test all(isapprox.(value(x), 8.0; atol = 1e-2))
 end
 
 function test_loa_infinite_hull_complement_nonlinear()
@@ -1237,6 +1271,7 @@ end
     @testset "LOA" begin
         test_loa_infinite_nonlinear_global()
         test_loa_infinite_aggregate_global()
+        test_loa_infinite_aggregate_disjunct()
         test_loa_infinite_complement_indicator()
         test_loa_infinite_complement_nonlinear_disjunct()
         test_loa_infinite_multidim_parameter()

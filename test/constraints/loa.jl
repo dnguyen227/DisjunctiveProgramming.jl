@@ -39,14 +39,24 @@ function test_set_covering_combos()
 
     combos = DP._set_covering_combinations(model)
 
-    # Should cover both Y[1] and Y[2]
-    all_active = Set()
-    for combo in combos
-        for (ind, active) in combo
-            active && push!(all_active, ind)
-        end
-    end
-    @test length(all_active) == 2
+    # K = 2 combinations, each activating exactly one indicator, and
+    # together covering both.
+    @test length(combos) == 2
+    @test all(count(values(combo)) == 1 for combo in combos)
+    @test combos[1][Y[1]] && !combos[1][Y[2]]
+    @test combos[2][Y[2]] && !combos[2][Y[1]]
+end
+
+function test_oa_cut_terms()
+    # The `<= 0` cut directions per set, at a scalar linearization value
+    # of 5: LessThan/GreaterThan give one signed direction, EqualTo and
+    # Interval give both, unknown sets fall back to RHS 0.
+    @test DP._oa_cut_terms(MOI.LessThan(2.0), 5.0) == (3.0,)
+    @test DP._oa_cut_terms(MOI.GreaterThan(2.0), 5.0) == (-3.0,)
+    @test DP._oa_cut_terms(MOI.EqualTo(2.0), 5.0) == (3.0, -3.0)
+    @test DP._oa_cut_terms(MOI.Interval(1.0, 4.0), 5.0) == (1.0, -4.0)
+    @test DP._set_rhs(MOI.ZeroOne()) == 0.0
+    @test DP._oa_cut_terms(MOI.ZeroOne(), 5.0) == (5.0,)
 end
 
 function test_no_good_cut()
@@ -68,16 +78,25 @@ function test_no_good_cut()
     num_cons_before = length(JuMP.all_constraints(
         master_model;
         include_variable_in_set_constraints = false))
-    DP.avoid_combination(master.model, combo, master.variable_map)
+    cref = DP.avoid_combination(master.model, combo, master.variable_map)
     num_cons_after = length(JuMP.all_constraints(
         master_model;
         include_variable_in_set_constraints = false))
 
     @test num_cons_after == num_cons_before + 1
+    # The cut is (1 - y1) + y2 >= 1, i.e. normalized -y1 + y2 >= 0:
+    # excludes exactly the (Y1 active, Y2 inactive) combination.
+    binary_map = DP._indicator_to_binary(model)
+    y1 = master.variable_map[binary_map[Y[1]]]
+    y2 = master.variable_map[binary_map[Y[2]]]
+    @test JuMP.normalized_coefficient(cref, y1) == -1.0
+    @test JuMP.normalized_coefficient(cref, y2) == 1.0
+    @test JuMP.normalized_rhs(cref) == 0.0
 end
 
 function test_loa_reformulate_simple()
     model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
     @variable(model, 0 <= x <= 10)
     @variable(model, Y[1:2], Logical)
     @constraint(model, x <= 3, Disjunct(Y[1]))
@@ -89,6 +108,10 @@ function test_loa_reformulate_simple()
     DP.reformulate_model(model, method)
 
     @test DP._ready_to_optimize(model)
+    # The committed model solves to the LOA incumbent: x = 7 via Y[2].
+    JuMP.optimize!(model, ignore_optimize_hook = true)
+    @test objective_value(model) ≈ 7.0 atol = 1e-6
+    @test value(x) ≈ 7.0 atol = 1e-6
 end
 
 function test_loa_solve_simple()
@@ -179,6 +202,121 @@ function test_loa_nonlinear_global()
         gdp_method = LOA(juniper; mip_optimizer = HiGHS.Optimizer))
     @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
     @test objective_value(model) ≈ 5.0 atol = 1e-3
+end
+
+function test_loa_nonlinear_equality_global()
+    # max x s.t. x^2 == 25 (global nonlinear equality), (x <= 3) ∨
+    # (x <= 8), 0 <= x <= 10. The Y[1] seed is NLP-infeasible (x <= 3
+    # contradicts x = 5), so NLPF slacks the inequality while keeping
+    # the equality exact. The equality emits BOTH cut directions into
+    # the master. Optimum: x = 5 via Y[2].
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    model = GDPModel(ipopt)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @constraint(model, x^2 == 25)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 8, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    optimize!(model,
+        gdp_method = LOA(ipopt; mip_optimizer = HiGHS.Optimizer))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 5.0 atol = 1e-3
+    @test value(x) ≈ 5.0 atol = 1e-3
+    @test value(Y[2]) ≈ 1.0 atol = 1e-6
+end
+
+function test_loa_nonlinear_equality_disjunct()
+    # Nonlinear equality inside a disjunct: Y1: x <= 3, Y2: x^2 == 64.
+    # The disjunct cut emits both gated directions. Optimum: x = 8.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = GDPModel(juniper)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x^2 == 64, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    optimize!(model,
+        gdp_method = LOA(juniper; mip_optimizer = HiGHS.Optimizer))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 8.0 atol = 1e-3
+    @test value(Y[2]) ≈ 1.0 atol = 1e-6
+end
+
+function test_loa_nonlinear_interval_disjunct()
+    # Nonlinear Interval constraint inside a disjunct: Y1: x <= 3,
+    # Y2: 36 <= x^2 <= 64. The disjunct cut emits both gated
+    # directions. Optimum: x = 8 via Y2.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = GDPModel(juniper)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, 36 <= x^2 <= 64, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    optimize!(model,
+        gdp_method = LOA(juniper; mip_optimizer = HiGHS.Optimizer))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 8.0 atol = 1e-3
+    @test value(Y[2]) ≈ 1.0 atol = 1e-6
+end
+
+function test_loa_restores_prior_time_limit()
+    # A time limit set by the user before LOA must survive the loop's
+    # per-solve caps when only `iteration_time_limit` is finite (the
+    # `_restore_time_limit(::Real)` path).
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    set_time_limit_sec(model, 90.0)
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer;
+        iteration_time_limit = 60.0, time_limit = Inf))
+    @test time_limit_sec(model) == 90.0
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 7.0 atol = 1e-4
+end
+
+function test_loa_limit_hit_report()
+    # Stop the main loop on `max_iter = 1` after the master has produced
+    # a bound: the report must label the run "limit hit" (not converged),
+    # and the single loop iteration still finds the off-diagonal optimum.
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, 0 <= z <= 10)
+    @variable(model, Y[1:2], Logical)
+    @variable(model, W[1:2], Logical)
+    @constraint(model, x <= 4, Disjunct(Y[1]))
+    @constraint(model, x >= 6, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @constraint(model, z <= 4, Disjunct(W[1]))
+    @constraint(model, z >= 6, Disjunct(W[2]))
+    @disjunction(model, W)
+    @objective(model, Min, x - z)
+    method = LOA(HiGHS.Optimizer; max_iter = 1)
+    @test_logs (:info, r"limit hit") match_mode = :any begin
+        DP.reformulate_model(model, method)
+    end
+    JuMP.optimize!(model, ignore_optimize_hook = true)
+    @test objective_value(model) ≈ -10.0 atol = 1e-4
 end
 
 function test_loa_complement_indicator_nonlinear_disjunct()
@@ -510,6 +648,7 @@ end
 @testset "LOA" begin
     test_loa_datatype()
     test_set_covering_combos()
+    test_oa_cut_terms()
     test_no_good_cut()
     test_loa_reformulate_simple()
     test_loa_solve_simple()
@@ -517,6 +656,11 @@ end
     test_loa_solve_two_disjunctions()
     test_loa_error_fallback()
     test_loa_nonlinear_global()
+    test_loa_nonlinear_equality_global()
+    test_loa_nonlinear_equality_disjunct()
+    test_loa_nonlinear_interval_disjunct()
+    test_loa_restores_prior_time_limit()
+    test_loa_limit_hit_report()
     test_loa_complement_indicator_nonlinear_disjunct()
     test_loa_nlpf_infeasible_disjunct()
     test_loa_sense_primitives()
