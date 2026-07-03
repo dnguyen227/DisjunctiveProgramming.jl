@@ -401,6 +401,49 @@ function test_loa_nlpf_infeasible_disjunct()
     @test value(Y[1]) ≈ 0.0 atol = 1e-6
 end
 
+function test_loa_solve_nlp_infeasible_fallback()
+    # `_solve_nlp` fallback: both the primary NLP and NLPF are
+    # infeasible at the fixed combination, so it returns the infeasible
+    # sentinel (objective = Inf, feasible = false, empty linearization
+    # point, combination echoed back unchanged).
+    #
+    # The global x^2 == 400 is unsatisfiable under 0 <= x <= 10 (needs
+    # x = 20). It is NONLINEAR, so it never enters the master and the
+    # primary NLP is the one that catches it as infeasible. It is an
+    # EQUALITY, so NLPF does not slack it and NLPF is infeasible too.
+    # This is what distinguishes the path from
+    # test_loa_no_feasible_incumbent, whose LINEAR equality makes the
+    # master infeasible first, short-circuiting the NLP solve entirely.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    model = GDPModel()
+    @variable(model, 0 <= x <= 10)
+    @constraint(model, x^2 == 400)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+
+    DP.reformulate_model(model, BigM(1e9))
+    method = LOA(ipopt)
+    problem = DP.build_loa_problem(model, method)
+    DP._relax_binaries(problem)
+    JuMP.set_optimizer(problem.nlp, method.nlp_optimizer)
+    JuMP.set_silent(problem.nlp)
+
+    binary_map = DP._indicator_to_binary(model)
+    combination = Dict(
+        DP._underlying_binary(binary_map[Y[1]]) => false,
+        DP._underlying_binary(binary_map[Y[2]]) => true)
+
+    result = DP._solve_nlp(problem, combination, method)
+    @test result.feasible == false
+    @test result.objective == Inf
+    @test isempty(result.linearization_point)
+    @test result.combination === combination
+end
+
 function test_loa_sense_primitives()
     # Sense-dispatched primitives the main loop reads through. The
     # finite/infinite solve tests cover every branch except the
@@ -687,6 +730,7 @@ end
     test_loa_limit_hit_report()
     test_loa_complement_indicator_nonlinear_disjunct()
     test_loa_nlpf_infeasible_disjunct()
+    test_loa_solve_nlp_infeasible_fallback()
     test_loa_sense_primitives()
     test_loa_iteration_loop()
     test_loa_time_limits()
