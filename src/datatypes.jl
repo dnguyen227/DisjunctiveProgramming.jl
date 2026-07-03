@@ -659,18 +659,21 @@ struct _LOAProblem{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, T}
         _MOI.AbstractScalarSet}}
     disaggregation_map::Union{Nothing,
         Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}}
-end
 
-# Outer constructor supplying the value type `T` from the NLP model.
-function _LOAProblem(
-    nlp::M,
-    binaries::Vector{V},
-    disjunct_constraints::Vector,
-    global_constraints::Vector,
-    disaggregation_map
-    ) where {M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef}
-    return _LOAProblem{M, V, JuMP.value_type(M)}(nlp, binaries,
-        disjunct_constraints, global_constraints, disaggregation_map)
+    # Inner constructor deriving the value type `T` from the NLP model.
+    # `T` only appears inside `Union` field types, so the default
+    # constructors could be called without binding it (Aqua
+    # unbound_args); this replaces them.
+    function _LOAProblem(
+        nlp::M,
+        binaries::Vector{V},
+        disjunct_constraints::Vector,
+        global_constraints::Vector,
+        disaggregation_map
+        ) where {M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef}
+        return new{M, V, JuMP.value_type(M)}(nlp, binaries,
+            disjunct_constraints, global_constraints, disaggregation_map)
+    end
 end
 
 # The LOA master MILP plus the NLP-to-master variable map.
