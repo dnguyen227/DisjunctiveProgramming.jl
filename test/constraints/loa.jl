@@ -9,18 +9,20 @@ function test_loa_datatype()
     @test method.M_value == 1e9
     @test method.max_slack == 1000.0
     @test method.oa_penalty == 1000.0
+    @test method.use_nlpf == true
     @test method.convergence_tol == 1e-6
     @test method.slack_tol == 1e-4
     @test method.inner_method isa BigM
     @test method.inner_method.value == 1e9
 
     method = LOA(HiGHS.Optimizer; max_iter = 50, M_value = 1e6,
-        max_slack = 500.0, oa_penalty = 200.0,
+        max_slack = 500.0, oa_penalty = 200.0, use_nlpf = false,
         convergence_tol = 1e-4, slack_tol = 1e-3)
     @test method.max_iter == 50
     @test method.M_value == 1e6
     @test method.max_slack == 500.0
     @test method.oa_penalty == 200.0
+    @test method.use_nlpf == false
     @test method.convergence_tol == 1e-4
     @test method.slack_tol == 1e-3
     @test method.inner_method isa BigM
@@ -401,6 +403,59 @@ function test_loa_nlpf_infeasible_disjunct()
     @test value(Y[1]) ≈ 0.0 atol = 1e-6
 end
 
+function test_loa_nlpf_disabled()
+    # `use_nlpf = false` skips the NLPF fall-through entirely: an
+    # NLP-infeasible combination returns the bare infeasible sentinel
+    # (empty linearization point), so it contributes only its no-good
+    # cut. Same setup as test_loa_nlpf_infeasible_disjunct, where NLPF
+    # WOULD succeed (x = 10, u = 100) and return a nonempty
+    # linearization point — the empty point proves NLPF was skipped.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    model = GDPModel()
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x^2 >= 200, Disjunct(Y[1]))
+    @constraint(model, x <= 5, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+
+    DP.reformulate_model(model, BigM(1e9))
+    method = LOA(ipopt; use_nlpf = false)
+    problem = DP.build_loa_problem(model, method)
+    DP._relax_binaries(problem)
+    JuMP.set_optimizer(problem.nlp, method.nlp_optimizer)
+    JuMP.set_silent(problem.nlp)
+
+    binary_map = DP._indicator_to_binary(model)
+    combination = Dict(
+        DP._underlying_binary(binary_map[Y[1]]) => true,
+        DP._underlying_binary(binary_map[Y[2]]) => false)
+
+    result = DP._solve_nlp(problem, combination, method)
+    @test result.feasible == false
+    @test result.objective == Inf
+    @test isempty(result.linearization_point)
+
+    # End-to-end: with NLPF off, LOA still reaches the Y2 optimum x = 5
+    # off no-good cuts alone.
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt, "log_levels" => [])
+    model = GDPModel(juniper)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x^2 >= 200, Disjunct(Y[1]))
+    @constraint(model, x <= 5, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    optimize!(model, gdp_method = LOA(juniper;
+        mip_optimizer = HiGHS.Optimizer, use_nlpf = false))
+    @test termination_status(model) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+    @test objective_value(model) ≈ 5.0 atol = 1e-3
+    @test value(Y[2]) ≈ 1.0 atol = 1e-6
+end
+
 function test_loa_solve_nlp_infeasible_fallback()
     # `_solve_nlp` fallback: both the primary NLP and NLPF are
     # infeasible at the fixed combination, so it returns the infeasible
@@ -730,6 +785,7 @@ end
     test_loa_limit_hit_report()
     test_loa_complement_indicator_nonlinear_disjunct()
     test_loa_nlpf_infeasible_disjunct()
+    test_loa_nlpf_disabled()
     test_loa_solve_nlp_infeasible_fallback()
     test_loa_sense_primitives()
     test_loa_iteration_loop()

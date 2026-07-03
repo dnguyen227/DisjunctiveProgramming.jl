@@ -394,7 +394,7 @@ _transcribed_refs(x) = [x]
 
 # Index a per-support vector, broadcasting a single-element (finite)
 # vector across all supports.
-_at(values::AbstractVector, k::Int) =
+_at(values::Vector, k::Int) =
     length(values) == 1 ? values[1] : values[k]
 
 # Per-support transcribed binary references for an indicator: the
@@ -418,7 +418,8 @@ function _transcribed_disaggregation_map(
     model::InfiniteOpt.InfiniteModel,
     disaggregation_map
     )
-    result = Dict{Any, Any}()
+    result = Dict{Tuple{JuMP.VariableRef,
+        Union{JuMP.VariableRef, JuMP.AffExpr}}, JuMP.VariableRef}()
     for ((variable, indicator), disaggregated) in disaggregation_map
         binary_refs = _transcribed_binary_refs(model, indicator)
         variables = _transcribed_refs(
@@ -450,7 +451,8 @@ function DP.build_loa_problem(
     end
     unique!(binaries)
 
-    disjunct_constraints = Tuple{Any, Any, Any}[]
+    disjunct_constraints = Tuple{Union{JuMP.VariableRef, JuMP.AffExpr},
+        JuMP.AbstractJuMPScalar, _MOI.AbstractScalarSet}[]
     for (_, disjunction) in DP._disjunctions(model)
         for indicator in disjunction.constraint.indicators
             haskey(DP._indicator_to_constraints(model), indicator) ||
@@ -472,7 +474,8 @@ function DP.build_loa_problem(
         end
     end
 
-    global_constraints = Tuple{Any, Any}[]
+    global_constraints = Tuple{JuMP.AbstractJuMPScalar,
+        _MOI.AbstractScalarSet}[]
     reform_set = Set(DP._reformulation_constraints(model))
     for (F, S) in JuMP.list_of_constraint_types(model)
         F === InfiniteOpt.GeneralVariableRef && continue

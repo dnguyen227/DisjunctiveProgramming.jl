@@ -184,10 +184,9 @@ end
 # disjuncts of a single-binary disjunction (`y` and its `1 - y`
 # complement) stay distinct. Purely linear disjuncts need no cover: the
 # inner reformulation already places them in the master exactly.
-function _cover_disjuncts(problem::_LOAProblem)
-    V = eltype(problem.binaries)
+function _cover_disjuncts(problem::_LOAProblem{M, V, T}) where {M, V, T}
     seen = Set{Tuple{V, Bool}}()
-    disjuncts = Any[]
+    disjuncts = Union{V, JuMP.GenericAffExpr{T, V}}[]
     for (binary_ref, _, _) in problem.disjunct_constraints
         key = (_underlying_binary(binary_ref),
             _underlying_value(binary_ref, true))
@@ -258,13 +257,15 @@ function build_loa_problem(
     disaggregation_map = nothing
     )
     V = JuMP.variable_ref_type(typeof(model))
+    T = JuMP.value_type(typeof(model))
     binary_map = _indicator_to_binary(model)
 
     binaries = V[_underlying_binary(binary_ref)
         for (_, binary_ref) in binary_map]
     unique!(binaries)
 
-    disjunct_constraints = Tuple{Any, Any, Any}[]
+    disjunct_constraints = Tuple{Union{V, JuMP.GenericAffExpr{T, V}},
+        JuMP.AbstractJuMPScalar, _MOI.AbstractScalarSet}[]
     for (_, disjunction) in _disjunctions(model)
         for indicator in disjunction.constraint.indicators
             haskey(_indicator_to_constraints(model), indicator) || continue
@@ -281,7 +282,8 @@ function build_loa_problem(
         end
     end
 
-    global_constraints = Tuple{Any, Any}[]
+    global_constraints = Tuple{JuMP.AbstractJuMPScalar,
+        _MOI.AbstractScalarSet}[]
     reform_set = Set(_reformulation_constraints(model))
     for (F, S) in JuMP.list_of_constraint_types(model)
         F === V && continue
@@ -295,7 +297,8 @@ function build_loa_problem(
     end
 
     binary_disaggregations = disaggregation_map === nothing ? nothing :
-        Dict((variable, binary_map[indicator]) => disaggregated
+        Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}(
+            (variable, binary_map[indicator]) => disaggregated
             for ((variable, indicator), disaggregated) in disaggregation_map)
     return _LOAProblem(model, binaries, disjunct_constraints,
         global_constraints, binary_disaggregations)
@@ -375,13 +378,12 @@ end
 # Master-space Hull disaggregator for the convex-hull cut emitter
 # (`nothing` for Big-M / MBM): remap the `(variable, binary_ref) ->
 # disaggregated variable` map into master refs.
-_build_disaggregator(::_LOAProblem, ::AbstractDict, ::Union{BigM, MBM}) =
-    nothing
+_build_disaggregator(::_LOAProblem, ::Dict, ::Union{BigM, MBM}) = nothing
 function _build_disaggregator(
     problem::_LOAProblem,
-    variable_map::AbstractDict,
+    variable_map::Dict{V, V},
     inner::Hull
-    )
+    ) where {V <: JuMP.AbstractVariableRef}
     hull = _Hull(inner, Set{valtype(variable_map)}())
     for ((variable, binary_ref), disaggregated) in problem.disaggregation_map
         hull.disjunct_variables[(variable_map[variable],
@@ -424,7 +426,8 @@ end
 
 # Solve the NLP at a fixed combination. If infeasible, fall
 # through to NLPF (a slacked version that always solves) so the master
-# still gets a linearization site, not just a no-good cut.
+# still gets a linearization site, not just a no-good cut. NLPF can be
+# switched off via `use_nlpf = false`.
 function _solve_nlp(
     problem::_LOAProblem,
     combination,
@@ -441,9 +444,12 @@ function _solve_nlp(
             objective = JuMP.objective_value(nlp), feasible = true)
     end
 
-    # Primary NLP infeasible — try NLPF.
-    nlpf = _solve_nlpf(problem, combination, method; deadline = deadline)
-    nlpf === nothing || return nlpf
+    # Primary NLP infeasible — try NLPF (unless disabled, in which case
+    # the combination contributes only its no-good cut).
+    if method.use_nlpf
+        nlpf = _solve_nlpf(problem, combination, method; deadline = deadline)
+        nlpf === nothing || return nlpf
+    end
 
     V = JuMP.variable_ref_type(typeof(nlp))
     T = JuMP.value_type(typeof(nlp))

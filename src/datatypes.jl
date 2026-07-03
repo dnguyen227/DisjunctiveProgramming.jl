@@ -419,7 +419,7 @@ struct Hull{T} <: AbstractReformulationMethod
     value::T
     # Internal: LOA installs a Dict here to collect the disaggregation
     # map during reformulation; `nothing` for every other use.
-    disaggregation_map::Any
+    disaggregation_map::Union{Nothing, AbstractDict}
     function Hull(ϵ::T = 1e-6; disaggregation_map = nothing) where {T}
         new{T}(ϵ, disaggregation_map)
     end
@@ -430,7 +430,7 @@ mutable struct _Hull{V <: JuMP.AbstractVariableRef, T} <: AbstractReformulationM
     value::T
     disjunction_variables::Dict{V, Vector{V}}
     disjunct_variables::Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}
-    disaggregation_map::Any
+    disaggregation_map::Union{Nothing, AbstractDict}
     function _Hull(method::Hull{T}, vrefs::Set{V}) where {T, V <: JuMP.AbstractVariableRef}
         new{V, T}(
             method.value,
@@ -592,6 +592,9 @@ iteration) and a master MILP accumulating OA and no-good cuts.
 - `M_value::T`: big-M for the disjunct OA cut gating term.
 - `max_slack::T`: upper bound per slack variable.
 - `oa_penalty::T`: penalty on slacks in the master objective.
+- `use_nlpf::Bool`: solve the NLPF feasibility subproblem when the
+  primary NLP is infeasible (default `true`). When `false`, an
+  infeasible combination contributes only its no-good cut, no OA cuts.
 - `convergence_tol::Float64`: relative gap tolerance for the early stop.
 - `slack_tol::Float64`: max total slack for which the bound still counts
   as converged (positive slack = nonconvex crossing, keep iterating).
@@ -608,6 +611,7 @@ struct LOA{O, P, R, T} <: AbstractReformulationMethod
     M_value::T
     max_slack::T
     oa_penalty::T
+    use_nlpf::Bool
     convergence_tol::Float64
     slack_tol::Float64
     iteration_time_limit::Float64
@@ -621,6 +625,7 @@ struct LOA{O, P, R, T} <: AbstractReformulationMethod
         max_slack::T = 1e3,
         oa_penalty::T = 1e3,
         inner_method::R = BigM(M_value),
+        use_nlpf::Bool = true,
         convergence_tol::Float64 = 1e-6,
         slack_tol::Float64 = 1e-4,
         iteration_time_limit::Float64 = Inf,
@@ -631,7 +636,7 @@ struct LOA{O, P, R, T} <: AbstractReformulationMethod
             "PSplit is not yet supported.")
         new{O, P, R, T}(nlp_optimizer, mip_optimizer, inner_method,
             max_iter, set_cover_max_iter, M_value, max_slack, oa_penalty,
-            convergence_tol, slack_tol,
+            use_nlpf, convergence_tol, slack_tol,
             iteration_time_limit, time_limit)
     end
 end
@@ -645,12 +650,27 @@ end
 # (`nothing` for Big-M / MBM). Built by `build_loa_problem`. The
 # set-covering seed generates its combinations on the fly from the
 # master, so none are stored here.
-struct _LOAProblem{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef}
+struct _LOAProblem{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, T}
     nlp::M
     binaries::Vector{V}
-    disjunct_constraints::Vector{Tuple{Any, Any, Any}}
-    global_constraints::Vector{Tuple{Any, Any}}
-    disaggregation_map::Any
+    disjunct_constraints::Vector{Tuple{Union{V, JuMP.GenericAffExpr{T, V}},
+        JuMP.AbstractJuMPScalar, _MOI.AbstractScalarSet}}
+    global_constraints::Vector{Tuple{JuMP.AbstractJuMPScalar,
+        _MOI.AbstractScalarSet}}
+    disaggregation_map::Union{Nothing,
+        Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}}
+end
+
+# Outer constructor supplying the value type `T` from the NLP model.
+function _LOAProblem(
+    nlp::M,
+    binaries::Vector{V},
+    disjunct_constraints::Vector,
+    global_constraints::Vector,
+    disaggregation_map
+    ) where {M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef}
+    return _LOAProblem{M, V, JuMP.value_type(M)}(nlp, binaries,
+        disjunct_constraints, global_constraints, disaggregation_map)
 end
 
 # The LOA master MILP plus the NLP-to-master variable map.
