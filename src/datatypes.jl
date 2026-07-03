@@ -587,6 +587,8 @@ iteration) and a master MILP accumulating OA and no-good cuts.
 - `mip_optimizer::P`: solver for the master MILP (default `nlp_optimizer`).
 - `inner_method::R`: NLP reformulation — `BigM`, `MBM`, or `Hull`.
 - `max_iter::Int`: max iterations after set-covering seeding.
+- `set_cover_max_iter::Int`: max iterations of the set-covering seed
+  loop.
 - `M_value::T`: big-M for the disjunct OA cut gating term.
 - `max_slack::T`: upper bound per slack variable.
 - `oa_penalty::T`: penalty on slacks in the master objective.
@@ -602,6 +604,7 @@ struct LOA{O, P, R, T} <: AbstractReformulationMethod
     mip_optimizer::P
     inner_method::R
     max_iter::Int
+    set_cover_max_iter::Int
     M_value::T
     max_slack::T
     oa_penalty::T
@@ -613,6 +616,7 @@ struct LOA{O, P, R, T} <: AbstractReformulationMethod
         nlp_optimizer::O;
         mip_optimizer::P = nlp_optimizer,
         max_iter::Int = 10,
+        set_cover_max_iter::Int = 8,
         M_value::T = 1e9,
         max_slack::T = 1e3,
         oa_penalty::T = 1e3,
@@ -626,7 +630,7 @@ struct LOA{O, P, R, T} <: AbstractReformulationMethod
             "LOA inner_method must be BigM, MBM, or Hull (got $R). " *
             "PSplit is not yet supported.")
         new{O, P, R, T}(nlp_optimizer, mip_optimizer, inner_method,
-            max_iter, M_value, max_slack, oa_penalty,
+            max_iter, set_cover_max_iter, M_value, max_slack, oa_penalty,
             convergence_tol, slack_tol,
             iteration_time_limit, time_limit)
     end
@@ -634,16 +638,16 @@ end
 
 # The problem the LOA loop operates on: the model solved as the NLP
 # subproblem, the binary variables backing the indicators, the
-# set-covering seed combinations, the nonlinear disjunct
-# `(binary_ref, function, set)` triples (`binary_ref` is the binary or
-# its `1 - y` complement expression), the nonlinear global
-# `(function, set)` pairs, and the `(variable, binary_ref) ->
+# nonlinear disjunct `(binary_ref, function, set)` triples (`binary_ref`
+# is the binary or its `1 - y` complement expression), the nonlinear
+# global `(function, set)` pairs, and the `(variable, binary_ref) ->
 # disaggregated variable` map from an inner Hull reformulation
-# (`nothing` for Big-M / MBM). Built by `build_loa_problem`.
+# (`nothing` for Big-M / MBM). Built by `build_loa_problem`. The
+# set-covering seed generates its combinations on the fly from the
+# master, so none are stored here.
 struct _LOAProblem{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef}
     nlp::M
     binaries::Vector{V}
-    covering_combinations::Vector{Dict{V, Bool}}
     disjunct_constraints::Vector{Tuple{Any, Any, Any}}
     global_constraints::Vector{Tuple{Any, Any}}
     disaggregation_map::Any

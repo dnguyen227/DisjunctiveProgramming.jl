@@ -408,25 +408,6 @@ function _transcribed_binary_refs(model::InfiniteOpt.InfiniteModel, indicator)
     return [1.0 - binary for binary in binaries]
 end
 
-# Transcribed combination for an InfiniteModel: every support of the
-# underlying transcribed binary takes the indicator's value.
-function _transcribed_combination(
-    model::InfiniteOpt.InfiniteModel,
-    combination
-    )
-    result = Dict{JuMP.VariableRef, Bool}()
-    binary_map = DP._indicator_to_binary(model)
-    for (indicator, active) in combination
-        binary_ref = binary_map[indicator]
-        value = DP._underlying_value(binary_ref, active)
-        for binary in _transcribed_refs(InfiniteOpt.transformation_variable(
-            DP._underlying_binary(binary_ref)))
-            result[binary] = value
-        end
-    end
-    return result
-end
-
 # Transcribe the inner Hull disaggregation map per support. A finite
 # variable under an infinite indicator keys its single disaggregated
 # copy by each per-support binary reference, mirroring the per-support
@@ -468,8 +449,6 @@ function DP.build_loa_problem(
                 DP._underlying_binary(binary_ref))))
     end
     unique!(binaries)
-    combinations = [_transcribed_combination(model, combination)
-        for combination in DP._set_covering_combinations(model)]
 
     disjunct_constraints = Tuple{Any, Any, Any}[]
     for (_, disjunction) in DP._disjunctions(model)
@@ -509,7 +488,7 @@ function DP.build_loa_problem(
         end
     end
 
-    return DP._LOAProblem(nlp, binaries, combinations,
+    return DP._LOAProblem(nlp, binaries,
         disjunct_constraints, global_constraints,
         _transcribed_disaggregation_map(model, disaggregation_map))
 end

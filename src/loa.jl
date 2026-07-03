@@ -44,11 +44,33 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
     best_result = nothing
     master_bound = nothing
 
-    # Seed the master with an OA cut per set-covering combination, each
-    # NLP warm-started from the last feasible primal.
+    # Set-covering seed. This mimics Pyomo GDPopt's set-covering
+    # initialization: borrow the master as a covering MILP (only its
+    # objective changes), let it pick a combination that activates the
+    # nonlinear disjuncts still lacking a linearization, solve the NLP
+    # there, and seed the resulting OA and no-good cuts. Each NLP
+    # warm-starts from the last feasible primal.
     previous_result = nothing
-    for combination in problem.covering_combinations
+    cover_disjuncts = _cover_disjuncts(problem)
+    needs_cover = trues(length(cover_disjuncts))
+    num_covered = 0
+    for iteration in 1:method.set_cover_max_iter
+        (iteration == 1 || any(needs_cover)) || break
         time() < loop_deadline || break
+        # Swap in the covering objective, solve, read off the combination,
+        # then restore the OA objective (with its accumulated slack
+        # penalties) before emitting cuts against it.
+        oa_objective = JuMP.objective_function(master.model)
+        JuMP.@objective(master.model, Max,
+            _cover_objective(master, cover_disjuncts, needs_cover,
+                num_covered))
+        _cap_remaining_time(master.model, loop_deadline)
+        JuMP.optimize!(master.model)
+        solved = JuMP.is_solved_and_feasible(master.model)
+        combination = solved ? _extract_combination(problem, master) : nothing
+        JuMP.set_objective_sense(master.model, master.objective_sense)
+        JuMP.set_objective_function(master.model, oa_objective)
+        solved || break
         _set_nlp_warm_start(previous_result)
         result = _solve_nlp(problem, combination, method;
             deadline = loop_deadline)
@@ -60,6 +82,17 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
             best_result = result
         end
         result.feasible && (previous_result = result)
+        # A disjunct counts as covered only once it is active in a
+        # feasible NLP. An infeasible combination still contributes its
+        # no-good cut above but leaves the coverage targets untouched.
+        if result.feasible
+            for i in eachindex(cover_disjuncts)
+                needs_cover[i] || continue
+                _disjunct_active(result.combination, cover_disjuncts[i]) &&
+                    (needs_cover[i] = false)
+            end
+            num_covered = count(!, needs_cover)
+        end
     end
 
     # Master/NLP loop: `alpha_oa` is the bound, the NLP refines the
@@ -143,25 +176,50 @@ function reformulate_model(::M, ::LOA) where {M}
 end
 
 ################################################################################
-#                       SET-COVERING INITIALIZATION (simple version from pyomo)
+#                       SET-COVERING INITIALIZATION
 ################################################################################
-# `K = max disjunction size` combinations that activate every indicator
-# at least once: combination `k` activates the `k`-th indicator of each
-# disjunction, cycling via `mod1`. Inconsistent nested combinations are
-# caught by the no-good cut from the infeasible NLP.
-function _set_covering_combinations(model::JuMP.AbstractModel)
-    LogicalRef = LogicalVariableRef{typeof(model)}
-    indicator_lists = [collect(d.constraint.indicators)
-        for (_, d) in _disjunctions(model)]
-    isempty(indicator_lists) && return Dict{LogicalRef, Bool}[]
-    K = maximum(length, indicator_lists)
-    return [
-        Dict{LogicalRef, Bool}(
-            indicator => (indicator == indicators[mod1(k, length(indicators))])
-            for indicators in indicator_lists
-            for indicator in indicators)
-        for k in 1:K
-    ]
+# The nonlinear disjuncts to cover: one entry per distinct indicator that
+# owns a nonlinear disjunct constraint, carrying that indicator's
+# `binary_ref`. Keyed by `(underlying binary, active value)` so the two
+# disjuncts of a single-binary disjunction (`y` and its `1 - y`
+# complement) stay distinct. Purely linear disjuncts need no cover: the
+# inner reformulation already places them in the master exactly.
+function _cover_disjuncts(problem::_LOAProblem)
+    V = eltype(problem.binaries)
+    seen = Set{Tuple{V, Bool}}()
+    disjuncts = Any[]
+    for (binary_ref, _, _) in problem.disjunct_constraints
+        key = (_underlying_binary(binary_ref),
+            _underlying_value(binary_ref, true))
+        key in seen && continue
+        push!(seen, key)
+        push!(disjuncts, binary_ref)
+    end
+    return disjuncts
+end
+
+# The set-covering objective (master space), mimicking Pyomo GDPopt:
+# maximize active disjuncts weighted `num_covered + 1` if still uncovered
+# else `1`, so one uncovered disjunct outweighs every covered one and each
+# solve must activate a new disjunct when the logic allows. Empty
+# `disjuncts` gives the zero expression: a constant objective that still
+# seeds one feasible combination (needed to bound `alpha_oa`).
+function _cover_objective(
+    master::_LOAMaster,
+    disjuncts,
+    needs_cover,
+    num_covered::Int
+    )
+    T = JuMP.value_type(typeof(master.model))
+    V = JuMP.variable_ref_type(typeof(master.model))
+    expr = JuMP.GenericAffExpr{T, V}(zero(T))
+    for i in eachindex(disjuncts)
+        weight = needs_cover[i] ? num_covered + 1 : 1
+        activation = _remap_indicator_to_binary(disjuncts[i],
+            master.variable_map)
+        JuMP.add_to_expression!(expr, T(weight), activation)
+    end
+    return expr
 end
 
 ################################################################################
@@ -176,20 +234,6 @@ _underlying_binary(binary_ref::JuMP.GenericAffExpr) =
 _underlying_value(::JuMP.AbstractVariableRef, active::Bool) = active
 _underlying_value(::JuMP.GenericAffExpr, active::Bool) = !active
 
-# Translate an indicator-level combination onto the underlying binary
-# variables, inverting the value for complement-form indicators.
-function _binary_combination(model::JuMP.AbstractModel, combination)
-    V = JuMP.variable_ref_type(typeof(model))
-    binary_map = _indicator_to_binary(model)
-    result = Dict{V, Bool}()
-    for (indicator, active) in combination
-        binary_ref = binary_map[indicator]
-        result[_underlying_binary(binary_ref)] =
-            _underlying_value(binary_ref, active)
-    end
-    return result
-end
-
 """
     build_loa_problem(
         model::JuMP.AbstractModel,
@@ -199,11 +243,11 @@ end
 
 Build the problem the LOA loop operates on from `model` (already
 reformulated by the LOA inner method): the NLP subproblem, the binary
-variables backing the indicators, the set-covering seed combinations,
-the nonlinear disjunct `(binary_ref, function, set)` triples, the
-nonlinear global `(function, set)` pairs, and the Hull disaggregation
-map. The NLP is `model` itself; the InfiniteOpt extension overloads
-this to build the problem from the transcribed backend instead.
+variables backing the indicators, the nonlinear disjunct
+`(binary_ref, function, set)` triples, the nonlinear global
+`(function, set)` pairs, and the Hull disaggregation map. The NLP is
+`model` itself; the InfiniteOpt extension overloads this to build the
+problem from the transcribed backend instead.
 
 ## Returns
 - `_LOAProblem`: the problem.
@@ -219,8 +263,6 @@ function build_loa_problem(
     binaries = V[_underlying_binary(binary_ref)
         for (_, binary_ref) in binary_map]
     unique!(binaries)
-    combinations = [_binary_combination(model, combination)
-        for combination in _set_covering_combinations(model)]
 
     disjunct_constraints = Tuple{Any, Any, Any}[]
     for (_, disjunction) in _disjunctions(model)
@@ -255,7 +297,7 @@ function build_loa_problem(
     binary_disaggregations = disaggregation_map === nothing ? nothing :
         Dict((variable, binary_map[indicator]) => disaggregated
             for ((variable, indicator), disaggregated) in disaggregation_map)
-    return _LOAProblem(model, binaries, combinations, disjunct_constraints,
+    return _LOAProblem(model, binaries, disjunct_constraints,
         global_constraints, binary_disaggregations)
 end
 

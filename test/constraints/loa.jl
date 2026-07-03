@@ -5,6 +5,7 @@ function test_loa_datatype()
     @test method.nlp_optimizer == HiGHS.Optimizer
     @test method.mip_optimizer == HiGHS.Optimizer
     @test method.max_iter == 10
+    @test method.set_cover_max_iter == 8
     @test method.M_value == 1e9
     @test method.max_slack == 1000.0
     @test method.oa_penalty == 1000.0
@@ -29,22 +30,31 @@ function test_loa_datatype()
     @test method.inner_method isa MBM
 end
 
-function test_set_covering_combos()
+function test_cover_disjuncts()
+    # Only disjuncts owning a nonlinear constraint need covering: the two
+    # `x^2` disjuncts do, the two linear `x` disjuncts do not.
     model = GDPModel()
-    @variable(model, x)
+    @variable(model, -5 <= x <= 5)
     @variable(model, Y[1:2], Logical)
-    @constraint(model, x <= 3, Disjunct(Y[1]))
-    @constraint(model, x >= 5, Disjunct(Y[2]))
+    @constraint(model, x^2 <= 3, Disjunct(Y[1]))
+    @constraint(model, x^2 >= 5, Disjunct(Y[2]))
     @disjunction(model, Y)
+    @variable(model, W[1:2], Logical)
+    @constraint(model, x <= 1, Disjunct(W[1]))
+    @constraint(model, x >= -1, Disjunct(W[2]))
+    @disjunction(model, W)
 
-    combos = DP._set_covering_combinations(model)
+    DP.reformulate_model(model, BigM(1e9))
+    method = LOA(HiGHS.Optimizer)
+    problem = DP.build_loa_problem(model, method)
+    disjuncts = DP._cover_disjuncts(problem)
 
-    # K = 2 combinations, each activating exactly one indicator, and
-    # together covering both.
-    @test length(combos) == 2
-    @test all(count(values(combo)) == 1 for combo in combos)
-    @test combos[1][Y[1]] && !combos[1][Y[2]]
-    @test combos[2][Y[2]] && !combos[2][Y[1]]
+    # Two nonlinear disjuncts to cover; the linear W disjuncts omitted.
+    @test length(disjuncts) == 2
+    binary_map = DP._indicator_to_binary(model)
+    underlying = Set(DP._underlying_binary(dref) for dref in disjuncts)
+    @test underlying == Set([DP._underlying_binary(binary_map[Y[1]]),
+        DP._underlying_binary(binary_map[Y[2]])])
 end
 
 function test_oa_cut_terms()
@@ -55,6 +65,17 @@ function test_oa_cut_terms()
     @test DP._oa_cut_terms(MOI.GreaterThan(2.0), 5.0) == (-3.0,)
     @test DP._oa_cut_terms(MOI.EqualTo(2.0), 5.0) == (3.0, -3.0)
     @test DP._oa_cut_terms(MOI.Interval(1.0, 4.0), 5.0) == (1.0, -4.0)
+end
+
+function test_is_linear_F()
+    # Scalar and vector variable-ref / affine function types are linear
+    # (copied into the master at build time); anything else, e.g. a
+    # quadratic, is nonlinear and enters only as an OA cut.
+    @test DP._is_linear_F(JuMP.VariableRef)
+    @test DP._is_linear_F(JuMP.AffExpr)
+    @test DP._is_linear_F(Vector{JuMP.VariableRef})
+    @test DP._is_linear_F(Vector{JuMP.AffExpr})
+    @test !DP._is_linear_F(JuMP.QuadExpr)
 end
 
 function test_no_good_cut()
@@ -71,7 +92,12 @@ function test_no_good_cut()
     master = DP._build_loa_master(problem, method)
     master_model = master.model
 
-    combo = DP._binary_combination(model, Dict(Y[1] => true, Y[2] => false))
+    binary_map = DP._indicator_to_binary(model)
+    combo = Dict(
+        DP._underlying_binary(binary_map[Y[1]]) =>
+            DP._underlying_value(binary_map[Y[1]], true),
+        DP._underlying_binary(binary_map[Y[2]]) =>
+            DP._underlying_value(binary_map[Y[2]], false))
 
     num_cons_before = length(JuMP.all_constraints(
         master_model;
@@ -84,7 +110,6 @@ function test_no_good_cut()
     @test num_cons_after == num_cons_before + 1
     # The cut is (1 - y1) + y2 >= 1, i.e. normalized -y1 + y2 >= 0:
     # excludes exactly the (Y1 active, Y2 inactive) combination.
-    binary_map = DP._indicator_to_binary(model)
     y1 = master.variable_map[binary_map[Y[1]]]
     y2 = master.variable_map[binary_map[Y[2]]]
     @test JuMP.normalized_coefficient(cref, y1) == -1.0
@@ -645,8 +670,9 @@ end
 
 @testset "LOA" begin
     test_loa_datatype()
-    test_set_covering_combos()
+    test_cover_disjuncts()
     test_oa_cut_terms()
+    test_is_linear_F()
     test_no_good_cut()
     test_loa_reformulate_simple()
     test_loa_solve_simple()
