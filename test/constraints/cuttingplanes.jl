@@ -5,15 +5,13 @@ function test_CuttingPlanes_datatype()
     @test method.optimizer == HiGHS.Optimizer
     @test method.max_iter == 3
     @test method.seperation_tolerance == 1e-6
-    @test method.final_reform_method isa BigM
     @test method.M_value == 1e9
 
     method = CuttingPlanes(HiGHS.Optimizer;max_iter=10,
-    seperation_tolerance=1e-4, final_reform_method=Indicator(), M_value=1e6
+    seperation_tolerance=1e-4, M_value=1e6
     )
     @test method.max_iter == 10
     @test method.seperation_tolerance == 1e-4
-    @test method.final_reform_method isa Indicator
     @test method.M_value == 1e6
 end
 

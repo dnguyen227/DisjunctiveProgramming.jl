@@ -417,11 +417,8 @@ constraints.
 """
 struct Hull{T} <: AbstractReformulationMethod
     value::T
-    # Internal: LOA installs a Dict here to collect the disaggregation
-    # map during reformulation; `nothing` for every other use.
-    disaggregation_map::Union{Nothing, AbstractDict}
-    function Hull(ϵ::T = 1e-6; disaggregation_map = nothing) where {T}
-        new{T}(ϵ, disaggregation_map)
+    function Hull(ϵ::T = 1e-6) where {T}
+        new{T}(ϵ)
     end
 end
 
@@ -430,13 +427,11 @@ mutable struct _Hull{V <: JuMP.AbstractVariableRef, T} <: AbstractReformulationM
     value::T
     disjunction_variables::Dict{V, Vector{V}}
     disjunct_variables::Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}
-    disaggregation_map::Union{Nothing, AbstractDict}
     function _Hull(method::Hull{T}, vrefs::Set{V}) where {T, V <: JuMP.AbstractVariableRef}
         new{V, T}(
             method.value,
             Dict{V, Vector{V}}(vref => V[] for vref in vrefs),
-            Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}(),
-            method.disaggregation_map
+            Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}()
         )
     end
 end
@@ -450,24 +445,20 @@ A type for using the cutting planes approach for disjunctive constraints.
 - `optimizer::O`: Optimizer to use when solving mini-models (required).
 - `max_iter::Int`: Number of iterations (default = `3`).
 - `seperation_tolerance::T`: Tolerance for the separation problem (default = `1e-6`).
-- `final_reform_method::AbstractReformulationMethod`: Final reformulation 
-method to use after cutting planes (default = `BigM()`).
 - `M_value::T`: Big-M value to use in the final reformulation (default = `1e9`).
 """
 struct CuttingPlanes{O, T} <: AbstractReformulationMethod
     optimizer::O;
     max_iter::Int
     seperation_tolerance::T
-    final_reform_method::AbstractReformulationMethod
     M_value::T
     function CuttingPlanes(
         optimizer::O;
         max_iter::Int = 3,
         seperation_tolerance::T = 1e-6,
-        final_reform_method = BigM(),
         M_value::T = 1e9
     ) where {O, T}
-        new{O, T}(optimizer, max_iter, seperation_tolerance, final_reform_method, M_value)
+        new{O, T}(optimizer, max_iter, seperation_tolerance, M_value)
     end
 end
 
@@ -575,12 +566,17 @@ struct Indicator <: AbstractReformulationMethod end
 #                              LOA
 ################################################################################
 """
-    LOA{O, P, R, T} <: AbstractReformulationMethod
+    LOA{O, P, R, T} <: AbstractSolutionMethod
 
 Logic-based Outer Approximation solver for GDP models. Iterates a primary
 NLP (original model reformulated by `inner_method`, binaries fixed per
 iteration) and a master MILP accumulating OA and no-good cuts.
 `inner_method` is `BigM` (default), `MBM`, or `Hull`.
+
+LOA is a solution algorithm, not a reformulation: it is invoked with
+`optimize!(model, gdp_method = LOA(...))`, always re-runs on `optimize!`,
+and is not accepted by [`reformulate_model`](@ref). After the run the
+incumbent is loaded into `model`, so JuMP solution queries work directly.
 
 ## Fields
 - `nlp_optimizer::O`: solver for the primary NLP.
@@ -599,10 +595,10 @@ iteration) and a master MILP accumulating OA and no-good cuts.
 - `slack_tol::Float64`: max total slack for which the bound still counts
   as converged (positive slack = nonconvex crossing, keep iterating).
 - `iteration_time_limit::Float64`: budget (s) for the iteration loop.
-- `time_limit::Float64`: overall budget (s) incl. the final solve
-  (default 3600; `Inf` disables).
+- `time_limit::Float64`: overall budget (s) for the algorithm; the
+  final loading solve is not capped (default 3600; `Inf` disables).
 """
-struct LOA{O, P, R, T} <: AbstractReformulationMethod
+struct LOA{O, P, R, T} <: AbstractSolutionMethod
     nlp_optimizer::O
     mip_optimizer::P
     inner_method::R
@@ -647,7 +643,7 @@ end
 # is the binary or its `1 - y` complement expression), the nonlinear
 # global `(function, set)` pairs, and the `(variable, binary_ref) ->
 # disaggregated variable` map from an inner Hull reformulation
-# (`nothing` for Big-M / MBM). Built by `build_loa_problem`. The
+# (empty for Big-M / MBM). Built by `build_loa_problem`. The
 # set-covering seed generates its combinations on the fly from the
 # master, so none are stored here.
 struct _LOAProblem{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, T}
@@ -657,8 +653,7 @@ struct _LOAProblem{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, T}
         JuMP.AbstractJuMPScalar, _MOI.AbstractScalarSet}}
     global_constraints::Vector{Tuple{JuMP.AbstractJuMPScalar,
         _MOI.AbstractScalarSet}}
-    disaggregation_map::Union{Nothing,
-        Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}}
+    disaggregation_map::Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}
 
     # Inner constructor deriving the value type `T` from the NLP model.
     # `T` only appears inside `Union` field types, so the default
@@ -715,6 +710,10 @@ mutable struct GDPData{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, C
     # Helpful metadata for most reformulations (not just one of them)
     variable_bounds::Dict{V, Tuple{T, T}}
 
+    # Hull disaggregations recorded during reformulation, consumed by
+    # solution algorithms (LOA): (variable, indicator) => disaggregated
+    disaggregation_map::Dict{Tuple{V, LogicalVariableRef{M}}, V}
+
     # Reformulation variables and constraints
     reformulation_variables::Vector{V}
     reformulation_constraints::Vector{C}
@@ -735,6 +734,7 @@ mutable struct GDPData{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, C
             Dict{LogicalVariableRef{M}, Vector{Union{DisjunctConstraintRef{M}, DisjunctionRef{M}}}}(),
             Dict{Union{DisjunctConstraintRef{M}, DisjunctionRef{M}}, LogicalVariableRef{M}}(),
             Dict{V, Tuple{T, T}}(),
+            Dict{Tuple{V, LogicalVariableRef{M}}, V}(),
             Vector{V}(),
             Vector{C}(),
             nothing,

@@ -175,6 +175,12 @@ function test_generic_model(m)
     # TODO add meaningful tests to check the constraints/variables
 end
 
+function test_unsupported_solution_method()
+    m = GDPModel(HiGHS.Optimizer)
+    @test_throws ErrorException optimize!(
+        m, gdp_method = DummySolutionMethod())
+end
+
 @testset "Solve Linear GDP" begin
     test_linear_gdp_example(GDPModel(HiGHS.Optimizer))
     test_linear_gdp_example(GDPModel(HiGHS.Optimizer), true)
@@ -184,4 +190,5 @@ end
         )
     test_quadratic_gdp_example()
     test_generic_model(GDPModel{Float32}(mockoptimizer))
+    test_unsupported_solution_method()
 end

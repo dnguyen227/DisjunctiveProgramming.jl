@@ -14,18 +14,25 @@ _is_better(::Val{_MOI.MAX_SENSE}, new, best) = new > best
 _gap(::Val{_MOI.MIN_SENSE}, best, bound) = best - bound
 _gap(::Val{_MOI.MAX_SENSE}, best, bound) = bound - best
 
+# One progress record per NLP solve, for external convergence traces.
+function _log_loa_progress(t_start::Float64, best_objective, master_bound)
+    bound = master_bound === nothing ? NaN : master_bound
+    @info "LOA progress: elapsed=$(time() - t_start) " *
+        "incumbent=$best_objective bound=$bound"
+    return
+end
+
 ################################################################################
 #                            MAIN LOOP
 ################################################################################
-# LOA entry: build the problem, seed with set-covering combinations,
-# iterate the master/NLP loop, and commit the best combination.
-function reformulate_model(model::JuMP.AbstractModel, method::LOA)
+# LOA optimize hook: build the problem, seed with set-covering
+# combinations, iterate the master/NLP loop, commit the best
+# combination, and load it with a final direct solve.
+function _optimize_hook(model::JuMP.AbstractModel, method::LOA; kwargs...)
     _clear_reformulations(model)
-    # Hull needs the disaggregation map if its used as inner function
-    inner, disaggregation_map = _loa_inner_method(model, method.inner_method)
-    reformulate_model(model, inner)
+    reformulate_model(model, method.inner_method)
 
-    problem = build_loa_problem(model, method, disaggregation_map)
+    problem = build_loa_problem(model, method)
     # The master copies the NLP while its binaries still carry
     # integrality; the NLP is then relaxed once and each iteration
     # overwrites the binary fixes in place.
@@ -82,6 +89,7 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
             best_result = result
         end
         result.feasible && (previous_result = result)
+        _log_loa_progress(t_start, best_objective, master_bound)
         # A disjunct counts as covered only once it is active in a
         # feasible NLP. An infeasible combination still contributes its
         # no-good cut above but leaves the coverage targets untouched.
@@ -126,20 +134,33 @@ function reformulate_model(model::JuMP.AbstractModel, method::LOA)
             best_result = result
         end
         result.feasible && (previous_result = result)
+        _log_loa_progress(t_start, best_objective, master_bound)
     end
 
-    best_result === nothing || _commit_combination(best_result)
-    if isfinite(method.time_limit)
-        # Overall cap: the final committed solve gets the budget left.
-        JuMP.set_time_limit_sec(nlp, max(0.0, overall_deadline - time()))
-    elseif isfinite(method.iteration_time_limit)
-        # Loop-only budget: restore so the final solve isn't crippled.
-        _restore_time_limit(nlp, original_time_limit)
-    end
+    pins = best_result === nothing ? [] :
+        _commit_combination(model, best_result)
+    # The loading solve is a pinned formality, so an exhausted loop
+    # budget must not starve it: restore the model's own time limit.
+    _restore_time_limit(nlp, original_time_limit)
     _report_loa_gap(best_objective, best_result, master_bound, sense_token,
         converged)
+    # The committed model (binaries relaxed and fixed) is not a clean
+    # reformulation, so any later reformulation method must rebuild.
     _set_solution_method(model, method)
-    _set_ready_to_optimize(model, true)
+    _set_ready_to_optimize(model, false)
+    # Loading solve: the incumbent is fully pinned, so this is a
+    # formality that makes JuMP solution queries on `model` return it.
+    JuMP.optimize!(model; ignore_optimize_hook = true, kwargs...)
+    if best_result !== nothing && !JuMP.has_values(nlp)
+        # Observed with presolve-off Gurobi: the tiny pin boxes can be
+        # rejected numerically. Drop them and load by re-solving warm
+        # at the fixed combination instead.
+        _remove_pins(model, pins)
+        for (variable, value) in best_result.linearization_point
+            JuMP.set_start_value(variable, value)
+        end
+        JuMP.optimize!(model; ignore_optimize_hook = true, kwargs...)
+    end
     return
 end
 
@@ -168,11 +189,6 @@ function _report_loa_gap(
     @info "LOA finished [$label]: incumbent $best_objective, master " *
         "bound $master_bound, gap $gap (relative $relative)."
     return
-end
-
-# Error fallback for unsupported model types.
-function reformulate_model(::M, ::LOA) where {M}
-    error("reformulate_model not implemented for model type `$(M)` with LOA.")
 end
 
 ################################################################################
@@ -236,26 +252,22 @@ _underlying_value(::JuMP.GenericAffExpr, active::Bool) = !active
 """
     build_loa_problem(
         model::JuMP.AbstractModel,
-        method::LOA,
-        [disaggregation_map = nothing]
+        method::LOA
         )::_LOAProblem
 
 Build the problem the LOA loop operates on from `model` (already
 reformulated by the LOA inner method): the NLP subproblem, the binary
 variables backing the indicators, the nonlinear disjunct
 `(binary_ref, function, set)` triples, the nonlinear global
-`(function, set)` pairs, and the Hull disaggregation map. The NLP is
-`model` itself; the InfiniteOpt extension overloads this to build the
-problem from the transcribed backend instead.
+`(function, set)` pairs, and the Hull disaggregation map recorded in
+the GDP data during reformulation. The NLP is `model` itself; the
+InfiniteOpt extension overloads this to build the problem from the
+transcribed backend instead.
 
 ## Returns
 - `_LOAProblem`: the problem.
 """
-function build_loa_problem(
-    model::JuMP.AbstractModel,
-    method::LOA,
-    disaggregation_map = nothing
-    )
+function build_loa_problem(model::JuMP.AbstractModel, method::LOA)
     V = JuMP.variable_ref_type(typeof(model))
     T = JuMP.value_type(typeof(model))
     binary_map = _indicator_to_binary(model)
@@ -296,25 +308,13 @@ function build_loa_problem(
         end
     end
 
-    binary_disaggregations = disaggregation_map === nothing ? nothing :
+    binary_disaggregations =
         Dict{Tuple{V, Union{V, JuMP.GenericAffExpr{T, V}}}, V}(
             (variable, binary_map[indicator]) => disaggregated
-            for ((variable, indicator), disaggregated) in disaggregation_map)
+            for ((variable, indicator), disaggregated)
+                in _disaggregation_map(model))
     return _LOAProblem(model, binaries, disjunct_constraints,
         global_constraints, binary_disaggregations)
-end
-
-# The inner reformulation method LOA runs, plus the disaggregation map
-# to collect (Big-M / MBM need none). For Hull, return a map-carrying
-# copy so the reformulation records its `(variable, indicator) ->
-# disaggregated variable` map into a fresh LOA-owned `Dict`.
-_loa_inner_method(::JuMP.AbstractModel, inner::Union{BigM, MBM}) =
-    (inner, nothing)
-function _loa_inner_method(model::JuMP.AbstractModel, inner::Hull)
-    V = JuMP.variable_ref_type(typeof(model))
-    disaggregations = Dict{Tuple{V, LogicalVariableRef{typeof(model)}}, V}()
-    return (Hull(inner.value; disaggregation_map = disaggregations),
-        disaggregations)
 end
 
 # Relax the binaries to continuous in [0, 1]; each NLP solve then
@@ -524,16 +524,40 @@ function _set_nlp_warm_start(previous)
     return
 end
 
-# Finalize the NLP with the LOA-optimal combination: fix the
-# binaries at the committed values (in place; the NLP is already
-# permanently relaxed) and warm-start from the linearization point.
-# After this, the model is no longer in a state suitable for re-running
-# with a different `gdp_method`.
-function _commit_combination(result)
+# Finalize the NLP with the LOA incumbent: fix the binaries at the
+# committed combination and pin each linearization-point variable
+# inside a tight interval, so the loading solve only polishes the
+# incumbent instead of re-solving the NLP. Pins are interval rows
+# rather than `JuMP.fix` or equalities: variable bounds survive, the
+# rows stay out of Ipopt's degrees-of-freedom count (equality pins can
+# exceed it and are rejected as INVALID_MODEL), and the box is kept
+# comfortably wider than typical solver feasibility tolerances. On a
+# GDP model they register as reformulation constraints and the next
+# reformulation deletes them; on a transcription backend the next
+# rebuild discards them. Returns the pins for the loading-solve
+# fallback.
+function _commit_combination(model::JuMP.AbstractModel, result)
     _fix_combination(result.combination)
+    pins = []
     for (variable, value) in result.linearization_point
-        JuMP.set_start_value(variable, value)
+        owner = JuMP.owner_model(variable)
+        tol = 1e-5 * max(1.0, abs(value))
+        pin = JuMP.@constraint(owner,
+            value - tol <= variable <= value + tol)
+        owner === model && push!(_reformulation_constraints(model), pin)
+        push!(pins, pin)
     end
+    return pins
+end
+
+# Loading-solve fallback: delete the pins (and untrack them so the next
+# clear does not double-delete) ahead of a warm re-solve.
+function _remove_pins(model::JuMP.AbstractModel, pins::Vector)
+    pin_set = Set(pins)
+    for pin in pins
+        JuMP.delete(JuMP.owner_model(pin), pin)
+    end
+    filter!(c -> !(c in pin_set), _reformulation_constraints(model))
     return
 end
 

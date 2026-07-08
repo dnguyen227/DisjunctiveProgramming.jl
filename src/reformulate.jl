@@ -2,12 +2,20 @@
 #                              REFORMULATE
 ################################################################################
 """
-    reformulate_model(model::JuMP.AbstractModel, method::AbstractSolutionMethod = BigM())
+    reformulate_model(
+        model::JuMP.AbstractModel,
+        method::AbstractReformulationMethod = BigM()
+        )
 
 Reformulate a `GDPModel` using the specified `method`. Prior to reformulation,
-all previous reformulation variables and constraints are deleted.
+all previous reformulation variables and constraints are deleted. Solution
+algorithms such as [`LOA`](@ref) are not reformulation methods and are run
+via `optimize!(model, gdp_method = ...)` instead.
 """
-function reformulate_model(model::JuMP.AbstractModel, method::AbstractSolutionMethod = BigM())
+function reformulate_model(
+    model::JuMP.AbstractModel,
+    method::AbstractReformulationMethod = BigM()
+    )
     #clear all previous reformulations
     _clear_reformulations(model)
     #reformulate
@@ -25,6 +33,7 @@ function _clear_reformulations(model::JuMP.AbstractModel)
     empty!(gdp_data(model).reformulation_constraints)
     empty!(gdp_data(model).reformulation_variables)
     empty!(gdp_data(model).variable_bounds)
+    empty!(gdp_data(model).disaggregation_map)
     _restore_logical_binaries(model)
     return
 end

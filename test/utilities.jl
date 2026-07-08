@@ -59,6 +59,7 @@ end
 # Prepare helpful test types 
 struct BadVarRef <: JuMP.AbstractVariableRef end
 struct DummyReformulation <: AbstractReformulationMethod end
+struct DummySolutionMethod <: AbstractSolutionMethod end
 
 # Define types/methods to test using DP with extension models
 struct MyVar{I} <: JuMP.AbstractVariable

@@ -119,7 +119,7 @@ function test_no_good_cut()
     @test JuMP.normalized_rhs(cref) == 0.0
 end
 
-function test_loa_reformulate_simple()
+function test_loa_hook_simple()
     model = GDPModel(HiGHS.Optimizer)
     set_silent(model)
     @variable(model, 0 <= x <= 10)
@@ -130,11 +130,12 @@ function test_loa_reformulate_simple()
     @objective(model, Max, x)
 
     method = LOA(HiGHS.Optimizer)
-    DP.reformulate_model(model, method)
+    optimize!(model, gdp_method = method)
 
-    @test DP._ready_to_optimize(model)
-    # The committed model solves to the LOA incumbent: x = 7 via Y[2].
-    JuMP.optimize!(model, ignore_optimize_hook = true)
+    # The committed model is not a clean reformulation.
+    @test !DP._ready_to_optimize(model)
+    @test DP._solution_method(model) === method
+    # The hook's loading solve returns the LOA incumbent: x = 7 via Y[2].
     @test objective_value(model) ≈ 7.0 atol = 1e-6
     @test value(x) ≈ 7.0 atol = 1e-6
 end
@@ -199,9 +200,11 @@ function test_loa_solve_two_disjunctions()
     @test objective_value(model) ≈ 12.0 atol=1e-4
 end
 
-function test_loa_error_fallback()
+function test_loa_not_reformulation()
+    # LOA is a solution algorithm: reformulate_model rejects it.
     method = LOA(HiGHS.Optimizer)
-    @test_throws ErrorException DP.reformulate_model(42, method)
+    model = GDPModel(HiGHS.Optimizer)
+    @test_throws MethodError DP.reformulate_model(model, method)
 end
 
 function test_loa_nonlinear_global()
@@ -338,9 +341,8 @@ function test_loa_limit_hit_report()
     @objective(model, Min, x - z)
     method = LOA(HiGHS.Optimizer; max_iter = 1)
     @test_logs (:info, r"limit hit") match_mode = :any begin
-        DP.reformulate_model(model, method)
+        optimize!(model, gdp_method = method)
     end
-    JuMP.optimize!(model, ignore_optimize_hook = true)
     @test objective_value(model) ≈ -10.0 atol = 1e-4
 end
 
@@ -555,11 +557,10 @@ end
 function test_loa_time_limits()
     # Exercise the wall-clock budget paths. A finite `time_limit`
     # (overall cap) drives `_cap_remaining_time` during the subproblem
-    # solves and the final-solve budget reset; a finite
-    # `iteration_time_limit` (loop-only budget) drives the post-loop
-    # time-limit restore from no prior limit (the `::Nothing` path).
-    # Both limits are generous: they govern the path taken, not the
-    # result.
+    # solves; a finite `iteration_time_limit` (loop-only budget) covers
+    # the post-loop time-limit restore from no prior limit (the
+    # `::Nothing` path). Both limits are generous: they govern the
+    # path taken, not the result.
     function build_model()
         model = GDPModel(HiGHS.Optimizer)
         set_silent(model)
@@ -603,9 +604,9 @@ function test_loa_no_feasible_incumbent()
     @objective(model, Max, x)
     method = LOA(HiGHS.Optimizer)
     @test_logs (:warn, r"no feasible incumbent") match_mode = :any begin
-        DP.reformulate_model(model, method)
+        optimize!(model, gdp_method = method)
     end
-    @test DP._ready_to_optimize(model)
+    @test !DP._ready_to_optimize(model)
 end
 
 function test_loa_hull_linear()
@@ -720,9 +721,9 @@ end
 
 function test_loa_hull_nested_disaggregation_map()
     # The inner disjunction (over y) is a disjunct of the outer (gated by
-    # z[1]). Hull's nested redispatch must propagate the LOA
-    # disaggregation map so the inner disaggregations are recorded, else
-    # LOA-Hull emits the nested cut on the aggregated variable.
+    # z[1]). Hull's nested redispatch must record the inner
+    # disaggregations in the GDP data map, else LOA-Hull emits the
+    # nested cut on the aggregated variable.
     model = GDPModel()
     @variable(model, 0 <= x <= 10)
     @variable(model, y[1:2], Logical)
@@ -732,8 +733,8 @@ function test_loa_hull_nested_disaggregation_map()
     @disjunction(model, y, Disjunct(z[1]))
     @constraint(model, x <= 1, Disjunct(z[2]))
     @disjunction(model, z)
-    disaggregations = Dict{Any, Any}()
-    DP.reformulate_model(model, Hull(; disaggregation_map = disaggregations))
+    DP.reformulate_model(model, Hull())
+    disaggregations = DP._disaggregation_map(model)
     @test haskey(disaggregations, (x, y[1]))
     @test haskey(disaggregations, (x, y[2]))
 end
@@ -772,11 +773,11 @@ end
     test_oa_cut_terms()
     test_is_linear_F()
     test_no_good_cut()
-    test_loa_reformulate_simple()
+    test_loa_hook_simple()
     test_loa_solve_simple()
     test_loa_solve_simple_with_mbm()
     test_loa_solve_two_disjunctions()
-    test_loa_error_fallback()
+    test_loa_not_reformulation()
     test_loa_nonlinear_global()
     test_loa_nonlinear_equality_global()
     test_loa_nonlinear_equality_disjunct()

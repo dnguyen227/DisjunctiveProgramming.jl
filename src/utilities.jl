@@ -325,6 +325,7 @@ function copy_gdp_data(
     # - indicator_to_constraints
     # - constraint_to_indicator
     # - variable_bounds
+    # - disaggregation_map
     # SINGLE VALUES (copy directly)
     # - solution_method
     # - ready_to_optimize
@@ -431,6 +432,11 @@ function copy_gdp_data(
     for (v, bounds) in old_gdp.variable_bounds
         # Update to new_gdp.variable_bounds
         new_gdp.variable_bounds[var_map[v]] = bounds
+    end
+
+    # Copying the disaggregation map
+    for ((v, lv_ref), dv) in old_gdp.disaggregation_map
+        new_gdp.disaggregation_map[(var_map[v], lv_map[lv_ref])] = var_map[dv]
     end
 
     # Copying solution method and ready to optimize

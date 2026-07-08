@@ -412,15 +412,10 @@ end
 # variable under an infinite indicator keys its single disaggregated
 # copy by each per-support binary reference, mirroring the per-support
 # disjunct cuts that look it up.
-_transcribed_disaggregation_map(::InfiniteOpt.InfiniteModel, ::Nothing) =
-    nothing
-function _transcribed_disaggregation_map(
-    model::InfiniteOpt.InfiniteModel,
-    disaggregation_map
-    )
+function _transcribed_disaggregation_map(model::InfiniteOpt.InfiniteModel)
     result = Dict{Tuple{JuMP.VariableRef,
         Union{JuMP.VariableRef, JuMP.AffExpr}}, JuMP.VariableRef}()
-    for ((variable, indicator), disaggregated) in disaggregation_map
+    for ((variable, indicator), disaggregated) in DP._disaggregation_map(model)
         binary_refs = _transcribed_binary_refs(model, indicator)
         variables = _transcribed_refs(
             InfiniteOpt.transformation_variable(variable))
@@ -437,8 +432,7 @@ end
 
 function DP.build_loa_problem(
     model::InfiniteOpt.InfiniteModel,
-    method::DP.LOA,
-    disaggregation_map = nothing
+    method::DP.LOA
     )
     InfiniteOpt.build_transformation_backend!(model)
     nlp = InfiniteOpt.transformation_model(model)
@@ -493,7 +487,7 @@ function DP.build_loa_problem(
 
     return DP._LOAProblem(nlp, binaries,
         disjunct_constraints, global_constraints,
-        _transcribed_disaggregation_map(model, disaggregation_map))
+        _transcribed_disaggregation_map(model))
 end
 
 end

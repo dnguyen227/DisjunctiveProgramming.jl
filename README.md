@@ -184,13 +184,12 @@ The following reformulation methods are currently supported:
 
     All variables must be included in exactly one partition. For manual partitioning, ensure each variable appears in exactly one group. For automatic partitioning, variables are divided as evenly as possible among the specified number of partitions.
 
-6. [Cutting Planes](https://pubsonline.informs.org/doi/10.1287/ijoc.2015.0669): This method iteratively generates cutting planes using a separation problem and a relaxed Big-M formulation, then applies a final reformulation method. The `CuttingPlanes` struct is created with the following arguments:
+6. [Cutting Planes](https://pubsonline.informs.org/doi/10.1287/ijoc.2015.0669): This method iteratively generates cutting planes using a separation problem and a relaxed Big-M formulation. The `CuttingPlanes` struct is created with the following arguments:
 
     - `optimizer`: Optimizer to use when solving the separation and relaxed Big-M subproblems. This is a required value.
     - `max_iter`: Maximum number of cutting plane iterations. Default: `3`.
     - `seperation_tolerance`: Convergence tolerance for the separation problem objective. Default: `1e-6`.
-    - `final_reform_method`: Reformulation method to apply after cutting plane iterations. Default: `BigM()`.
-    - `M_value`: Big-M value to use in the relaxed Big-M reformulation during iterations. Default: `1e9`.
+    - `M_value`: Big-M value to use in the relaxed Big-M reformulation. Default: `1e9`.
 
 ## Infinite-Dimensional GDP
 To model disjunctions, logical variables, and logical constraints with infinite-dimensional optimization problems (e.g., dynamic and stochastic optimization), DisjunctiveProgramming is also compatible with [InfiniteOpt.jl](https://github.com/infiniteopt/InfiniteOpt.jl). For this, the syntax is largely the same, users simply need to import `InfiniteOpt` and use `InfiniteGDPModel`. They also can use `InfiniteLogical` to declare infinite logical variables as shown below:

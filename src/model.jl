@@ -39,15 +39,36 @@ end
 
 # Define what should happen to solve a GDPModel
 # See https://github.com/jump-dev/JuMP.jl/blob/9ea1df38fd320f864ab4c93c78631d0f15939c0b/src/JuMP.jl#L718-L745
+# The kwarg form is the installed hook; it redispatches on the method so
+# solution algorithms (e.g. LOA) can own their entire solve.
 function _optimize_hook(
-    model::JuMP.AbstractModel; 
+    model::JuMP.AbstractModel;
     gdp_method::AbstractSolutionMethod = BigM(),
     kwargs...
-    ) # can add more kwargs if wanted
-    if !_ready_to_optimize(model) || _solution_method(model) != gdp_method
-        reformulate_model(model, gdp_method)
+    )
+    return _optimize_hook(model, gdp_method; kwargs...)
+end
+
+# Reformulation methods: reformulate if stale, then solve in place.
+function _optimize_hook(
+    model::JuMP.AbstractModel,
+    method::AbstractReformulationMethod;
+    kwargs...
+    )
+    if !_ready_to_optimize(model) || _solution_method(model) != method
+        reformulate_model(model, method)
     end
     return JuMP.optimize!(model; ignore_optimize_hook = true, kwargs...)
+end
+
+# Fallback for solution algorithms without an optimize hook.
+function _optimize_hook(
+    model::JuMP.AbstractModel,
+    method::AbstractSolutionMethod;
+    kwargs...
+    )
+    error("Solution method `$(nameof(typeof(method)))` is not " *
+        "supported; LOA is currently the only solution algorithm.")
 end
 
 ################################################################################
@@ -84,6 +105,7 @@ _constraint_to_indicator(model::JuMP.AbstractModel) = gdp_data(model).constraint
 _reformulation_variables(model::JuMP.AbstractModel) = gdp_data(model).reformulation_variables
 _reformulation_constraints(model::JuMP.AbstractModel) = gdp_data(model).reformulation_constraints
 _variable_bounds(model::JuMP.AbstractModel) = gdp_data(model).variable_bounds
+_disaggregation_map(model::JuMP.AbstractModel) = gdp_data(model).disaggregation_map
 _solution_method(model::JuMP.AbstractModel) = gdp_data(model).solution_method # Get the current solution method
 _ready_to_optimize(model::JuMP.AbstractModel) = gdp_data(model).ready_to_optimize # Determine if the model is ready to call `optimize!` without a optimize hook
 

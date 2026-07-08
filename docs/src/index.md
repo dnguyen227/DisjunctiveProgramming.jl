@@ -171,7 +171,7 @@ The following reformulation methods are currently supported:
 
 5. [Indicator](https://jump.dev/JuMP.jl/stable/manual/constraints/#Indicator-constraints): This method reformulates each disjunct constraint into an indicator constraint with the Boolean reformulation counterpart of the Logical variable used to define the disjunct constraint. This is invoked with [`Indicator`](@ref).
 
-6. Logic-based Outer Approximation (LOA): An iterative solution method for nonlinear GDPs, rather than a single-shot reformulation. It alternates between a primal NLP (the model reformulated by an inner method — `BigM`, `MBM`, or `Hull` — with the disjunct binaries fixed at the current selection) and a master MILP that accumulates outer-approximation and no-good cuts until the bound meets the incumbent. This is invoked with the [`LOA`](@ref) struct, e.g. `optimize!(m, gdp_method = LOA(Ipopt.Optimizer))`.
+6. Logic-based Outer Approximation (LOA): An iterative solution method for nonlinear GDPs, rather than a single-shot reformulation. It alternates between a primal NLP (the model reformulated by an inner method — `BigM`, `MBM`, or `Hull` — with the disjunct binaries fixed at the current selection) and a master MILP that accumulates outer-approximation and no-good cuts until the bound meets the incumbent. This is invoked with the [`LOA`](@ref) struct, e.g. `optimize!(m, gdp_method = LOA(Ipopt.Optimizer))`. Unlike the reformulation methods above, `LOA` runs the full algorithm on every `optimize!` call and cannot be passed to `reformulate_model`.
 
 ## Release Notes
 
