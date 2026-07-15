@@ -721,6 +721,9 @@ mutable struct GDPData{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, C
     # Solution data
     solution_method::Union{Nothing, AbstractSolutionMethod}
     ready_to_optimize::Bool
+    # Real solver stashed by an LOA solve so a later reformulation
+    # re-solve can replace the injected solution optimizer.
+    loa_solver::Any
 
     # Default constructor
     function GDPData{M, V, C}() where {M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, C}
@@ -739,6 +742,7 @@ mutable struct GDPData{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, C
             Vector{C}(),
             nothing,
             false,
+            nothing,
         )
     end
 end

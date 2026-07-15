@@ -55,6 +55,17 @@ function _optimize_hook(
     method::AbstractReformulationMethod;
     kwargs...
     )
+    # A prior LOA solve left an injected solution optimizer in the slot;
+    # swap the real solver back before a genuine re-solve, but only if the
+    # user has not already set their own optimizer since.
+    solver = gdp_data(model).loa_solver
+    if solver !== nothing
+        backend = JuMP.backend(model)
+        backend isa _MOI.Utilities.CachingOptimizer &&
+            backend.optimizer isa _MOI.Utilities.MockOptimizer &&
+            JuMP.set_optimizer(model, solver)
+        gdp_data(model).loa_solver = nothing
+    end
     if !_ready_to_optimize(model) || _solution_method(model) != method
         reformulate_model(model, method)
     end

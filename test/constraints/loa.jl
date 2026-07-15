@@ -132,11 +132,58 @@ function test_loa_hook_simple()
     method = LOA(HiGHS.Optimizer)
     optimize!(model, gdp_method = method)
 
-    # The committed model is not a clean reformulation.
+    # LOA marks the model as needing a rebuild before a reformulation solve.
     @test !DP._ready_to_optimize(model)
     @test DP._solution_method(model) === method
-    # The hook's loading solve returns the LOA incumbent: x = 7 via Y[2].
+    # The incumbent is injected, not solved: queries return x = 7 via Y[2].
     @test objective_value(model) ≈ 7.0 atol = 1e-6
+    @test value(x) ≈ 7.0 atol = 1e-6
+
+    # Injection leaves a clean model: the incumbent is loaded with no fixed
+    # binaries and no pin constraints.
+    @test !is_fixed(DP._indicator_to_binary(model)[Y[2]])
+end
+
+function test_loa_reoptimize()
+    # After an LOA solve the model must re-solve cleanly with an ordinary
+    # reformulation method (the injected mock optimizer is swapped back).
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
+    @test value(x) ≈ 7.0 atol = 1e-6
+
+    optimize!(model, gdp_method = Hull())
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 7.0 atol = 1e-4
+end
+
+function test_loa_reoptimize_respects_user_optimizer()
+    # If the user sets their own optimizer after LOA, a re-solve must keep
+    # it (the stashed solver only restores when the injected mock is still
+    # attached). Regression: an unconditional restore clobbered the choice.
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
+    set_optimizer(model, HiGHS.Optimizer)
+    set_attribute(model, "time_limit", 123.0)
+    set_silent(model)
+    optimize!(model, gdp_method = BigM())
+    # A clobbering restore would rebuild a fresh solver, losing the setting.
+    @test get_attribute(model, "time_limit") == 123.0
     @test value(x) ≈ 7.0 atol = 1e-6
 end
 
@@ -774,6 +821,8 @@ end
     test_is_linear_F()
     test_no_good_cut()
     test_loa_hook_simple()
+    test_loa_reoptimize()
+    test_loa_reoptimize_respects_user_optimizer()
     test_loa_solve_simple()
     test_loa_solve_simple_with_mbm()
     test_loa_solve_two_disjunctions()

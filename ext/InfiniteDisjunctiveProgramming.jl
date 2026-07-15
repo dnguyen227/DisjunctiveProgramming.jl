@@ -490,4 +490,23 @@ function DP.build_loa_problem(
         _transcribed_disaggregation_map(model))
 end
 
+# Inject the incumbent into the transcription backend and mark it ready so
+# InfiniteOpt value/objective queries return it. No binary restore (the
+# relaxed binaries are backend-transcribed and discarded on rebuild) and no
+# solver stash (a later reformulation mutates the InfiniteModel, invalidates
+# the backend, and rebuilds it fresh with the real optimizer).
+function DP._load_solution(
+    model::InfiniteOpt.InfiniteModel,
+    problem::DP._LOAProblem,
+    best_result,
+    method::DP.LOA,
+    solve_time::Real
+    )
+    primal = DP._incumbent_primal(problem, best_result)
+    DP._inject_solution(problem.nlp, primal, best_result.objective,
+        best_result.status, solve_time)
+    InfiniteOpt.set_transformation_backend_ready(model, true)
+    return
+end
+
 end

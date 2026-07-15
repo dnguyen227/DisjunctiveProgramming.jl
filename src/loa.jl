@@ -26,8 +26,8 @@ end
 #                            MAIN LOOP
 ################################################################################
 # LOA optimize hook: build the problem, seed with set-covering
-# combinations, iterate the master/NLP loop, commit the best
-# combination, and load it with a final direct solve.
+# combinations, iterate the master/NLP loop, then load the best
+# combination into the model by injecting its solution.
 function _optimize_hook(model::JuMP.AbstractModel, method::LOA; kwargs...)
     _clear_reformulations(model)
     reformulate_model(model, method.inner_method)
@@ -137,30 +137,17 @@ function _optimize_hook(model::JuMP.AbstractModel, method::LOA; kwargs...)
         _log_loa_progress(t_start, best_objective, master_bound)
     end
 
-    pins = best_result === nothing ? [] :
-        _commit_combination(model, best_result)
-    # The loading solve is a pinned formality, so an exhausted loop
-    # budget must not starve it: restore the model's own time limit.
+    # Clear the loop's leftover time-limit cap before handing the model
+    # back so it does not leak into a later re-solve.
     _restore_time_limit(nlp, original_time_limit)
     _report_loa_gap(best_objective, best_result, master_bound, sense_token,
         converged)
-    # The committed model (binaries relaxed and fixed) is not a clean
-    # reformulation, so any later reformulation method must rebuild.
+    # The injected solution is not a clean reformulation, so any later
+    # reformulation method must rebuild.
     _set_solution_method(model, method)
     _set_ready_to_optimize(model, false)
-    # Loading solve: the incumbent is fully pinned, so this is a
-    # formality that makes JuMP solution queries on `model` return it.
-    JuMP.optimize!(model; ignore_optimize_hook = true, kwargs...)
-    if best_result !== nothing && !JuMP.has_values(nlp)
-        # Observed with presolve-off Gurobi: the tiny pin boxes can be
-        # rejected numerically. Drop them and load by re-solving warm
-        # at the fixed combination instead.
-        _remove_pins(model, pins)
-        for (variable, value) in best_result.linearization_point
-            JuMP.set_start_value(variable, value)
-        end
-        JuMP.optimize!(model; ignore_optimize_hook = true, kwargs...)
-    end
+    best_result === nothing ||
+        _load_solution(model, problem, best_result, method, time() - t_start)
     return
 end
 
@@ -441,7 +428,8 @@ function _solve_nlp(
     if JuMP.is_solved_and_feasible(nlp)
         return (combination = combination,
             linearization_point = _extract_solution(nlp),
-            objective = JuMP.objective_value(nlp), feasible = true)
+            objective = JuMP.objective_value(nlp), feasible = true,
+            status = JuMP.termination_status(nlp))
     end
 
     # Primary NLP infeasible — try NLPF (unless disabled, in which case
@@ -524,40 +512,83 @@ function _set_nlp_warm_start(previous)
     return
 end
 
-# Finalize the NLP with the LOA incumbent: fix the binaries at the
-# committed combination and pin each linearization-point variable
-# inside a tight interval, so the loading solve only polishes the
-# incumbent instead of re-solving the NLP. Pins are interval rows
-# rather than `JuMP.fix` or equalities: variable bounds survive, the
-# rows stay out of Ipopt's degrees-of-freedom count (equality pins can
-# exceed it and are rejected as INVALID_MODEL), and the box is kept
-# comfortably wider than typical solver feasibility tolerances. On a
-# GDP model they register as reformulation constraints and the next
-# reformulation deletes them; on a transcription backend the next
-# rebuild discards them. Returns the pins for the loading-solve
-# fallback.
-function _commit_combination(model::JuMP.AbstractModel, result)
-    _fix_combination(result.combination)
-    pins = []
-    for (variable, value) in result.linearization_point
-        owner = JuMP.owner_model(variable)
-        tol = 1e-5 * max(1.0, abs(value))
-        pin = JuMP.@constraint(owner,
-            value - tol <= variable <= value + tol)
-        owner === model && push!(_reformulation_constraints(model), pin)
-        push!(pins, pin)
+################################################################################
+#                       LOAD SOLUTION BY INJECTION
+################################################################################
+# Complete primal for every NLP variable: the loop's linearization point
+# (non-fixed vars), a user fix value for the rest, overlaid with the
+# incumbent combination for the binaries (fixed during the loop, so absent
+# from the linearization point).
+function _incumbent_primal(problem::_LOAProblem, best_result)
+    nlp = problem.nlp
+    V = JuMP.variable_ref_type(typeof(nlp))
+    T = JuMP.value_type(typeof(nlp))
+    primal = Dict{V, T}()
+    for v in JuMP.all_variables(nlp)
+        if haskey(best_result.linearization_point, v)
+            primal[v] = best_result.linearization_point[v]
+        elseif JuMP.is_fixed(v)
+            primal[v] = JuMP.fix_value(v)
+        else
+            primal[v] = zero(T)
+        end
     end
-    return pins
+    for (binary, active) in best_result.combination
+        primal[binary] = active ? one(T) : zero(T)
+    end
+    return primal
 end
 
-# Loading-solve fallback: delete the pins (and untrack them so the next
-# clear does not double-delete) ahead of a warm re-solve.
-function _remove_pins(model::JuMP.AbstractModel, pins::Vector)
-    pin_set = Set(pins)
-    for pin in pins
-        JuMP.delete(JuMP.owner_model(pin), pin)
+# Attach a MockOptimizer preloaded with the incumbent so native JuMP
+# queries (value, objective_value, termination_status) return it with no
+# solve and no added constraints. `is_model_dirty = false` unlocks the
+# result queries (JuMP otherwise guards them and throws OptimizeNotCalled).
+function _inject_solution(
+    nlp::JuMP.AbstractModel,
+    primal::AbstractDict,
+    objective,
+    status::_MOI.TerminationStatusCode,
+    solve_time::Real
+    )
+    T = JuMP.value_type(typeof(nlp))
+    JuMP.set_optimizer(nlp, () -> _MOI.Utilities.MockOptimizer(
+        _MOI.Utilities.UniversalFallback(_MOI.Utilities.Model{T}()));
+        add_bridges = false)
+    _MOI.Utilities.attach_optimizer(JuMP.backend(nlp))
+    mock = JuMP.unsafe_backend(nlp)
+    _MOI.set(mock, _MOI.TerminationStatus(), status)
+    _MOI.set(mock, _MOI.PrimalStatus(), _MOI.FEASIBLE_POINT)
+    _MOI.set(mock, _MOI.ResultCount(), 1)
+    _MOI.set(mock, _MOI.ObjectiveValue(), objective)
+    _MOI.set(mock, _MOI.SolveTimeSec(), Float64(solve_time))
+    _MOI.set(mock, _MOI.RawStatusString(), "LOA incumbent (injected)")
+    for (variable, value) in primal
+        _MOI.set(mock, _MOI.VariablePrimal(),
+            JuMP.optimizer_index(variable), value)
     end
-    filter!(c -> !(c in pin_set), _reformulation_constraints(model))
+    nlp.is_model_dirty = false
+    return
+end
+
+# Finalize a finite GDP: drop the loop's incumbent binary fixes so the
+# model carries no leftover fixes, then inject the incumbent. The binaries
+# stay relaxed; a later reformulation restores their integrality.
+# Dispatchable so extensions (InfiniteOpt) override for their own type.
+function _load_solution(
+    model::JuMP.AbstractModel,
+    problem::_LOAProblem,
+    best_result,
+    method::LOA,
+    solve_time::Real
+    )
+    V = JuMP.variable_ref_type(typeof(model))
+    for (_, bvar) in _indicator_to_binary(model)
+        bvar isa V && JuMP.is_fixed(bvar) && JuMP.unfix(bvar)
+    end
+    primal = _incumbent_primal(problem, best_result)
+    _inject_solution(problem.nlp, primal, best_result.objective,
+        best_result.status, solve_time)
+    gdp_data(model).loa_solver = method.nlp_optimizer
     return
 end
 
