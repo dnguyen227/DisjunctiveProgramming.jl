@@ -369,6 +369,101 @@ function test_loa_restores_prior_time_limit()
     @test objective_value(model) ≈ 7.0 atol = 1e-4
 end
 
+function test_loa_restores_displaced_optimizer()
+    # LOA solves the NLP on the model itself, so it displaces the
+    # model's own optimizer. A later reformulation solve must get that
+    # optimizer back, not LOA's NLP solver.
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    set_optimizer_attribute(model, "mip_rel_gap", 0.25)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    displaced = JuMP.unsafe_backend(model)
+
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
+    @test DP.gdp_data(model).displaced_optimizer === displaced
+
+    # The reformulation solve restores it, attributes intact.
+    optimize!(model, gdp_method = BigM())
+    @test JuMP.unsafe_backend(model) === displaced
+    @test get_optimizer_attribute(model, "mip_rel_gap") == 0.25
+    @test DP.gdp_data(model).displaced_optimizer === nothing
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 7.0 atol = 1e-4
+end
+
+function test_loa_repeated_solve_keeps_displaced_optimizer()
+    # A second LOA solve displaces the first one's result cache, not the
+    # model's own optimizer. The stash must still hold the latter.
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    displaced = JuMP.unsafe_backend(model)
+
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
+    @test DP.gdp_data(model).displaced_optimizer === displaced
+
+    optimize!(model, gdp_method = BigM())
+    @test JuMP.unsafe_backend(model) === displaced
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 7.0 atol = 1e-4
+end
+
+function test_loa_no_optimizer_to_restore()
+    # With no optimizer to put back, the result cache must be dropped
+    # rather than left to serve its stored results as a fresh solve.
+    model = GDPModel()
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
+    @test DP.gdp_data(model).displaced_optimizer === nothing
+    @test objective_value(model) ≈ 7.0 atol = 1e-4
+
+    @test_throws JuMP.NoOptimizer optimize!(model, gdp_method = BigM())
+    set_optimizer(model, HiGHS.Optimizer)
+    set_silent(model)
+    optimize!(model, gdp_method = BigM())
+    @test objective_value(model) ≈ 7.0 atol = 1e-4
+end
+
+function test_loa_cache_refuses_direct_solve()
+    # `ignore_optimize_hook = true` would "solve" the result cache and
+    # clear JuMP's dirty flag, reporting a stale point as freshly
+    # solved. It must error instead.
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
+    @test_throws ErrorException optimize!(model;
+        ignore_optimize_hook = true)
+
+    # Still true once the model has been edited underneath the cache.
+    @constraint(model, x <= 1)
+    @test !has_values(model)
+    @test_throws ErrorException optimize!(model;
+        ignore_optimize_hook = true)
+end
+
 function test_loa_limit_hit_report()
     # Stop the main loop on `max_iter = 1` after the master has produced
     # a bound: the report must label the run "limit hit" (not converged),
@@ -901,6 +996,10 @@ end
     test_loa_nonlinear_equality_disjunct()
     test_loa_nonlinear_interval_disjunct()
     test_loa_restores_prior_time_limit()
+    test_loa_restores_displaced_optimizer()
+    test_loa_repeated_solve_keeps_displaced_optimizer()
+    test_loa_no_optimizer_to_restore()
+    test_loa_cache_refuses_direct_solve()
     test_loa_limit_hit_report()
     test_loa_complement_indicator_nonlinear_disjunct()
     test_loa_nlpf_infeasible_disjunct()

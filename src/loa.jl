@@ -42,7 +42,8 @@ function _optimize_hook(model::JuMP.AbstractModel, method::LOA; kwargs...)
     master = _build_loa_master(problem, method)
     _relax_binaries(problem)
     nlp = problem.nlp
-    JuMP.set_optimizer(nlp, method.nlp_optimizer)
+    displaced_optimizer = _install_nlp_optimizer(nlp, method.nlp_optimizer,
+        gdp_data(model).displaced_optimizer)
     JuMP.set_silent(nlp)
     t_start = time()
     overall_deadline = t_start + method.time_limit
@@ -181,7 +182,8 @@ function _optimize_hook(model::JuMP.AbstractModel, method::LOA; kwargs...)
     end
     outcome = (results = feasible_results, status = status,
         raw_status = message, bound = bound,
-        solve_time = time() - t_start, solver_name = solver)
+        solve_time = time() - t_start, solver_name = solver,
+        displaced_optimizer = displaced_optimizer)
     # Injection is not a reformulation; a later method must rebuild.
     _set_solution_method(model, method)
     _set_ready_to_optimize(model, false)
@@ -403,6 +405,50 @@ function _restore_binaries(problem::_LOAProblem)
 end
 
 ################################################################################
+#                         OPTIMIZER HANDOVER
+################################################################################
+# Install the NLP solver, returning the optimizer it displaces. LOA
+# solves the NLP on the model itself, so that one is the user's own. A
+# re-solve displaces the last run's cache instead, so `previous` (the
+# optimizer already stashed) carries through untouched.
+function _install_nlp_optimizer(
+    nlp::JuMP.AbstractModel,
+    nlp_optimizer,
+    previous
+    )
+    backend = JuMP.backend(nlp)
+    displaced = if backend isa _MOI.Utilities.CachingOptimizer &&
+            backend.optimizer !== nothing
+        JuMP.unsafe_backend(nlp)
+    else
+        nothing
+    end
+    JuMP.set_optimizer(nlp, nlp_optimizer)
+    return displaced isa _LOAResultCache ? previous : displaced
+end
+
+# Model types without a MOI backend of their own never carry a cache.
+function _has_loa_cache(model::JuMP.GenericModel)
+    backend = JuMP.backend(model)
+    return backend isa _MOI.Utilities.CachingOptimizer &&
+        backend.optimizer isa _LOAResultCache
+end
+_has_loa_cache(::JuMP.AbstractModel) = false
+
+# Restore the displaced optimizer, emptied so the re-solve copies the
+# model in. Without one, drop the cache rather than serve its results.
+function _restore_displaced_optimizer(model::JuMP.AbstractModel)
+    displaced = gdp_data(model).displaced_optimizer
+    if displaced === nothing
+        _MOI.Utilities.drop_optimizer(JuMP.backend(model))
+    else
+        _MOI.empty!(displaced)
+        JuMP.set_optimizer(model, () -> displaced)
+    end
+    return
+end
+
+################################################################################
 #                         MASTER CONSTRUCTION
 ################################################################################
 # True for linear constraint function types (variable refs / affine).
@@ -602,12 +648,18 @@ end
 #                       LOA RESULT CACHE (MOI LAYER)
 ################################################################################
 # `_LOAResultCache` delegates the MOI interface to its inner mock. Only
-# `SolverName` (the mock hardcodes "Mock") and the bound attributes (a
+# `SolverName` (the mock hardcodes "Mock"), the bound attributes (a
 # raw `KeyError` from the mock's generic storage when the master
-# produced no bound) are intercepted.
+# produced no bound), and `optimize!` are intercepted.
 _MOI.is_empty(cache::_LOAResultCache) = _MOI.is_empty(cache.mock)
 _MOI.empty!(cache::_LOAResultCache) = _MOI.empty!(cache.mock)
-_MOI.optimize!(cache::_LOAResultCache) = _MOI.optimize!(cache.mock)
+# "Solving" the cache would clear JuMP's dirty flag and serve the stored
+# results again, so an edited model would report a stale point as fresh.
+function _MOI.optimize!(cache::_LOAResultCache)
+    return error("This model holds the results of an LOA solve and " *
+        "cannot be re-solved directly (`ignore_optimize_hook = true`). " *
+        "Call `optimize!(model, gdp_method = ...)` to rebuild and solve.")
+end
 _MOI.copy_to(cache::_LOAResultCache, src::_MOI.ModelLike) =
     _MOI.copy_to(cache.mock, src)
 _MOI.add_variable(cache::_LOAResultCache) = _MOI.add_variable(cache.mock)
@@ -817,7 +869,7 @@ function _load_solution(
     _MOI.Utilities.drop_optimizer(JuMP.backend(problem.nlp))
     _restore_binaries(problem)
     _inject_solution(problem.nlp, problem, outcome)
-    gdp_data(model).loa_solver = method.nlp_optimizer
+    gdp_data(model).displaced_optimizer = outcome.displaced_optimizer
     return
 end
 

@@ -739,9 +739,9 @@ mutable struct GDPData{M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, C
     # Solution data
     solution_method::Union{Nothing, AbstractSolutionMethod}
     ready_to_optimize::Bool
-    # Real solver stashed by an LOA solve so a later reformulation
-    # re-solve can replace the injected solution optimizer.
-    loa_solver::Any
+    # The optimizer an LOA solve displaced (it solves the NLP in place),
+    # stashed so a later reformulation re-solve can put it back.
+    displaced_optimizer::Any
 
     # Default constructor
     function GDPData{M, V, C}() where {M <: JuMP.AbstractModel, V <: JuMP.AbstractVariableRef, C}
