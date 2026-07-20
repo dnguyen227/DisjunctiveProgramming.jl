@@ -576,7 +576,14 @@ iteration) and a master MILP accumulating OA and no-good cuts.
 LOA is a solution algorithm, not a reformulation: it is invoked with
 `optimize!(model, gdp_method = LOA(...))`, always re-runs on `optimize!`,
 and is not accepted by [`reformulate_model`](@ref). After the run the
-incumbent is loaded into `model`, so JuMP solution queries work directly.
+results are loaded into `model`, so the standard JuMP queries answer
+directly: `termination_status` reports the LOA-level outcome
+(`LOCALLY_SOLVED` on convergence or combination exhaustion, the binding
+limit otherwise), `objective_bound` and `relative_gap` report the master
+bound, `raw_status` carries the run summary, and every feasible
+combination visited is exposed as a solution-pool result
+(`value(x; result = k)`, best first). Duals are not available, matching
+other MI(N)LP solvers.
 
 ## Fields
 - `nlp_optimizer::O`: solver for the primary NLP.
@@ -682,6 +689,17 @@ struct _LOAMaster{M <: JuMP.AbstractModel, VM, OF, AO, DG}
     objective::OF
     alpha_oa::AO
     disaggregator::DG
+end
+
+# The optimizer left in a model's backend slot after an LOA solve: a
+# `MockOptimizer` preloaded with the run's results so every standard
+# JuMP query answers with no solve, plus the composed solver name (the
+# mock's own is hardcoded to "Mock"). `model.jl` detects this type to
+# swap the real solver back before a later reformulation solve.
+struct _LOAResultCache{O <: _MOI.Utilities.MockOptimizer} <:
+        _MOI.AbstractOptimizer
+    mock::O
+    name::String
 end
 
 ################################################################################

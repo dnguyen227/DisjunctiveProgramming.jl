@@ -200,7 +200,7 @@ function test_loa_solve_simple()
     @objective(model, Max, x)
 
     optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
-    @test termination_status(model) == MOI.OPTIMAL
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
     @test objective_value(model) ≈ 7.0 atol=1e-4
 end
 
@@ -219,7 +219,7 @@ function test_loa_solve_simple_with_mbm()
 
     optimize!(model, gdp_method = LOA(HiGHS.Optimizer;
         inner_method = MBM(HiGHS.Optimizer)))
-    @test termination_status(model) == MOI.OPTIMAL
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
     @test objective_value(model) ≈ 7.0 atol=1e-4
 end
 
@@ -243,7 +243,7 @@ function test_loa_solve_two_disjunctions()
     @objective(model, Max, x + z)
 
     optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
-    @test termination_status(model) == MOI.OPTIMAL
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
     @test objective_value(model) ≈ 12.0 atol=1e-4
 end
 
@@ -365,7 +365,7 @@ function test_loa_restores_prior_time_limit()
     optimize!(model, gdp_method = LOA(HiGHS.Optimizer;
         iteration_time_limit = 60.0, time_limit = Inf))
     @test time_limit_sec(model) == 90.0
-    @test termination_status(model) == MOI.OPTIMAL
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
     @test objective_value(model) ≈ 7.0 atol = 1e-4
 end
 
@@ -390,6 +390,8 @@ function test_loa_limit_hit_report()
     @test_logs (:info, r"limit hit") match_mode = :any begin
         optimize!(model, gdp_method = method)
     end
+    @test termination_status(model) == MOI.ITERATION_LIMIT
+    @test primal_status(model) == MOI.FEASIBLE_POINT
     @test objective_value(model) ≈ -10.0 atol = 1e-4
 end
 
@@ -595,7 +597,7 @@ function test_loa_iteration_loop()
     @disjunction(model, W)
     @objective(model, Min, x - z)
     optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
-    @test termination_status(model) == MOI.OPTIMAL
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
     @test objective_value(model) ≈ -10.0 atol = 1e-4
     @test value(Y[1]) ≈ 1.0 atol = 1e-6
     @test value(W[2]) ≈ 1.0 atol = 1e-6
@@ -622,13 +624,13 @@ function test_loa_time_limits()
 
     model = build_model()
     optimize!(model, gdp_method = LOA(HiGHS.Optimizer; time_limit = 60.0))
-    @test termination_status(model) == MOI.OPTIMAL
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
     @test objective_value(model) ≈ 7.0 atol = 1e-4
 
     model = build_model()
     optimize!(model, gdp_method = LOA(HiGHS.Optimizer;
         iteration_time_limit = 60.0, time_limit = Inf))
-    @test termination_status(model) == MOI.OPTIMAL
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
     @test objective_value(model) ≈ 7.0 atol = 1e-4
 end
 
@@ -639,7 +641,7 @@ function test_loa_no_feasible_incumbent()
     # returns its infeasible fallback. No seed or loop NLP yields a
     # feasible incumbent, so `best_result` stays `nothing`, the master
     # is infeasible (no bound), and LOA exits on the "no feasible
-    # incumbent" warning from `_report_loa_gap`.
+    # incumbent" warning from `_loa_status_message`.
     model = GDPModel(HiGHS.Optimizer)
     set_silent(model)
     @variable(model, 0 <= x <= 10)
@@ -654,6 +656,16 @@ function test_loa_no_feasible_incumbent()
         optimize!(model, gdp_method = method)
     end
     @test !DP._ready_to_optimize(model)
+    # The failed run still answers the standard result API the way a
+    # native solver does: the linear equality makes the very first
+    # master infeasible (a genuine certificate), the pool is empty, and
+    # value/bound queries throw the standard errors.
+    @test termination_status(model) == MOI.INFEASIBLE
+    @test result_count(model) == 0
+    @test !has_values(model)
+    @test occursin("no feasible incumbent", raw_status(model))
+    @test_throws MOI.ResultIndexBoundsError value(x)
+    @test_throws MOI.GetAttributeNotAllowed objective_bound(model)
 end
 
 function test_loa_hull_linear()
@@ -671,7 +683,7 @@ function test_loa_hull_linear()
     @objective(model, Max, x)
     optimize!(model, gdp_method = LOA(HiGHS.Optimizer;
         inner_method = Hull()))
-    @test termination_status(model) == MOI.OPTIMAL
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
     @test objective_value(model) ≈ 7.0 atol = 1e-4
 end
 
@@ -692,7 +704,7 @@ function test_loa_hull_two_disjunctions()
     @objective(model, Max, x + z)
     optimize!(model, gdp_method = LOA(HiGHS.Optimizer;
         inner_method = Hull()))
-    @test termination_status(model) == MOI.OPTIMAL
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
     @test objective_value(model) ≈ 12.0 atol = 1e-4
 end
 
@@ -786,11 +798,68 @@ function test_loa_hull_nested_disaggregation_map()
     @test haskey(disaggregations, (x, y[2]))
 end
 
+function test_loa_result_attributes()
+    # Post-LOA the model answers the full standard JuMP result API from
+    # the injected result cache: LOA-level status, composed solver name,
+    # master bound and gap, wall-clock time, and one solution-pool
+    # result per feasible combination (best first). Both disjuncts are
+    # nonlinear so set covering must visit both combinations, making
+    # the pool size deterministic.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    model = GDPModel(ipopt)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @constraint(model, cap, x <= 9)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x^2 <= 9, Disjunct(Y[1]))
+    @constraint(model, x^2 <= 49, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    optimize!(model,
+        gdp_method = LOA(ipopt; mip_optimizer = HiGHS.Optimizer))
+
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
+    @test primal_status(model) == MOI.FEASIBLE_POINT
+    @test dual_status(model) == MOI.NO_SOLUTION
+    @test_throws MOI.GetAttributeNotAllowed dual_objective_value(model)
+    @test_throws MOI.GetAttributeNotAllowed dual(cap)
+    @test startswith(solver_name(model), "LOA(BigM")
+    @test occursin("Ipopt", solver_name(model))
+    @test occursin("HiGHS", solver_name(model))
+    @test occursin("LOA finished", raw_status(model))
+    @test objective_bound(model) ≈ 7.0 atol = 1e-3
+    @test relative_gap(model) <= 1e-3
+    @test solve_time(model) >= 0.0
+    # Solution pool: both combinations feasible, best first.
+    @test result_count(model) == 2
+    @test objective_value(model) ≈ 7.0 atol = 1e-3
+    @test value(x) ≈ 7.0 atol = 1e-3
+    @test value(Y[2]) ≈ 1.0 atol = 1e-6
+    @test primal_status(model; result = 2) == MOI.FEASIBLE_POINT
+    @test objective_value(model; result = 2) ≈ 3.0 atol = 1e-3
+    @test value(x; result = 2) ≈ 3.0 atol = 1e-3
+    @test primal_status(model; result = 3) == MOI.NO_SOLUTION
+    # ConstraintPrimal is served by evaluating at the injected primal.
+    @test value(cap) ≈ 7.0 atol = 1e-3
+    # solution_summary exercises nearly every query in one call.
+    summary = sprint(show, solution_summary(model))
+    @test occursin("LOA(", summary)
+    @test occursin("LOCALLY_SOLVED", summary)
+    # The binaries come back binary, unfixed, and bound-free.
+    bins = [v for (_, v) in DP._indicator_to_binary(model)
+        if v isa JuMP.VariableRef]
+    @test all(JuMP.is_binary, bins)
+    @test all(!JuMP.is_fixed, bins)
+    @test all(!JuMP.has_lower_bound, bins)
+end
+
 function test_reformulate_after_loa_restores_binaries()
-    # LOA relaxes the logical binaries and fixes them to its incumbent, so
-    # a later reformulation of the same model must restore binary
-    # integrality. Regression: a nested disjunction's tight-M looked up a
-    # relaxed binary's bounds and threw a KeyError.
+    # LOA relaxes the logical binaries and fixes them per iteration; at
+    # exit it must hand them back binary and unfixed so a later
+    # reformulation of the same model works unchanged. Regression: a
+    # nested disjunction's tight-M looked up a relaxed binary's bounds
+    # and threw a KeyError.
     model = GDPModel(HiGHS.Optimizer)
     set_silent(model)
     @variable(model, 1 <= x <= 9)
@@ -806,10 +875,10 @@ function test_reformulate_after_loa_restores_binaries()
     optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
     bins = [v for (_, v) in DP._indicator_to_binary(model)
         if v isa JuMP.VariableRef]
-    @test all(!JuMP.is_binary, bins)          # LOA left them relaxed
+    @test all(JuMP.is_binary, bins)           # restored at LOA exit
+    @test all(!JuMP.is_fixed, bins)
 
     @test optimize!(model, gdp_method = BigM()) isa Nothing
-    @test all(JuMP.is_binary, bins)           # restored by reformulation
     @test termination_status(model) == MOI.OPTIMAL
     @test objective_value(model) ≈ 9
 end
@@ -847,5 +916,6 @@ end
     test_loa_hull_nonlinear_disjunct()
     test_loa_hull_complement_nonlinear()
     test_loa_hull_nested_disaggregation_map()
+    test_loa_result_attributes()
     test_reformulate_after_loa_restores_binaries()
 end

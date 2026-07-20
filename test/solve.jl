@@ -64,7 +64,7 @@ function test_linear_gdp_example(m, use_complements = false)
     @test !value(W[2])
 
     @test optimize!(m, gdp_method = LOA(HiGHS.Optimizer)) isa Nothing
-    @test termination_status(m) == MOI.OPTIMAL
+    @test termination_status(m) == MOI.LOCALLY_SOLVED
     @test objective_value(m) ≈ 11 atol=1e-3
     @test value.(x) ≈ [9,2] atol=1e-3
     @test !value(Y[1])

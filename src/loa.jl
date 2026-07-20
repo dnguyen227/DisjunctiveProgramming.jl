@@ -13,6 +13,9 @@ _is_better(::Val{_MOI.MIN_SENSE}, new, best) = new < best
 _is_better(::Val{_MOI.MAX_SENSE}, new, best) = new > best
 _gap(::Val{_MOI.MIN_SENSE}, best, bound) = best - bound
 _gap(::Val{_MOI.MAX_SENSE}, best, bound) = bound - best
+# A valid overall bound is the weaker of two partial bounds.
+_loosest_bound(::Val{_MOI.MIN_SENSE}, best, bound) = min(best, bound)
+_loosest_bound(::Val{_MOI.MAX_SENSE}, best, bound) = max(best, bound)
 
 # One progress record per NLP solve, for external convergence traces.
 function _log_loa_progress(t_start::Float64, best_objective, master_bound)
@@ -26,8 +29,8 @@ end
 #                            MAIN LOOP
 ################################################################################
 # LOA optimize hook: build the problem, seed with set-covering
-# combinations, iterate the master/NLP loop, then load the best
-# combination into the model by injecting its solution.
+# combinations, iterate the master/NLP loop, then load the results into
+# the model by injecting every feasible combination found (best first).
 function _optimize_hook(model::JuMP.AbstractModel, method::LOA; kwargs...)
     _clear_reformulations(model)
     reformulate_model(model, method.inner_method)
@@ -50,6 +53,10 @@ function _optimize_hook(model::JuMP.AbstractModel, method::LOA; kwargs...)
     best_objective = _worst_objective(sense_token)
     best_result = nothing
     master_bound = nothing
+    feasible_results = NamedTuple[]
+    master_failure = nothing
+    cuts_added = false
+    converged = false
 
     # Set-covering seed. This mimics Pyomo GDPopt's set-covering
     # initialization: borrow the master as a covering MILP (only its
@@ -77,18 +84,24 @@ function _optimize_hook(model::JuMP.AbstractModel, method::LOA; kwargs...)
         combination = solved ? _extract_combination(problem, master) : nothing
         JuMP.set_objective_sense(master.model, master.objective_sense)
         JuMP.set_objective_function(master.model, oa_objective)
-        solved || break
+        if !solved
+            master_failure = JuMP.termination_status(master.model)
+            break
+        end
         _set_nlp_warm_start(previous_result)
         result = _solve_nlp(problem, combination, method;
             deadline = loop_deadline)
         avoid_combination(master.model, combination, master.variable_map)
         _add_oa_cuts(problem, master, result, method)
-        if result.feasible &&
-                _is_better(sense_token, result.objective, best_objective)
-            best_objective = result.objective
-            best_result = result
+        cuts_added = true
+        if result.feasible
+            push!(feasible_results, result)
+            previous_result = result
+            if _is_better(sense_token, result.objective, best_objective)
+                best_objective = result.objective
+                best_result = result
+            end
         end
-        result.feasible && (previous_result = result)
         _log_loa_progress(t_start, best_objective, master_bound)
         # A disjunct counts as covered only once it is active in a
         # feasible NLP. An infeasible combination still contributes its
@@ -105,12 +118,14 @@ function _optimize_hook(model::JuMP.AbstractModel, method::LOA; kwargs...)
 
     # Master/NLP loop: `alpha_oa` is the bound, the NLP refines the
     # incumbent. Exit on convergence, infeasible master, max_iter, or time.
-    converged = false
     for _ in 1:method.max_iter
         time() < loop_deadline || break
         _cap_remaining_time(master.model, loop_deadline)
         JuMP.optimize!(master.model)
-        JuMP.is_solved_and_feasible(master.model) || break
+        if !JuMP.is_solved_and_feasible(master.model)
+            master_failure = JuMP.termination_status(master.model)
+            break
+        end
         master_bound = JuMP.value(master.alpha_oa)
         if best_result !== nothing
             gap = _gap(sense_token, best_objective, master_bound)
@@ -128,54 +143,111 @@ function _optimize_hook(model::JuMP.AbstractModel, method::LOA; kwargs...)
             deadline = loop_deadline)
         avoid_combination(master.model, combination, master.variable_map)
         _add_oa_cuts(problem, master, result, method)
-        if result.feasible &&
-                _is_better(sense_token, result.objective, best_objective)
-            best_objective = result.objective
-            best_result = result
+        cuts_added = true
+        if result.feasible
+            push!(feasible_results, result)
+            previous_result = result
+            if _is_better(sense_token, result.objective, best_objective)
+                best_objective = result.objective
+                best_result = result
+            end
         end
-        result.feasible && (previous_result = result)
         _log_loa_progress(t_start, best_objective, master_bound)
     end
 
-    # Clear the loop's leftover time-limit cap before handing the model
-    # back so it does not leak into a later re-solve.
     _restore_time_limit(nlp, original_time_limit)
-    _report_loa_gap(best_objective, best_result, master_bound, sense_token,
-        converged)
-    # The injected solution is not a clean reformulation, so any later
-    # reformulation method must rebuild.
+    status = _loa_termination_status(best_result !== nothing, converged,
+        master_failure, cuts_added, time() >= loop_deadline)
+    message = _loa_status_message(status, best_objective, best_result,
+        master_bound, sense_token)
+    best_result === nothing ? (@warn message) : (@info message)
+    # Must be read before the injection replaces the NLP's optimizer.
+    solver = "LOA(" * string(nameof(typeof(method.inner_method))) *
+        ", nlp = " * JuMP.solver_name(nlp) *
+        ", master = " * JuMP.solver_name(master.model) * ")"
+    sort!(feasible_results; by = result -> result.objective,
+        rev = master.objective_sense == _MOI.MAX_SENSE)
+    # No-good cuts mean the master bound only covers unvisited
+    # combinations, so the reported bound folds in the incumbent
+    # (`raw_status` above keeps the unfolded master bound).
+    bound = if best_result === nothing
+        master_bound
+    elseif _infeasible_master(master_failure)
+        best_objective
+    elseif master_bound === nothing
+        nothing
+    else
+        _loosest_bound(sense_token, best_objective, master_bound)
+    end
+    outcome = (results = feasible_results, status = status,
+        raw_status = message, bound = bound,
+        solve_time = time() - t_start, solver_name = solver)
+    # Injection is not a reformulation; a later method must rebuild.
     _set_solution_method(model, method)
     _set_ready_to_optimize(model, false)
-    best_result === nothing ||
-        _load_solution(model, problem, best_result, method, time() - t_start)
+    _load_solution(model, problem, outcome, method)
     return
 end
 
-# Report the final gap. The bound is rigorous only for a convex inner
-# problem; on a nonconvex one it can cross the incumbent (negative gap).
-function _report_loa_gap(
+# Master statuses that report infeasibility. A local claim
+# (LOCALLY_INFEASIBLE, e.g. from an NLP-based MILP solver like Juniper)
+# counts for combination exhaustion, but only a global certificate
+# justifies the global INFEASIBLE report.
+_infeasible_master(::Nothing) = false
+_infeasible_master(status::_MOI.TerminationStatusCode) = status in
+    (_MOI.INFEASIBLE, _MOI.INFEASIBLE_OR_UNBOUNDED,
+        _MOI.LOCALLY_INFEASIBLE)
+_proven_infeasible_master(::Nothing) = false
+_proven_infeasible_master(status::_MOI.TerminationStatusCode) = status in
+    (_MOI.INFEASIBLE, _MOI.INFEASIBLE_OR_UNBOUNDED)
+
+# LOA-level termination status, reported the way a native solver would:
+# convergence and combination exhaustion (master infeasible with an
+# incumbent in hand) are locally solved (a local NLP solver cannot
+# certify global optimality), a master proven infeasible before any cut
+# proves the linear relaxation infeasible, exhaustion without an
+# incumbent is only a local claim, and otherwise the binding limit is
+# reported (`OTHER_LIMIT` for a master solve that failed without an
+# infeasibility status, e.g. on its own time cap).
+function _loa_termination_status(
+    found_incumbent::Bool,
+    converged::Bool,
+    master_failure::Union{Nothing, _MOI.TerminationStatusCode},
+    cuts_added::Bool,
+    timed_out::Bool
+    )
+    (converged || (_infeasible_master(master_failure) && found_incumbent)) &&
+        return _MOI.LOCALLY_SOLVED
+    _proven_infeasible_master(master_failure) && !cuts_added &&
+        return _MOI.INFEASIBLE
+    _infeasible_master(master_failure) && return _MOI.LOCALLY_INFEASIBLE
+    timed_out && return _MOI.TIME_LIMIT
+    master_failure === nothing || return _MOI.OTHER_LIMIT
+    return _MOI.ITERATION_LIMIT
+end
+
+# Human-readable run summary: logged at the end of the hook and stored
+# as the model's `RawStatusString`. The bound is rigorous only for a
+# convex inner problem; on a nonconvex one it can cross the incumbent
+# (negative gap).
+function _loa_status_message(
+    status::_MOI.TerminationStatusCode,
     best_objective::Real,
     best_result,
     master_bound,
-    sense_token::Val,
-    converged::Bool
+    sense_token::Val
     )
-    if best_result === nothing
-        @warn "LOA finished: no feasible incumbent found."
-        return
-    end
-    if master_bound === nothing
-        @info "LOA finished [no bound]: incumbent $best_objective " *
+    best_result === nothing &&
+        return "LOA finished [$status]: no feasible incumbent found."
+    master_bound === nothing &&
+        return "LOA finished [$status]: incumbent $best_objective " *
             "(master produced no bound; best seed kept)."
-        return
-    end
     gap = _gap(sense_token, best_objective, master_bound)
     relative = abs(best_objective) > 1e-10 ?
         gap / abs(best_objective) : gap
-    label = converged ? "converged" : "limit hit"
-    @info "LOA finished [$label]: incumbent $best_objective, master " *
+    label = status == _MOI.LOCALLY_SOLVED ? "converged" : "limit hit"
+    return "LOA finished [$label]: incumbent $best_objective, master " *
         "bound $master_bound, gap $gap (relative $relative)."
-    return
 end
 
 ################################################################################
@@ -315,6 +387,21 @@ function _relax_binaries(problem::_LOAProblem)
     return
 end
 
+# Undo `_relax_binaries` and the loop's last combination fix: drop the
+# fix and the relaxation bounds, then restore integrality so the model
+# is handed back with its binaries exactly as the reformulation created
+# them. (A fixed binary carries no bounds — `fix(; force = true)`
+# deleted them — while an unfixed one still carries the relaxation's.)
+function _restore_binaries(problem::_LOAProblem)
+    for binary in problem.binaries
+        JuMP.is_fixed(binary) && JuMP.unfix(binary)
+        JuMP.has_lower_bound(binary) && JuMP.delete_lower_bound(binary)
+        JuMP.has_upper_bound(binary) && JuMP.delete_upper_bound(binary)
+        JuMP.set_binary(binary)
+    end
+    return
+end
+
 ################################################################################
 #                         MASTER CONSTRUCTION
 ################################################################################
@@ -428,8 +515,7 @@ function _solve_nlp(
     if JuMP.is_solved_and_feasible(nlp)
         return (combination = combination,
             linearization_point = _extract_solution(nlp),
-            objective = JuMP.objective_value(nlp), feasible = true,
-            status = JuMP.termination_status(nlp))
+            objective = JuMP.objective_value(nlp), feasible = true)
     end
 
     # Primary NLP infeasible — try NLPF (unless disabled, in which case
@@ -513,81 +599,224 @@ function _set_nlp_warm_start(previous)
 end
 
 ################################################################################
+#                       LOA RESULT CACHE (MOI LAYER)
+################################################################################
+# `_LOAResultCache` delegates the MOI interface to its inner mock. Only
+# `SolverName` (the mock hardcodes "Mock") and the bound attributes (a
+# raw `KeyError` from the mock's generic storage when the master
+# produced no bound) are intercepted.
+_MOI.is_empty(cache::_LOAResultCache) = _MOI.is_empty(cache.mock)
+_MOI.empty!(cache::_LOAResultCache) = _MOI.empty!(cache.mock)
+_MOI.optimize!(cache::_LOAResultCache) = _MOI.optimize!(cache.mock)
+_MOI.copy_to(cache::_LOAResultCache, src::_MOI.ModelLike) =
+    _MOI.copy_to(cache.mock, src)
+_MOI.add_variable(cache::_LOAResultCache) = _MOI.add_variable(cache.mock)
+function _MOI.add_constraint(
+    cache::_LOAResultCache,
+    func::_MOI.AbstractFunction,
+    set::_MOI.AbstractSet
+    )
+    return _MOI.add_constraint(cache.mock, func, set)
+end
+_MOI.delete(cache::_LOAResultCache, index::_MOI.Index) =
+    _MOI.delete(cache.mock, index)
+_MOI.is_valid(cache::_LOAResultCache, index::_MOI.Index) =
+    _MOI.is_valid(cache.mock, index)
+function _MOI.modify(
+    cache::_LOAResultCache,
+    ci::_MOI.ConstraintIndex,
+    change::_MOI.AbstractFunctionModification
+    )
+    return _MOI.modify(cache.mock, ci, change)
+end
+function _MOI.modify(
+    cache::_LOAResultCache,
+    attr::_MOI.ObjectiveFunction,
+    change::_MOI.AbstractFunctionModification
+    )
+    return _MOI.modify(cache.mock, attr, change)
+end
+function _MOI.supports_constraint(
+    cache::_LOAResultCache,
+    F::Type{<:_MOI.AbstractFunction},
+    S::Type{<:_MOI.AbstractSet}
+    )
+    return _MOI.supports_constraint(cache.mock, F, S)
+end
+function _MOI.supports(
+    cache::_LOAResultCache,
+    attr::Union{_MOI.AbstractModelAttribute,
+        _MOI.AbstractOptimizerAttribute}
+    )
+    return _MOI.supports(cache.mock, attr)
+end
+function _MOI.supports(
+    cache::_LOAResultCache,
+    attr::Union{_MOI.AbstractVariableAttribute,
+        _MOI.AbstractConstraintAttribute},
+    IdxType::Type{<:_MOI.Index}
+    )
+    return _MOI.supports(cache.mock, attr, IdxType)
+end
+function _MOI.get(
+    cache::_LOAResultCache,
+    attr::Union{_MOI.AbstractModelAttribute,
+        _MOI.AbstractOptimizerAttribute}
+    )
+    return _MOI.get(cache.mock, attr)
+end
+function _MOI.get(
+    cache::_LOAResultCache,
+    attr::_MOI.AbstractVariableAttribute,
+    index::_MOI.VariableIndex
+    )
+    return _MOI.get(cache.mock, attr, index)
+end
+function _MOI.get(
+    cache::_LOAResultCache,
+    attr::_MOI.AbstractConstraintAttribute,
+    index::_MOI.ConstraintIndex
+    )
+    return _MOI.get(cache.mock, attr, index)
+end
+function _MOI.set(
+    cache::_LOAResultCache,
+    attr::Union{_MOI.AbstractModelAttribute,
+        _MOI.AbstractOptimizerAttribute},
+    value
+    )
+    return _MOI.set(cache.mock, attr, value)
+end
+function _MOI.set(
+    cache::_LOAResultCache,
+    attr::_MOI.AbstractVariableAttribute,
+    index::_MOI.VariableIndex,
+    value
+    )
+    return _MOI.set(cache.mock, attr, index, value)
+end
+function _MOI.set(
+    cache::_LOAResultCache,
+    attr::_MOI.AbstractConstraintAttribute,
+    index::_MOI.ConstraintIndex,
+    value
+    )
+    return _MOI.set(cache.mock, attr, index, value)
+end
+_MOI.get(cache::_LOAResultCache, ::_MOI.SolverName) = cache.name
+# A real solver throws `GetAttributeNotAllowed` when no bound exists.
+function _MOI.get(
+    cache::_LOAResultCache,
+    attr::Union{_MOI.ObjectiveBound, _MOI.RelativeGap}
+    )
+    haskey(cache.mock.model_attributes, attr) ||
+        throw(_MOI.GetAttributeNotAllowed(attr,
+            "The LOA master did not produce a bound."))
+    return _MOI.get(cache.mock, attr)
+end
+# No duals from an MI(N)LP solve; matches `dual_status = NO_SOLUTION`.
+# Both methods are needed: the caching layer swallows the first throw
+# and recomputes `DualObjectiveValue` from per-constraint duals.
+_MOI.get(cache::_LOAResultCache, attr::_MOI.DualObjectiveValue) =
+    throw(_MOI.GetAttributeNotAllowed(attr, "LOA does not provide duals."))
+function _MOI.get(
+    cache::_LOAResultCache,
+    attr::_MOI.ConstraintDual,
+    index::_MOI.ConstraintIndex
+    )
+    return throw(_MOI.GetAttributeNotAllowed(attr,
+        "LOA does not provide duals."))
+end
+
+################################################################################
 #                       LOAD SOLUTION BY INJECTION
 ################################################################################
-# Complete primal for every NLP variable: the loop's linearization point
-# (non-fixed vars), a user fix value for the rest, overlaid with the
-# incumbent combination for the binaries (fixed during the loop, so absent
-# from the linearization point).
-function _incumbent_primal(problem::_LOAProblem, best_result)
+# Complete primal for one pool result. The binaries were fixed during
+# the loop (absent from the linearization point), so the combination
+# supplies them.
+function _result_primal(problem::_LOAProblem, result)
     nlp = problem.nlp
     V = JuMP.variable_ref_type(typeof(nlp))
     T = JuMP.value_type(typeof(nlp))
     primal = Dict{V, T}()
     for v in JuMP.all_variables(nlp)
-        if haskey(best_result.linearization_point, v)
-            primal[v] = best_result.linearization_point[v]
+        if haskey(result.linearization_point, v)
+            primal[v] = result.linearization_point[v]
         elseif JuMP.is_fixed(v)
             primal[v] = JuMP.fix_value(v)
         else
             primal[v] = zero(T)
         end
     end
-    for (binary, active) in best_result.combination
+    for (binary, active) in result.combination
         primal[binary] = active ? one(T) : zero(T)
     end
     return primal
 end
 
-# Attach a MockOptimizer preloaded with the incumbent so native JuMP
-# queries (value, objective_value, termination_status) return it with no
-# solve and no added constraints. `is_model_dirty = false` unlocks the
-# result queries (JuMP otherwise guards them and throws OptimizeNotCalled).
+# Attach a `_LOAResultCache` preloaded with the outcome so standard
+# JuMP result queries answer with no solve (an empty pool injects only
+# the statuses). `is_model_dirty = false` re-opens the result queries
+# JuMP guards behind OptimizeNotCalled.
 function _inject_solution(
     nlp::JuMP.AbstractModel,
-    primal::AbstractDict,
-    objective,
-    status::_MOI.TerminationStatusCode,
-    solve_time::Real
+    problem::_LOAProblem,
+    outcome::NamedTuple
     )
     T = JuMP.value_type(typeof(nlp))
-    JuMP.set_optimizer(nlp, () -> _MOI.Utilities.MockOptimizer(
-        _MOI.Utilities.UniversalFallback(_MOI.Utilities.Model{T}()));
-        add_bridges = false)
+    primals = [_result_primal(problem, result)
+        for result in outcome.results]
+    # The mock is the one MOI optimizer that accepts written results.
+    # Serve stored objectives rather than re-evaluating at the primal.
+    JuMP.set_optimizer(nlp, () -> _LOAResultCache(
+        _MOI.Utilities.MockOptimizer(
+            _MOI.Utilities.UniversalFallback(_MOI.Utilities.Model{T}()),
+            T; eval_objective_value = false),
+        outcome.solver_name); add_bridges = false)
+    # Attach copies the model in and creates the `optimizer_index` map.
     _MOI.Utilities.attach_optimizer(JuMP.backend(nlp))
-    mock = JuMP.unsafe_backend(nlp)
-    _MOI.set(mock, _MOI.TerminationStatus(), status)
-    _MOI.set(mock, _MOI.PrimalStatus(), _MOI.FEASIBLE_POINT)
-    _MOI.set(mock, _MOI.ResultCount(), 1)
-    _MOI.set(mock, _MOI.ObjectiveValue(), objective)
-    _MOI.set(mock, _MOI.SolveTimeSec(), Float64(solve_time))
-    _MOI.set(mock, _MOI.RawStatusString(), "LOA incumbent (injected)")
-    for (variable, value) in primal
-        _MOI.set(mock, _MOI.VariablePrimal(),
-            JuMP.optimizer_index(variable), value)
+    # Result attributes are read-only through the caching layer, so they
+    # are written on the inner optimizer directly.
+    cache = JuMP.unsafe_backend(nlp)
+    _MOI.set(cache, _MOI.TerminationStatus(), outcome.status)
+    _MOI.set(cache, _MOI.RawStatusString(), outcome.raw_status)
+    _MOI.set(cache, _MOI.SolveTimeSec(), Float64(outcome.solve_time))
+    _MOI.set(cache, _MOI.ResultCount(), length(primals))
+    if outcome.bound !== nothing
+        _MOI.set(cache, _MOI.ObjectiveBound(), outcome.bound)
+        isempty(primals) || _MOI.set(cache, _MOI.RelativeGap(),
+            abs(outcome.bound - outcome.results[1].objective) /
+                abs(outcome.results[1].objective))
     end
+    indices = Dict(variable => JuMP.optimizer_index(variable)
+        for variable in JuMP.all_variables(nlp))
+    for k in eachindex(primals)
+        _MOI.set(cache, _MOI.PrimalStatus(k), _MOI.FEASIBLE_POINT)
+        _MOI.set(cache, _MOI.ObjectiveValue(k),
+            outcome.results[k].objective)
+        for (variable, value) in primals[k]
+            _MOI.set(cache, _MOI.VariablePrimal(k),
+                indices[variable], value)
+        end
+    end
+    # No public API for this; must stay the last mutation.
     nlp.is_model_dirty = false
     return
 end
 
-# Finalize a finite GDP: drop the loop's incumbent binary fixes so the
-# model carries no leftover fixes, then inject the incumbent. The binaries
-# stay relaxed; a later reformulation restores their integrality.
-# Dispatchable so extensions (InfiniteOpt) override for their own type.
+# Finalize a finite GDP. Dispatchable so the InfiniteOpt extension
+# overrides it.
 function _load_solution(
     model::JuMP.AbstractModel,
     problem::_LOAProblem,
-    best_result,
-    method::LOA,
-    solve_time::Real
+    outcome::NamedTuple,
+    method::LOA
     )
-    V = JuMP.variable_ref_type(typeof(model))
-    for (_, bvar) in _indicator_to_binary(model)
-        bvar isa V && JuMP.is_fixed(bvar) && JuMP.unfix(bvar)
-    end
-    primal = _incumbent_primal(problem, best_result)
-    _inject_solution(problem.nlp, primal, best_result.objective,
-        best_result.status, solve_time)
+    # Drop the solver first: an NLP-only solver fails JuMP's ZeroOne
+    # supports check during the binary restore, even detached.
+    _MOI.Utilities.drop_optimizer(JuMP.backend(problem.nlp))
+    _restore_binaries(problem)
+    _inject_solution(problem.nlp, problem, outcome)
     gdp_data(model).loa_solver = method.nlp_optimizer
     return
 end

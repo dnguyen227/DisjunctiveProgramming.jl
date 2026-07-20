@@ -34,20 +34,6 @@ function _clear_reformulations(model::JuMP.AbstractModel)
     empty!(gdp_data(model).reformulation_variables)
     empty!(gdp_data(model).variable_bounds)
     empty!(gdp_data(model).disaggregation_map)
-    _restore_logical_binaries(model)
-    return
-end
-
-# An LOA solve relaxes the logical binaries (and fixes them per
-# iteration). Restore them to free binaries so a later reformulation of the
-# model (or a copy of it) sees the integrality it expects.
-function _restore_logical_binaries(model::JuMP.AbstractModel)
-    V = JuMP.variable_ref_type(typeof(model))
-    for (_, bvar) in _indicator_to_binary(model)
-        bvar isa V || continue
-        JuMP.is_fixed(bvar) && JuMP.unfix(bvar)
-        JuMP.is_binary(bvar) || JuMP.set_binary(bvar)
-    end
     return
 end
 

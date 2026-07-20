@@ -62,7 +62,7 @@ function _optimize_hook(
     if solver !== nothing
         backend = JuMP.backend(model)
         backend isa _MOI.Utilities.CachingOptimizer &&
-            backend.optimizer isa _MOI.Utilities.MockOptimizer &&
+            backend.optimizer isa _LOAResultCache &&
             JuMP.set_optimizer(model, solver)
         gdp_data(model).loa_solver = nothing
     end
