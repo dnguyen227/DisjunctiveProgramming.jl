@@ -202,3 +202,37 @@ end
 @testset "Solve Conic GDP" begin
     test_conic_gdp_example()
 end
+
+function test_exact_quadratic_gdp_example()
+    # Quadratic version of the circle disjunction above: the point must
+    # lie in the unit disk around (0, 0) or around (5, 0); minimizing x
+    # selects the first disk at (x, y) = (-1, 0). The exact hull
+    # reformulations (CEHR/GEHR, Gusev & Bernal Neira 2025) must agree
+    # with BigM and the ε-approximated hull.
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+        "print_level" => 0, "sb" => "yes")
+    juniper = optimizer_with_attributes(Juniper.Optimizer,
+        "nl_solver" => ipopt)
+    for meth in (BigM(100), Hull(), Hull(quadratic = :exact),
+                 Hull(quadratic = :gehr))
+        m = GDPModel(juniper)
+        set_attribute(m, MOI.Silent(), true)
+        @variable(m, -10 <= x <= 10)
+        @variable(m, -10 <= y <= 10)
+        @variable(m, Y[1:2], Logical)
+        @objective(m, Min, x)
+        @constraint(m, x^2 + y^2 <= 1, Disjunct(Y[1]))
+        @constraint(m, (x - 5)^2 + y^2 <= 1, Disjunct(Y[2]))
+        @disjunction(m, Y)
+        @test optimize!(m, gdp_method = meth) isa Nothing
+        @test termination_status(m) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+        @test isapprox(objective_value(m), -1, atol = 1e-4)
+        @test isapprox(value(x), -1, atol = 1e-4)
+        @test value(Y[1])
+        @test !value(Y[2])
+    end
+end
+
+@testset "Solve Exact Quadratic GDP" begin
+    test_exact_quadratic_gdp_example()
+end
