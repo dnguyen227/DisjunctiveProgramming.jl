@@ -28,6 +28,8 @@ include("print.jl")
 include("extension_api.jl")
 include("utilities.jl")
 include("psplit.jl")
+include("linear_tree.jl")
+include("linear_tree_fit.jl")
 
 # Define additional stuff that should not be exported
 const _EXCLUDE_SYMBOLS = [Symbol(@__MODULE__), :eval, :include]
