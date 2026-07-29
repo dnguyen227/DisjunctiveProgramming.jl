@@ -3,6 +3,7 @@ module InfiniteDisjunctiveProgramming
 import JuMP.MOI as _MOI
 import InfiniteOpt, JuMP
 import DisjunctiveProgramming as DP
+import AbstractGPs, KernelFunctions
 
 ################################################################################
 #                                   MODEL
@@ -263,9 +264,95 @@ function _interpolate_at(
         )
 end
 
-# Transcribe mini_expr, solve per support on the transcribed JuMP
-# model, and aggregate to a scalar if uniform, else to a parameter
-# function on main.
+# ------ GP active-learning M(d) (hard-coded for the mbm_gp experiments) ------
+# Coordinates of every support, normalized to [0,1]^d so one isotropic
+# lengthscale works across dimensions.
+function _gp_support_coords(grids)
+    idxs = CartesianIndices(length.(grids))
+    los = [minimum(g) for g in grids]
+    rng = [max(maximum(g) - minimum(g), eps()) for g in grids]
+    X = [[(grids[d][I[d]] - los[d]) / rng[d] for d in 1:length(grids)]
+         for I in idxs]
+    return X, collect(idxs)
+end
+
+# Posterior mean and sd at all coords, given solved (index => M) samples.
+# Outputs are standardized so the k*sd term scales with the M spread.
+function _gp_mean_sd(X, solved)
+    lis = collect(keys(solved))
+    yt = [solved[li] for li in lis]
+    ybar = sum(yt) / length(yt)
+    ystd = max(sqrt(sum(abs2, yt .- ybar) / max(length(yt) - 1, 1)), 1e-8)
+    kern = KernelFunctions.with_lengthscale(
+        KernelFunctions.SqExponentialKernel(), 0.1)
+    post = AbstractGPs.posterior(
+        AbstractGPs.GP(kern)(X[lis], 1e-8), (yt .- ybar) ./ ystd)
+    mz = AbstractGPs.mean(post, X)
+    vz = max.(AbstractGPs.var(post, X), 0.0)
+    return mz .* ystd .+ ybar, sqrt.(vz) .* ystd
+end
+
+# Count of per-support M subproblems solved (for the grid-vs-GP comparison).
+const _M_SOLVE_COUNT = Ref(0)
+
+# Original workflow: solve M at every support (grid). Kept for the mbm_gp
+# vs grid comparison, gated by ENV["DP_MBM_GRID"].
+function _grid_M_vals(objectives, inner_sub, method)
+    M_vals = Array{Float64}(undef, size(objectives))
+    for I in eachindex(objectives)
+        _M_SOLVE_COUNT[] += 1
+        m = DP.raw_M(inner_sub, objectives[I], method)
+        m === nothing && return nothing
+        M_vals[I] = m
+    end
+    return M_vals
+end
+
+# Solve M at actively-selected supports (max-UCB acquisition) and fill the
+# rest with the UCB (mean + k*sd), a valid over-estimate. Returns a scalar
+# when M is uniform (e.g. dependent multi-dim parameters where M does not
+# vary), matching the grid workflow's early return.
+function _gp_active_M_vals(objectives, inner_sub, method, sub, mini_expr)
+    idxs = collect(CartesianIndices(objectives))
+    n = length(idxs)
+    k = 2.5
+    budget = min(n, max(6, cld(n, 4)))
+    solved = Dict{Int, Float64}()
+    solve_at!(li) = begin
+        _M_SOLVE_COUNT[] += 1
+        m = DP.raw_M(inner_sub, objectives[idxs[li]], method)
+        m === nothing && return false
+        solved[li] = m
+        true
+    end
+    for s in unique([1, cld(n + 1, 2), n])
+        solve_at!(s) || return nothing
+    end
+    seed = collect(values(solved))
+    all(==(first(seed)), seed) && return first(seed)   # uniform M -> scalar
+    mini_prefs = InfiniteOpt.parameter_refs(mini_expr)
+    reverse_map = Dict(ws[1] => v for (v, ws) in sub.fwd_map)
+    prefs = Tuple(reverse_map[p] for p in mini_prefs)
+    grids = Tuple(InfiniteOpt.supports(p) for p in prefs)
+    X, _ = _gp_support_coords(grids)
+    while length(solved) < budget
+        ms, ss = _gp_mean_sd(X, solved)
+        acq = ms .+ k .* ss
+        for li in keys(solved)
+            acq[li] = -Inf
+        end
+        solve_at!(argmax(acq)) || return nothing
+    end
+    ms, ss = _gp_mean_sd(X, solved)
+    M_vals = Array{Float64}(undef, size(objectives))
+    for (li, I) in enumerate(idxs)
+        M_vals[I] = get(solved, li, ms[li] + k * ss[li])
+    end
+    return M_vals
+end
+
+# Transcribe mini_expr, then approximate M(d) with an actively-sampled GP
+# instead of solving at every support; aggregate to a scalar if uniform.
 function DP.raw_M(
     sub::DP.GDPSubmodel{<:InfiniteOpt.InfiniteModel},
     mini_expr::JuMP.AbstractJuMPScalar,
@@ -276,12 +363,11 @@ function DP.raw_M(
     inner_sub = DP.GDPSubmodel(transcribed,JuMP.VariableRef[],
         Dict{JuMP.VariableRef, Vector{JuMP.VariableRef}}()
         )
-    M_vals = Array{typeof(method.default_M)}(undef, size(objectives))
-    for I in eachindex(objectives)
-        m = DP.raw_M(inner_sub, objectives[I], method)
-        m === nothing && return nothing
-        M_vals[I] = m
-    end
+    M_vals = haskey(ENV, "DP_MBM_GRID") ?
+        _grid_M_vals(objectives, inner_sub, method) :
+        _gp_active_M_vals(objectives, inner_sub, method, sub, mini_expr)
+    M_vals === nothing && return nothing
+    M_vals isa Number && return M_vals
     all(==(first(M_vals)), M_vals) && return first(M_vals)
     mini_prefs = InfiniteOpt.parameter_refs(mini_expr)
     reverse_map = Dict(ws[1] => v for (v, ws) in sub.fwd_map)
