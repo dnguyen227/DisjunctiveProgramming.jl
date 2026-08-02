@@ -368,21 +368,28 @@ struct BigM{T} <: AbstractReformulationMethod
 end
 
 """
-    MBM{O, T, L <: LogicalVariableRef} <: AbstractReformulationMethod
+    MBM{O, T} <: AbstractReformulationMethod
 
 A type for using the multiple big-M reformulation approach for disjunctive constraints.
 
 **Fields**
 - `optimizer::O`: Optimizer to use when solving mini-models (required).
 - `default_M::T`: Default big-M value to use if no big-M is specified for a logical variable (1e9).
+- `M_sampler::Any`: Strategy for computing M values across the supports
+  of an infinite model (`:auto`). `:auto` uses [`GPSampler`](@ref) when
+  the AbstractGPs extension is loaded and `:exact` otherwise; `:exact`
+  solves an M subproblem at every support. Ignored for finite models.
 """
 mutable struct MBM{O, T} <: AbstractReformulationMethod
     optimizer::O
     default_M::T
-    
+    M_sampler::Any
+
     # Constructor with optimizer (required) and optional default_M
-    function MBM(optimizer::O, default_M::T = 1e9) where {O, T}
-        new{O, T}(optimizer, default_M)
+    function MBM(
+        optimizer::O, default_M::T = 1e9; M_sampler = :auto
+        ) where {O, T}
+        new{O, T}(optimizer, default_M, M_sampler)
     end
 end
 
@@ -390,6 +397,7 @@ mutable struct _MBM{O, T, M <: JuMP.AbstractModel} <: AbstractReformulationMetho
     optimizer::O
     M::Dict{LogicalVariableRef{M}, Any}
     default_M::T
+    M_sampler::Any
     subproblem_indicators::Vector{LogicalVariableRef{M}}
     # Cached submodels: indicator => GDPSubmodel.
     # Typed Any so extensions can store different types.
@@ -400,6 +408,7 @@ mutable struct _MBM{O, T, M <: JuMP.AbstractModel} <: AbstractReformulationMetho
             method.optimizer,
             Dict{LogicalVariableRef{M}, Any}(),
             method.default_M,
+            method.M_sampler,
             Vector{LogicalVariableRef{M}}(),
             Dict{LogicalVariableRef{M}, Any}()
         )

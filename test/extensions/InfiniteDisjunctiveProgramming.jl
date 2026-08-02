@@ -376,7 +376,7 @@ function test_raw_M_infinite_scalar()
     @constraint(model, con, x >= 5, Disjunct(Y[1]))
     @constraint(model, con2, x <= 3, Disjunct(Y[2]))
     @disjunction(model, Y)
-    mbm = DP._MBM(MBM(HiGHS.Optimizer), model)
+    mbm = DP._MBM(MBM(HiGHS.Optimizer, M_sampler = :exact), model)
     sub = DP.copy_model_with_constraints(
         model, DP.DisjunctConstraintRef[con2], mbm)
     obj = DP.prepare_max_M_objective(
@@ -399,7 +399,7 @@ function test_raw_M_infinite_param_function()
     @constraint(model, con, x <= f, Disjunct(Y[1]))
     @constraint(model, con2, x >= 0.5, Disjunct(Y[2]))
     @disjunction(model, Y)
-    mbm = DP._MBM(MBM(HiGHS.Optimizer), model)
+    mbm = DP._MBM(MBM(HiGHS.Optimizer, M_sampler = :exact), model)
     sub = DP.copy_model_with_constraints(
         model, DP.DisjunctConstraintRef[con2], mbm)
     obj = DP.prepare_max_M_objective(
@@ -410,6 +410,34 @@ function test_raw_M_infinite_param_function()
     # max-of-corners is conservative: raw_fn(t) ≥ 10 - 2t at supports.
     for t_val in supports
         @test raw_fn(t_val) >= 10.0 - 2*t_val - 1e-6
+    end
+end
+
+# raw_M over two infinite parameters with different support counts.
+# Transcription orders the objective dimensions by parameter group,
+# which need not be the ascending order of the grids, so the M values
+# must be permuted to line up. Setup: x(t, s) in [0, 10],
+# disj1: x <= t + s, disj2: x >= 0.5. Slack r(x) = x - t - s
+# maximized over x in [0.5, 10]: 10 - t - s.
+function test_raw_M_infinite_two_params()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, t ∈ [0, 1], supports = [0.0, 0.5, 1.0])
+    @infinite_parameter(model, s ∈ [0, 1], supports = [0.0, 1.0])
+    @variable(model, 0 <= x <= 10, Infinite(t, s))
+    @variable(model, Y[1:2], InfiniteLogical(t, s))
+    @constraint(model, con, x <= t + s, Disjunct(Y[1]))
+    @constraint(model, con2, x >= 0.5, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    mbm = DP._MBM(MBM(HiGHS.Optimizer, M_sampler = :exact), model)
+    sub = DP.copy_model_with_constraints(
+        model, DP.DisjunctConstraintRef[con2], mbm)
+    obj = DP.prepare_max_M_objective(
+        model, JuMP.constraint_object(con), sub)
+    M = DP.raw_M(sub, obj, mbm)
+    @test M isa InfiniteOpt.GeneralVariableRef
+    raw_fn = InfiniteOpt.raw_function(M)
+    for t_val in [0.0, 0.5, 1.0], s_val in [0.0, 1.0]
+        @test raw_fn(t_val, s_val) >= 10.0 - t_val - s_val - 1e-6
     end
 end
 
@@ -834,6 +862,7 @@ end
         test_interpolate()
         test_raw_M_infinite_scalar()
         test_raw_M_infinite_param_function()
+        test_raw_M_infinite_two_params()
         test_mbm_finite_and_integer_var()
         test_mbm_infinite_simple()
         test_mbm_infinite_param_dependent()

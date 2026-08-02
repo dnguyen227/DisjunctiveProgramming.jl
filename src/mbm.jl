@@ -87,7 +87,8 @@ function reformulate_disjunct_constraint(
         },
     method::_MBM
     )
-    ref_cons = reformulate_disjunction(model, con, MBM(method.optimizer))
+    ref_cons = reformulate_disjunction(model, con, MBM(
+        method.optimizer, method.default_M, M_sampler = method.M_sampler))
     new_ref_cons = Vector{JuMP.AbstractConstraint}()
     for ref_con in ref_cons
         append!(new_ref_cons,
