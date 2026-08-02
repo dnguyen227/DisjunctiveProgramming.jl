@@ -75,13 +75,16 @@ julia> method = MBM(HiGHS.Optimizer, M_sampler = GPSampler(kappa = 4.0))
 function GPSampler end
 
 """
-    sample_M_values(sampler, objectives, sub, method, grids)
+    sample_M_values(sampler, objectives, sub, method, support_grids)
 
 Compute the MBM M values at the transcription supports of an infinite
 model. `objectives` is the array of per-support objective expressions,
 `sub` is the transcribed submodel wrapped as a `GDPSubmodel`, `method`
-is the `_MBM` data, and `grids` are the support vectors of the
-infinite parameters. Returns an array of M values shaped like
+is the `_MBM` data, and `support_grids` is a function returning the
+support vectors of the infinite parameters. It is a function because
+the supports are only well defined once M is known to vary over them,
+so samplers that return early (or never need coordinates) must not
+call it. Returns an array of M values shaped like
 `objectives`, a scalar when M is uniform across the supports, or
 `nothing` if an M subproblem is infeasible. Extensions implement
 methods for their sampler types (e.g. [`GPSampler`](@ref)); the

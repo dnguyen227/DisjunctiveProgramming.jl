@@ -90,7 +90,7 @@ function DP.sample_M_values(
     objectives::AbstractArray,
     sub::DP.GDPSubmodel,
     method::DP._MBM,
-    grids::Tuple
+    support_grids
     )
     idxs = collect(CartesianIndices(objectives))
     n = length(idxs)
@@ -108,7 +108,7 @@ function DP.sample_M_values(
     all(==(first(seed)), seed) && return first(seed)
     budget = clamp(
         ceil(Int, sampler.budget * n), min(sampler.min_solves, n), n)
-    X = _support_coords(grids)
+    X = _support_coords(support_grids())
     while length(solved) < budget
         ms, ss = _mean_sd(sampler, X, solved)
         acq = ms .+ sampler.kappa .* ss

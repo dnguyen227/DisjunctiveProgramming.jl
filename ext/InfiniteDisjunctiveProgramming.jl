@@ -263,6 +263,16 @@ function _interpolate_at(
         )
 end
 
+# The infinite parameters of `mini_expr` and their supports, in the
+# ascending order of `parameter_refs`. Only defined when M varies over
+# the supports, so it is deferred until an M sampler needs it.
+function _support_grids(sub::DP.GDPSubmodel, mini_expr)
+    reverse_map = Dict(ws[1] => v for (v, ws) in sub.fwd_map)
+    prefs = Tuple(reverse_map[p]
+                  for p in InfiniteOpt.parameter_refs(mini_expr))
+    return prefs, Tuple(InfiniteOpt.supports(p) for p in prefs)
+end
+
 # Resolve `:auto` to the GP sampler when the GP extension is loaded
 function _resolve_M_sampler(sampler)
     sampler === :auto || return sampler
@@ -276,7 +286,7 @@ function DP.sample_M_values(
     objectives::AbstractArray,
     sub::DP.GDPSubmodel,
     method::DP._MBM,
-    grids::Tuple
+    support_grids
     )
     sampler === :exact || error(
         "Unrecognized `M_sampler` `$(repr(sampler))` for MBM on an " *
@@ -308,15 +318,13 @@ function DP.raw_M(
     transcribed = InfiniteOpt.transformation_model(sub.model)
     inner_sub = DP.GDPSubmodel(transcribed, JuMP.VariableRef[],
         Dict{JuMP.VariableRef, Vector{JuMP.VariableRef}}())
-    mini_prefs = InfiniteOpt.parameter_refs(mini_expr)
-    reverse_map = Dict(ws[1] => v for (v, ws) in sub.fwd_map)
-    prefs = Tuple(reverse_map[p] for p in mini_prefs)
-    grids = Tuple(InfiniteOpt.supports(p) for p in prefs)
     sampler = _resolve_M_sampler(method.M_sampler)
-    M_vals = DP.sample_M_values(sampler, objectives, inner_sub, method, grids)
+    M_vals = DP.sample_M_values(sampler, objectives, inner_sub, method,
+        () -> _support_grids(sub, mini_expr)[2])
     M_vals === nothing && return nothing
     M_vals isa Number && return M_vals
     all(==(first(M_vals)), M_vals) && return first(M_vals)
+    prefs, grids = _support_grids(sub, mini_expr)
     main = JuMP.owner_model(first(prefs))
     param_func = InfiniteOpt.build_parameter_function(
         error, _interpolate(grids, M_vals), prefs)

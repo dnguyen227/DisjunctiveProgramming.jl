@@ -441,6 +441,27 @@ function test_raw_M_infinite_two_params()
     end
 end
 
+# Dependent parameters have no per-parameter support grid, so raw_M
+# must not need one when M does not vary. Setup as in
+# test_raw_M_infinite_scalar, over a dependent parameter array.
+function test_raw_M_infinite_dependent_params()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, ξ[1:2] ∈ [0, 1], num_supports = 4)
+    @variable(model, 0 <= x <= 10, Infinite(ξ))
+    @variable(model, Y[1:2], InfiniteLogical(ξ))
+    @constraint(model, con, x >= 5, Disjunct(Y[1]))
+    @constraint(model, con2, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    for sampler in (:exact, :auto)
+        mbm = DP._MBM(MBM(HiGHS.Optimizer, M_sampler = sampler), model)
+        sub = DP.copy_model_with_constraints(
+            model, DP.DisjunctConstraintRef[con2], mbm)
+        obj = DP.prepare_max_M_objective(
+            model, JuMP.constraint_object(con), sub)
+        @test DP.raw_M(sub, obj, mbm) == 5.0
+    end
+end
+
 # Piecewise-constant max-of-corners: returns the maximum value over
 # the 2^n corners of the cell containing the query.
 function test_interpolate()
@@ -863,6 +884,7 @@ end
         test_raw_M_infinite_scalar()
         test_raw_M_infinite_param_function()
         test_raw_M_infinite_two_params()
+        test_raw_M_infinite_dependent_params()
         test_mbm_finite_and_integer_var()
         test_mbm_infinite_simple()
         test_mbm_infinite_param_dependent()
