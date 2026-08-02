@@ -204,6 +204,47 @@ function test_loa_solve_simple()
     @test objective_value(model) ≈ 7.0 atol=1e-4
 end
 
+# With no master iterations the incumbent comes from the set covering
+# alone, so there is no master bound to report.
+function test_loa_solve_no_master_iterations()
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer, max_iter = 0))
+    @test termination_status(model) == MOI.ITERATION_LIMIT
+    @test has_values(model)
+    @test objective_value(model) <= 7.0 + 1e-4
+    @test_throws Exception objective_bound(model)
+end
+
+# The result cache delegates the rest of the MOI interface to its mock
+function test_loa_result_cache_delegation()
+    model = GDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x <= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 7, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, x)
+    optimize!(model, gdp_method = LOA(HiGHS.Optimizer))
+
+    cache = JuMP.unsafe_backend(model)
+    cref = first(MOI.get(cache, MOI.ListOfConstraintIndices{
+        MOI.ScalarAffineFunction{Float64}, MOI.LessThan{Float64}}()))
+    MOI.set(cache, MOI.ConstraintName(), cref, "renamed")
+    @test MOI.get(cache, MOI.ConstraintName(), cref) == "renamed"
+    @test !MOI.is_empty(cache)
+    MOI.empty!(cache)
+    @test MOI.is_empty(cache)
+end
+
 function test_loa_solve_simple_with_mbm()
     # Same GDP as test_loa_solve_simple, but inner_method = MBM so the
     # NLP model is built with per-constraint tight Ms instead of BigM.
@@ -988,6 +1029,8 @@ end
     test_loa_reoptimize()
     test_loa_reoptimize_respects_user_optimizer()
     test_loa_solve_simple()
+    test_loa_solve_no_master_iterations()
+    test_loa_result_cache_delegation()
     test_loa_solve_simple_with_mbm()
     test_loa_solve_two_disjunctions()
     test_loa_not_reformulation()

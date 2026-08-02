@@ -105,6 +105,16 @@ function test_copy_model()
     new_model1, ref_map1, lv_map1 = DP.copy_gdp_model(model)
     @test haskey(new_model1.ext, :GDP)
     @test length(lv_map1) == 2
+    # a Hull reformulation fills the disaggregation map, which copies too
+    hull_model = DP.GDPModel(HiGHS.Optimizer)
+    @variable(hull_model, 0 ≤ w ≤ 20)
+    @variable(hull_model, W[1:2], DP.Logical)
+    @constraint(hull_model, w ≤ 5, DP.Disjunct(W[1]))
+    @constraint(hull_model, w ≥ 8, DP.Disjunct(W[2]))
+    DP.@disjunction(hull_model, W)
+    DP.reformulate_model(hull_model, Hull())
+    @test !isempty(DP.gdp_data(hull_model).disaggregation_map)
+    _, _, _ = DP.copy_gdp_model(hull_model)
 
     orig_num_vars = num_variables(model)
     orig_num_constrs = num_constraints(model; 
