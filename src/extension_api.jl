@@ -41,7 +41,7 @@ function InfiniteLogical end
 
 """
     GPSampler(; kappa = 2.5, budget = 0.25, min_solves = 6,
-              kernel = nothing)
+              kernel = nothing, detect_uniform_M = true)
 
 Creates a Gaussian-process M sampler for [`MBM`](@ref) on infinite
 models. Instead of solving an M subproblem at every support of the
@@ -64,6 +64,14 @@ the `M_sampler` field of [`MBM`](@ref)).
 - `kernel`: Covariance kernel for the GP fit. Defaults to a squared
   exponential kernel whose lengthscale is selected by maximizing the
   marginal likelihood; pass a `KernelFunctions` kernel to override.
+- `detect_uniform_M::Bool`: If `true` (the default), M values that
+  agree at the first few supports are taken to be uniform and used
+  for every support. This is cheap and is what makes infinite
+  parameters without a support grid (e.g. dependent ones) workable,
+  but it assumes M does not vary elsewhere. Set it to `false` to
+  always fit the GP, which leaves the usual `kappa * sd` cushion on
+  the unsolved supports at the cost of the extra solves, and which
+  requires that every infinite parameter have a support grid.
 
 **Example**
 ```julia

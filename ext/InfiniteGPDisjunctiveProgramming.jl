@@ -13,31 +13,30 @@ struct GPSampler{K}
     budget::Float64
     min_solves::Int
     kernel::K
+    detect_uniform_M::Bool
 end
 
 function DP.GPSampler(;
     kappa::Real = 2.5,
     budget::Real = 0.25,
     min_solves::Int = 6,
-    kernel = nothing
+    kernel = nothing,
+    detect_uniform_M::Bool = true
     )
     kappa >= 0 || error("`kappa` must be nonnegative.")
     0 < budget <= 1 || error("`budget` must be in `(0, 1]`.")
     min_solves >= 1 || error("`min_solves` must be at least 1.")
-    return GPSampler(Float64(kappa), Float64(budget), min_solves, kernel)
+    return GPSampler(Float64(kappa), Float64(budget), min_solves,
+        kernel, detect_uniform_M)
 end
 
 ################################################################################
 #                                 GP FITTING
 ################################################################################
-# Lengthscale candidates on the [0, 1]-normalized support coordinates
 const _LENGTHSCALES = (0.05, 0.1, 0.2, 0.4, 0.8)
-
-# Observation jitter for the GP fit
 const _JITTER = 1e-8
 
-# Coordinates of every support in linear index order, normalized to
-# [0, 1]^d so one isotropic lengthscale works across dimensions
+# Normalized to [0, 1]^d so one lengthscale works across dimensions
 function _support_coords(grids)
     idxs = CartesianIndices(length.(grids))
     los = [minimum(g) for g in grids]
@@ -46,9 +45,7 @@ function _support_coords(grids)
             for I in vec(idxs)]
 end
 
-# Fit the GP posterior on the solved coordinates; `y` is standardized
-# by the caller. With no user kernel, select the lengthscale of a
-# squared exponential kernel by maximizing the marginal likelihood.
+# Lengthscale by marginal likelihood unless the user gave a kernel
 function _fit_posterior(sampler::GPSampler, X, y)
     isnothing(sampler.kernel) || return AbstractGPs.posterior(
         AbstractGPs.GP(sampler.kernel)(X, _JITTER), y)
@@ -65,13 +62,13 @@ function _fit_posterior(sampler::GPSampler, X, y)
     return best_post
 end
 
-# Posterior mean and sd at all coords given the solved (index => M)
-# samples, destandardized back to M units
 function _mean_sd(sampler::GPSampler, X, solved)
     lis = collect(keys(solved))
     y = [solved[li] for li in lis]
     ybar = sum(y) / length(y)
-    ystd = max(sqrt(sum(abs2, y .- ybar) / max(length(y) - 1, 1)), 1e-8)
+    # floored so near-equal solved values still cushion the filled ones
+    ystd = max(sqrt(sum(abs2, y .- ybar) / max(length(y) - 1, 1)),
+        1e-2 * abs(ybar), 1e-8)
     post = _fit_posterior(sampler, X[lis], (y .- ybar) ./ ystd)
     mz = AbstractGPs.mean(post, X)
     vz = max.(AbstractGPs.var(post, X), 0.0)
@@ -81,10 +78,7 @@ end
 ################################################################################
 #                              M VALUE SAMPLING
 ################################################################################
-# Solve M at actively-selected supports (max-UCB acquisition) and fill
-# the rest with the upper confidence bound mean + kappa * sd, a
-# heuristic over-estimate. Returns a scalar when the seed M values are
-# uniform (e.g. M does not vary over the supports).
+# Solve M at max-UCB selected supports, fill the rest with the bound
 function DP.sample_M_values(
     sampler::GPSampler,
     objectives::AbstractArray,
@@ -101,11 +95,16 @@ function DP.sample_M_values(
         solved[li] = m
         return true
     end
-    for s in unique([1, cld(n + 1, 2), n])
+    # golden fractions; even spacing aliases with a periodic M
+    for s in unique([1, n, 1 + floor(Int, 0.618 * (n - 1)),
+                     1 + floor(Int, 0.382 * (n - 1))])
         solve_at(s) || return nothing
     end
-    seed = collect(values(solved))
-    all(==(first(seed)), seed) && return first(seed)
+    if sampler.detect_uniform_M
+        # a uniform M needs no fit, and so no support grid either
+        probes = collect(values(solved))
+        all(==(first(probes)), probes) && return first(probes)
+    end
     budget = clamp(
         ceil(Int, sampler.budget * n), min(sampler.min_solves, n), n)
     X = _support_coords(support_grids())
@@ -125,8 +124,7 @@ function DP.sample_M_values(
         return M_vals
     end
     ms, ss = _mean_sd(sampler, X, solved)
-    for (li, I) in enumerate(idxs)
-        # exact M values are nonnegative, so the fill is too
+    for (li, I) in enumerate(idxs) # exact M values are nonnegative
         M_vals[I] = get(solved, li, max(ms[li] + sampler.kappa * ss[li], 0.0))
     end
     return M_vals

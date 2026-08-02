@@ -268,8 +268,11 @@ end
 # the supports, so it is deferred until an M sampler needs it.
 function _support_grids(sub::DP.GDPSubmodel, mini_expr)
     reverse_map = Dict(ws[1] => v for (v, ws) in sub.fwd_map)
-    prefs = Tuple(reverse_map[p]
-                  for p in InfiniteOpt.parameter_refs(mini_expr))
+    prefs = Tuple(get(reverse_map, p) do
+            error("MBM cannot build a support grid over `$p`, which " *
+                  "is a group of dependent infinite parameters, so M " *
+                  "must not vary over its supports.")
+        end for p in InfiniteOpt.parameter_refs(mini_expr))
     return prefs, Tuple(InfiniteOpt.supports(p) for p in prefs)
 end
 

@@ -12,13 +12,15 @@ function test_gp_sampler_creation()
     @test sampler.budget == 0.25
     @test sampler.min_solves == 6
     @test isnothing(sampler.kernel)
+    @test sampler.detect_uniform_M
     kern = with_lengthscale(SqExponentialKernel(), 0.3)
-    sampler = GPSampler(
-        kappa = 4.0, budget = 0.1, min_solves = 3, kernel = kern)
+    sampler = GPSampler(kappa = 4.0, budget = 0.1, min_solves = 3,
+        kernel = kern, detect_uniform_M = false)
     @test sampler.kappa == 4.0
     @test sampler.budget == 0.1
     @test sampler.min_solves == 3
     @test sampler.kernel === kern
+    @test !sampler.detect_uniform_M
     @test_throws ErrorException GPSampler(kappa = -1)
     @test_throws ErrorException GPSampler(budget = 0)
     @test_throws ErrorException GPSampler(budget = 1.5)
@@ -137,6 +139,79 @@ function test_gp_mbm_solve_equivalence()
     @test obj_gp ≈ obj_exact atol = 1e-2
 end
 
+# A periodic M must not read as uniform. With f(t) = 2|cos(2*pi*t)|
+# on these supports, M = 10 - f is 8 at supports 1, 3, 5 and 10 at
+# supports 2, 4, so evenly spaced probes alias and collapse M to 8,
+# which caps x at 8 and cuts the optimum from 10 down to 9.
+function test_gp_periodic_M_not_uniform()
+    supports = [0.0, 0.25, 0.5, 0.75, 1.0]
+    function solve_with(M_sampler)
+        model = InfiniteGDPModel(HiGHS.Optimizer)
+        set_silent(model)
+        @infinite_parameter(model, t ∈ [0, 1], supports = supports)
+        @variable(model, 0 <= x <= 10, Infinite(t))
+        @variable(model, Y[1:2], InfiniteLogical(t))
+        @parameter_function(model, f == t -> 2 * abs(cos(2 * pi * t)))
+        @constraint(model, x <= f, Disjunct(Y[1]))
+        @constraint(model, x >= 0.5, Disjunct(Y[2]))
+        @disjunction(model, Y)
+        @objective(model, Max, 𝔼(x, t))
+        optimize!(model, gdp_method = MBM(
+            HiGHS.Optimizer, M_sampler = M_sampler))
+        return objective_value(model)
+    end
+    @test solve_with(:exact) ≈ 10.0 atol = 1e-6
+    @test solve_with(GPSampler()) ≈ 10.0 atol = 1e-6
+end
+
+# With detection off the uniform M is not collapsed to a scalar: the
+# GP is fit and the unsolved supports keep their kappa * sd cushion,
+# which must sit above the M that detection would have returned.
+function test_gp_detect_uniform_M_off()
+    function raw_M_with(detect)
+        model = InfiniteGDPModel()
+        @infinite_parameter(model, t ∈ [0, 1], num_supports = 20)
+        @variable(model, 0 <= x <= 10, Infinite(t))
+        @variable(model, Y[1:2], InfiniteLogical(t))
+        @constraint(model, con, x >= 5, Disjunct(Y[1]))
+        @constraint(model, con2, x <= 3, Disjunct(Y[2]))
+        @disjunction(model, Y)
+        mbm = DP._MBM(MBM(HiGHS.Optimizer,
+            M_sampler = GPSampler(detect_uniform_M = detect)), model)
+        sub = DP.copy_model_with_constraints(
+            model, DP.DisjunctConstraintRef[con2], mbm)
+        obj = DP.prepare_max_M_objective(
+            model, JuMP.constraint_object(con), sub)
+        return DP.raw_M(sub, obj, mbm)
+    end
+    @test raw_M_with(true) == 5.0
+    M = raw_M_with(false)
+    @test M isa InfiniteOpt.GeneralVariableRef
+    raw_fn = InfiniteOpt.raw_function(M)
+    vals = [raw_fn(t) for t in range(0, 1, length = 20)]
+    @test all(vals .>= 5.0 - 1e-6)
+    @test maximum(vals) > 5.0
+end
+
+# Dependent parameters have no support grid, so turning detection off
+# leaves the GP with nothing to fit over
+function test_gp_detect_uniform_M_off_dependent()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, ξ[1:2] ∈ [0, 1], num_supports = 4)
+    @variable(model, 0 <= x <= 10, Infinite(ξ))
+    @variable(model, Y[1:2], InfiniteLogical(ξ))
+    @constraint(model, con, x >= 5, Disjunct(Y[1]))
+    @constraint(model, con2, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    mbm = DP._MBM(MBM(HiGHS.Optimizer,
+        M_sampler = GPSampler(detect_uniform_M = false)), model)
+    sub = DP.copy_model_with_constraints(
+        model, DP.DisjunctConstraintRef[con2], mbm)
+    obj = DP.prepare_max_M_objective(
+        model, JuMP.constraint_object(con), sub)
+    @test_throws ErrorException DP.raw_M(sub, obj, mbm)
+end
+
 function test_gp_unknown_sampler_error()
     model = InfiniteGDPModel(HiGHS.Optimizer)
     set_silent(model)
@@ -158,6 +233,9 @@ end
     test_gp_raw_M_scalar()
     test_gp_raw_M_matches_exact()
     test_gp_mbm_solve_equivalence()
+    test_gp_periodic_M_not_uniform()
+    test_gp_detect_uniform_M_off()
+    test_gp_detect_uniform_M_off_dependent()
     test_gp_unknown_sampler_error()
     test_gp_infeasible_disjunct()
 end
