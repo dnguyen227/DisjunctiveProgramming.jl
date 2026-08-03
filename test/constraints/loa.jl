@@ -223,6 +223,45 @@ function test_loa_solve_no_master_iterations()
     @test_throws Exception objective_bound(model)
 end
 
+# The cache forwards the model building part of the MOI interface,
+# which a solve reaches only through `copy_to`
+function test_loa_result_cache_moi_interface()
+    T = Float64
+    cache = DP._LOAResultCache(
+        MOI.Utilities.MockOptimizer(
+            MOI.Utilities.UniversalFallback(MOI.Utilities.Model{T}()), T),
+        "TestSolver")
+    @test MOI.is_empty(cache)
+    @test MOI.get(cache, MOI.SolverName()) == "TestSolver"
+
+    x = MOI.add_variable(cache)
+    @test MOI.is_valid(cache, x)
+    func = MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(1.0, x)], 0.0)
+    @test MOI.supports_constraint(
+        cache, typeof(func), MOI.LessThan{T})
+    cref = MOI.add_constraint(cache, func, MOI.LessThan(1.0))
+    @test MOI.is_valid(cache, cref)
+
+    MOI.modify(cache, cref, MOI.ScalarCoefficientChange(x, 2.0))
+    @test MOI.get(cache, MOI.ConstraintFunction(), cref).terms[1].coefficient == 2.0
+
+    obj = MOI.ObjectiveFunction{MOI.ScalarAffineFunction{T}}()
+    @test MOI.supports(cache, obj)
+    MOI.set(cache, obj, func)
+    MOI.modify(cache, obj, MOI.ScalarCoefficientChange(x, 3.0))
+    @test MOI.get(cache, obj).terms[1].coefficient == 3.0
+
+    @test MOI.supports(cache, MOI.VariablePrimalStart(), MOI.VariableIndex)
+    MOI.set(cache, MOI.VariablePrimalStart(), x, 0.5)
+    @test MOI.get(cache, MOI.VariablePrimalStart(), x) == 0.5
+
+    MOI.delete(cache, cref)
+    @test !MOI.is_valid(cache, cref)
+    @test_throws ErrorException MOI.optimize!(cache)
+    MOI.empty!(cache)
+    @test MOI.is_empty(cache)
+end
+
 # The result cache delegates the rest of the MOI interface to its mock
 function test_loa_result_cache_delegation()
     model = GDPModel(HiGHS.Optimizer)
@@ -1030,6 +1069,7 @@ end
     test_loa_reoptimize_respects_user_optimizer()
     test_loa_solve_simple()
     test_loa_solve_no_master_iterations()
+    test_loa_result_cache_moi_interface()
     test_loa_result_cache_delegation()
     test_loa_solve_simple_with_mbm()
     test_loa_solve_two_disjunctions()
