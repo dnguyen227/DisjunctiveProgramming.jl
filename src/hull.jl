@@ -384,16 +384,17 @@ end
 #   constraint is left unfactorized so conic-aware solvers recognize
 #   the rotated SOC in presolve; at y = 0 the link forces t = 0.
 
-# Assemble the symmetric coefficient matrix of the quadratic terms
+# Assemble the symmetric coefficient matrix of the quadratic terms and
+# the variables indexing its rows, in order of first appearance
 function _quad_coefficient_matrix(
     quad::JuMP.GenericQuadExpr{C, V}
     ) where {C, V}
     index = Dict{V, Int}()
-    for (pair, _) in quad.terms
-        haskey(index, pair.a) || (index[pair.a] = length(index) + 1)
-        haskey(index, pair.b) || (index[pair.b] = length(index) + 1)
+    vars = V[]
+    for (pair, _) in quad.terms, v in (pair.a, pair.b)
+        haskey(index, v) || (push!(vars, v); index[v] = length(vars))
     end
-    Q = zeros(float(C), length(index), length(index))
+    Q = zeros(float(C), length(vars), length(vars))
     for (pair, coeff) in quad.terms
         i, j = index[pair.a], index[pair.b]
         if i == j
@@ -403,12 +404,12 @@ function _quad_coefficient_matrix(
             Q[j, i] += coeff / 2
         end
     end
-    return Q
+    return Q, vars
 end
 
 # Check whether the quadratic part is convex (Q ⪰ 0 up to a tolerance)
 function _is_convex_quad(quad::JuMP.GenericQuadExpr)
-    Q = _quad_coefficient_matrix(quad)
+    Q, _ = _quad_coefficient_matrix(quad)
     tol = 1e-9 * max(one(eltype(Q)), maximum(abs, Q))
     return LinearAlgebra.eigmin(LinearAlgebra.Symmetric(Q)) >= -tol
 end
@@ -455,9 +456,38 @@ function _add_cehr_epigraph_variable(model::JuMP.AbstractModel, bvref)
     return tvref
 end
 
+# CEHR for solvers that accept cones: the quadratic is handed over as
+# an explicit rotated second-order cone
+function _cehr_conic_constraints(
+    model::JuMP.AbstractModel,
+    h::JuMP.GenericQuadExpr,
+    bvref::Union{JuMP.AbstractVariableRef, JuMP.GenericAffExpr},
+    method::_Hull
+    )
+    tvref = _add_cehr_epigraph_variable(model, bvref)
+    Q, vars = _quad_coefficient_matrix(h)
+    factors = LinearAlgebra.eigen(LinearAlgebra.Symmetric(Q))
+    tol = 1e-9 * max(one(eltype(Q)), maximum(abs, Q))
+    dvars = [disaggregate_expression(model, v, bvref, method)
+             for v in vars]
+    rows = [0.5 * tvref, zero(0.5 * tvref) + bvref]
+    for k in findall(>(tol), factors.values) # drop zero eigenvalues
+        push!(rows, sqrt(factors.values[k]) * sum(
+            factors.vectors[j, k] * dvars[j] for j in eachindex(dvars)))
+    end
+    aff_pers = disaggregate_expression(model, h.aff, bvref, method)
+    link_func = JuMP.@expression(model, tvref + aff_pers)
+    return [
+        JuMP.build_constraint(error, rows,
+            _MOI.RotatedSecondOrderCone(length(rows))),
+        JuMP.build_constraint(error, link_func, _MOI.LessThan(0))
+    ]
+end
+
 # Reformulate a quadratic constraint normalized to h(x) ≤ 0 exactly:
 # CEHR when the quadratic part is convex (unless `:gehr` is forced),
-# GEHR otherwise
+# GEHR otherwise. CEHR stays algebraic for solvers that do not accept
+# cones; `:cehr_conic` writes the cone out for solvers that do.
 function _exact_quad_hull(
     model::JuMP.AbstractModel,
     h::JuMP.GenericQuadExpr,
@@ -467,6 +497,8 @@ function _exact_quad_hull(
     if isempty(h.terms) # no quadratic terms: standard exact hull
         aff_pers = disaggregate_expression(model, h.aff, bvref, method)
         return [JuMP.build_constraint(error, aff_pers, _MOI.LessThan(0))]
+    elseif _is_convex_quad(h) && method.quadratic == :cehr_conic
+        return _cehr_conic_constraints(model, h, bvref, method)
     elseif _is_convex_quad(h) && method.quadratic != :gehr
         tvref = _add_cehr_epigraph_variable(model, bvref)
         quad_part = _disaggregate_quad_terms(model, h, bvref, method)
@@ -477,10 +509,10 @@ function _exact_quad_hull(
             JuMP.build_constraint(error, cone_func, _MOI.LessThan(0)),
             JuMP.build_constraint(error, link_func, _MOI.LessThan(0))
         ]
-    elseif method.quadratic == :cehr
-        error("`Hull(quadratic = :cehr)` requires convex quadratic " *
-              "disjunct constraints. Use `quadratic = :exact` or " *
-              "`quadratic = :gehr` for nonconvex quadratic constraints.")
+    elseif method.quadratic in (:cehr, :cehr_conic)
+        error("`Hull(quadratic = :$(method.quadratic))` requires convex " *
+              "quadratic disjunct constraints. Use `quadratic = :exact` " *
+              "or `quadratic = :gehr` for nonconvex quadratic constraints.")
     else
         gehr_func = _gehr_expression(model, h, bvref, method)
         return [JuMP.build_constraint(error, gehr_func, _MOI.LessThan(0))]
@@ -498,10 +530,10 @@ function _exact_quad_hull_eq(
     if isempty(h.terms) # no quadratic terms: standard exact hull
         aff_pers = disaggregate_expression(model, h.aff, bvref, method)
         return [JuMP.build_constraint(error, aff_pers, _MOI.EqualTo(0))]
-    elseif method.quadratic == :cehr
-        error("`Hull(quadratic = :cehr)` does not support quadratic " *
-              "equality constraints. Use `quadratic = :exact` or " *
-              "`quadratic = :gehr` instead.")
+    elseif method.quadratic in (:cehr, :cehr_conic)
+        error("`Hull(quadratic = :$(method.quadratic))` does not support " *
+              "quadratic equality constraints. Use `quadratic = :exact` " *
+              "or `quadratic = :gehr` instead.")
     end
     gehr_func = _gehr_expression(model, h, bvref, method)
     return [JuMP.build_constraint(error, gehr_func, _MOI.EqualTo(0))]

@@ -233,6 +233,31 @@ function test_exact_quadratic_gdp_example()
     end
 end
 
+function test_cehr_conic_gdp_example()
+    # Same disks as above, but reformulated to explicit rotated SOCs
+    # (quadratic = :cehr_conic) and solved as a true MICP.
+    oa = optimizer_with_attributes(HiGHS.Optimizer, MOI.Silent() => true)
+    cs = optimizer_with_attributes(Hypatia.Optimizer, MOI.Silent() => true)
+    paj = optimizer_with_attributes(Pajarito.Optimizer,
+        "oa_solver" => oa, "conic_solver" => cs, "verbose" => false)
+    m = GDPModel(paj)
+    set_attribute(m, MOI.Silent(), true)
+    @variable(m, -10 <= x <= 10)
+    @variable(m, -10 <= y <= 10)
+    @variable(m, Y[1:2], Logical)
+    @objective(m, Min, x)
+    @constraint(m, x^2 + y^2 <= 1, Disjunct(Y[1]))
+    @constraint(m, (x - 5)^2 + y^2 <= 1, Disjunct(Y[2]))
+    @disjunction(m, Y)
+    @test optimize!(m, gdp_method = Hull(quadratic = :cehr_conic)) isa Nothing
+    @test termination_status(m) == MOI.OPTIMAL
+    @test isapprox(objective_value(m), -1, atol = 1e-4)
+    @test isapprox(value(x), -1, atol = 1e-4)
+    @test value(Y[1])
+    @test !value(Y[2])
+end
+
 @testset "Solve Exact Quadratic GDP" begin
     test_exact_quadratic_gdp_example()
+    test_cehr_conic_gdp_example()
 end

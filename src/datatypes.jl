@@ -425,14 +425,19 @@ constraints.
   - `:gehr`: always use the General Exact Hull Reformulation.
   - `:cehr`: always use the Conic Exact Hull Reformulation (errors on
     nonconvex quadratic constraints).
+  - `:cehr_conic`: CEHR with the cone written out explicitly as a
+    rotated second-order cone via a spectral factorization of the
+    quadratic part, for solvers that consume cones natively (errors on
+    nonconvex quadratic constraints).
 """
 struct Hull{T} <: AbstractReformulationMethod
     value::T
     quadratic::Symbol
     function Hull(ϵ::T = 1e-6; quadratic::Symbol = :epsilon) where {T}
-        if !(quadratic in (:epsilon, :exact, :gehr, :cehr))
+        if !(quadratic in (:epsilon, :exact, :gehr, :cehr, :cehr_conic))
             error("Invalid `quadratic` option `:$(quadratic)`. Choose " *
-                  "from `:epsilon`, `:exact`, `:gehr`, or `:cehr`.")
+                  "from `:epsilon`, `:exact`, `:gehr`, `:cehr`, or " *
+                  "`:cehr_conic`.")
         end
         new{T}(ϵ, quadratic)
     end

@@ -777,6 +777,68 @@ function test_scalar_cehr_hull_concave_greater()
     @test isequal_canonical(ref[1].func, x_z^2 - t*zbin)
     @test isequal_canonical(ref[2].func, t - 3*x_z + 1*zbin)
 end
+#cehr_conic writes the cone out as an explicit rotated SOC
+function test_scalar_cehr_conic_hull()
+    model = GDPModel()
+    @variable(model, -2 <= x <= 3)
+    @variable(model, z, Logical)
+    @constraint(model, con, x^2 + 3x <= 5, Disjunct(z))
+    zbin = variable_by_name(model, "z")
+    method = DP._Hull(Hull(quadratic = :cehr_conic), Set([x]))
+    prep_bounds(x, model, Hull())
+    @test DP._disaggregate_variables(model, z, Set([x]), method) isa Nothing
+    x_z = variable_by_name(model, "x_z")
+    ref = reformulate_disjunct_constraint(
+        model, constraint_object(con), zbin, method)
+    @test length(ref) == 2
+    t = variable_by_name(model, "t_cehr_z")
+    @test lower_bound(t) == 0
+    @test ref[1].set == MOI.RotatedSecondOrderCone(3)
+    @test isequal_canonical(ref[1].func[1], 0.5 * t)
+    @test isequal_canonical(ref[1].func[2], 1.0 * zbin)
+    # eigenvector sign is implementation-defined
+    @test abs(coefficient(ref[1].func[3], x_z)) ≈ 1.0
+    @test isequal_canonical(ref[2].func, t + 3*x_z - 5*zbin)
+    @test ref[2].set == MOI.LessThan(0.0)
+end
+#singular Q drops its zero eigenvalue rows from the cone
+function test_scalar_cehr_conic_rank_deficient()
+    model = GDPModel()
+    @variable(model, -2 <= x <= 3)
+    @variable(model, -2 <= w <= 3)
+    @variable(model, z, Logical)
+    @constraint(model, con, (x + w)^2 <= 4, Disjunct(z))
+    zbin = variable_by_name(model, "z")
+    method = DP._Hull(Hull(quadratic = :cehr_conic), Set([x, w]))
+    prep_bounds([x, w], model, Hull())
+    @test DP._disaggregate_variables(model, z, Set([x, w]), method) isa Nothing
+    x_z = variable_by_name(model, "x_z")
+    w_z = variable_by_name(model, "w_z")
+    ref = reformulate_disjunct_constraint(
+        model, constraint_object(con), zbin, method)
+    @test ref[1].set == MOI.RotatedSecondOrderCone(3) # rank 1, not 2
+    row = ref[1].func[3]
+    s = sign(coefficient(row, x_z))
+    @test coefficient(row, x_z) ≈ s * 1.0
+    @test coefficient(row, w_z) ≈ s * 1.0
+end
+#cehr_conic rejects nonconvex and equality constraints like cehr
+function test_scalar_cehr_conic_errors()
+    model = GDPModel()
+    @variable(model, -2 <= x <= 3)
+    @variable(model, -2 <= w <= 3)
+    @variable(model, z, Logical)
+    @constraint(model, con, x*w <= 5, Disjunct(z))
+    @constraint(model, con_eq, x^2 == 4, Disjunct(z))
+    zbin = variable_by_name(model, "z")
+    method = DP._Hull(Hull(quadratic = :cehr_conic), Set([x, w]))
+    prep_bounds([x, w], model, Hull())
+    DP._disaggregate_variables(model, z, Set([x, w]), method)
+    @test_throws ErrorException reformulate_disjunct_constraint(
+        model, constraint_object(con), zbin, method)
+    @test_throws ErrorException reformulate_disjunct_constraint(
+        model, constraint_object(con_eq), zbin, method)
+end
 #nonconvex quadratic routed to GEHR under :exact, error under :cehr
 function test_scalar_exact_hull_nonconvex()
     model = GDPModel()
@@ -944,6 +1006,9 @@ end
     test_hull_quadratic_option_error()
     test_scalar_cehr_hull()
     test_scalar_cehr_hull_concave_greater()
+    test_scalar_cehr_conic_hull()
+    test_scalar_cehr_conic_rank_deficient()
+    test_scalar_cehr_conic_errors()
     test_scalar_exact_hull_nonconvex()
     test_scalar_exact_hull_equality()
     test_scalar_exact_hull_2sided()
