@@ -1,0 +1,20 @@
+name = "GDPOptimizer"
+uuid = "7da86d0c-51ea-4770-ae9e-8cf6d5933256"
+authors = ["Daniel Nguyen"]
+version = "0.1.0"
+
+[deps]
+MathOptInterface = "b8f27783-ece8-5eb3-8dc8-9495eed66fee"
+
+[compat]
+MathOptInterface = "1"
+julia = "1.10"
+
+[extras]
+HiGHS = "87dc4568-4c63-4d18-b0c0-bb2238e4078b"
+Ipopt = "b6b21f68-93f8-5de0-b562-5493be1d77c9"
+JuMP = "4076af6c-e467-56ae-b986-b466b2749572"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["HiGHS", "Ipopt", "JuMP", "Test"]

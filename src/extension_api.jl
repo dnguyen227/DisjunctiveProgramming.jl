@@ -16,6 +16,29 @@ julia> InfiniteGDPModel()
 function InfiniteGDPModel end
 
 """
+    MOIDisjunction()
+
+Reformulation method that lowers each disjunction to a single vector
+constraint in `GDPOptimizer.DisjunctionSet` so the model can be solved
+by the GDPOptimizer.jl MOI solver layer (logic-based outer
+approximation). Requires GDPOptimizer to be imported first and the
+model's optimizer to be a `GDPOptimizer.Optimizer`.
+
+**Example**
+```julia
+julia> using DisjunctiveProgramming, GDPOptimizer, HiGHS, Ipopt
+
+julia> model = GDPModel(() -> GDPOptimizer.Optimizer(
+           nlp_solver = Ipopt.Optimizer, mip_solver = HiGHS.Optimizer));
+
+julia> optimize!(model, gdp_method = MOIDisjunction())
+```
+"""
+struct MOIDisjunction <: AbstractReformulationMethod end
+
+requires_exactly1(::MOIDisjunction) = true
+
+"""
     InfiniteLogical(prefs...)
 
 Allows users to create infinite logical variables. This is a tag 
