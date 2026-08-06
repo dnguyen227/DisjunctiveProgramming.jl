@@ -159,6 +159,27 @@ function test_lowering_infinite()
     @test all(value(x) .>= 5.0 .- 1e-4)
 end
 
+# A nested infinite disjunction transcribes with the parent indicator
+# as its activation, so the rebuilt constraint function is a uniform
+# vector of scalar expressions (no constant to promote).
+function test_lowering_infinite_nested()
+    model = InfiniteGDPModel(_gdp_optimizer_factory())
+    set_silent(model)
+    @infinite_parameter(model, t in [0, 1], num_supports = 3)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @variable(model, W[1:2], InfiniteLogical(t))
+    @constraint(model, x <= 2, Disjunct(Y[1]))
+    @constraint(model, x >= 5, Disjunct(W[1]))
+    @constraint(model, x >= 3, Disjunct(W[2]))
+    @disjunction(model, W, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, integral(x, t))
+    optimize!(model, gdp_method = MOIDisjunction())
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
+    @test objective_value(model) ≈ 10.0 atol = 1e-4
+end
+
 @testset "GDPOptimizer lowering" begin
     test_disjunction_set_lowering()
     test_lowering_nested()
@@ -167,4 +188,5 @@ end
     test_lowering_solve_nonlinear()
     test_lowering_solve_nested()
     test_lowering_infinite()
+    test_lowering_infinite_nested()
 end

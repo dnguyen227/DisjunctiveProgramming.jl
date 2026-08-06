@@ -362,6 +362,298 @@ function test_bridged_vector_constraint()
     @test value(z[2]) ≈ 1.0 atol = 1e-5
 end
 
+# Genuinely nonlinear (non-quadratic) global rows stay
+# `ScalarNonlinearFunction`s through demotion and the linearizer walks
+# their argument trees (variable and affine arguments).
+function test_nonlinear_exp_global()
+    model = Model(_loa_optimizer())
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, z[1:2], Bin)
+    @constraint(model, exp(x) <= exp(5.0))
+    @constraint(model, exp(x + 1.0) <= exp(6.5))
+    @constraint(model, [1, z[1], z[2], x, x] in GDPO.DisjunctionSet([
+        [MOI.LessThan(3.0)], [MOI.LessThan(8.0)]]))
+    @objective(model, Max, x)
+    optimize!(model)
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
+    @test objective_value(model) ≈ 5.0 atol = 1e-3
+    @test value(z[2]) ≈ 1.0 atol = 1e-5
+end
+
+# `use_nlpf = false` with an infeasible combination: the solve keeps
+# only the no-good cut and still finishes from the other disjunct.
+function test_nlpf_disabled_infeasible_combination()
+    model = Model(_loa_optimizer(use_nlpf = false))
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, z[1:2], Bin)
+    @constraint(model, 1.0x >= 5)
+    @constraint(model, [1, 1.0z[1], 1.0z[2], x^2, x^2] in
+        GDPO.DisjunctionSet([[MOI.LessThan(9.0)], [MOI.LessThan(64.0)]]))
+    @objective(model, Min, x)
+    optimize!(model)
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
+    @test objective_value(model) ≈ 5.0 atol = 1e-3
+    @test value(z[2]) ≈ 1.0 atol = 1e-5
+end
+
+# The NLPF slacks GreaterThan rows and copies the global linear rows
+# when restoring an infeasible combination.
+function test_nlpf_slacked_rows()
+    model = Model(_loa_optimizer())
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, z[1:2], Bin)
+    @constraint(model, 1.0x >= 4)
+    @constraint(model, x^2 >= 25)
+    @constraint(model, [1, 1.0z[1], 1.0z[2], x^2, x^2] in
+        GDPO.DisjunctionSet([[MOI.LessThan(9.0)], [MOI.LessThan(64.0)]]))
+    @objective(model, Min, x)
+    optimize!(model)
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
+    @test objective_value(model) ≈ 5.0 atol = 1e-3
+    @test value(z[2]) ≈ 1.0 atol = 1e-5
+end
+
+# A quadratic-typed global row with no quadratic terms demotes to
+# affine and lands in the master directly.
+function test_demoted_affine_global()
+    model = Model(_loa_optimizer())
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, z[1:2], Bin)
+    @constraint(model, zero(QuadExpr) + 1.0x <= 6)
+    @constraint(model, [1, z[1], z[2], x, x] in GDPO.DisjunctionSet([
+        [MOI.LessThan(3.0)], [MOI.LessThan(8.0)]]))
+    @objective(model, Max, x)
+    optimize!(model)
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
+    @test objective_value(model) ≈ 6.0 atol = 1e-4
+end
+
+# An all-variable disjunction arrives as `VectorOfVariables`; its raw
+# variable rows are promoted to affine rows rather than bounds.
+function test_vector_of_variables_disjunction()
+    model = Model(_loa_optimizer())
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, zout[1:2], Bin)
+    @variable(model, zin[1:2], Bin)
+    @constraint(model, [1, zout[1], zout[2], x] in GDPO.DisjunctionSet([
+        [MOI.LessThan(2.0)], MOI.AbstractScalarSet[]]))
+    @constraint(model, [zout[2], zin[1], zin[2], x, x] in
+        GDPO.DisjunctionSet([[MOI.LessThan(5.0)], [MOI.LessThan(8.0)]]))
+    @objective(model, Max, x)
+    optimize!(model)
+    @test termination_status(model) == MOI.LOCALLY_SOLVED
+    @test objective_value(model) ≈ 8.0 atol = 1e-4
+    @test value(zout[2]) ≈ 1.0 atol = 1e-5
+    @test value(zin[2]) ≈ 1.0 atol = 1e-5
+end
+
+# Zero iteration budgets exit before any solve, without an incumbent.
+function test_iteration_limit_no_incumbent()
+    model = Model(_loa_optimizer(set_cover_max_iter = 0, max_iter = 0))
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, z[1:2], Bin)
+    @constraint(model, [1, z[1], z[2], x, x] in GDPO.DisjunctionSet([
+        [MOI.LessThan(3.0)], [MOI.LessThan(7.0)]]))
+    @objective(model, Min, x)
+    optimize!(model)
+    @test termination_status(model) == MOI.ITERATION_LIMIT
+    @test result_count(model) == 0
+end
+
+# `max_iter = 0` keeps the set-covering incumbent but produces no
+# master bound.
+function test_iteration_limit_with_incumbent()
+    model = Model(_loa_optimizer(max_iter = 0))
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, z[1:2], Bin)
+    @constraint(model, [1, z[1], z[2], x, x] in GDPO.DisjunctionSet([
+        [MOI.GreaterThan(2.0)], [MOI.GreaterThan(5.0)]]))
+    @objective(model, Min, x)
+    optimize!(model)
+    @test termination_status(model) == MOI.ITERATION_LIMIT
+    @test primal_status(model) == MOI.FEASIBLE_POINT
+    @test occursin("limit hit", raw_status(model))
+    @test occursin("no bound", raw_status(model))
+    @test objective_bound(model) == -Inf
+end
+
+# An unbounded master (no OA cuts yet bound alpha_oa) surfaces its
+# status instead of looping.
+function test_master_abnormal_status()
+    model = Model(_loa_optimizer(set_cover_max_iter = 0))
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, z[1:2], Bin)
+    @constraint(model, [1, z[1], z[2], x, x] in GDPO.DisjunctionSet([
+        [MOI.LessThan(3.0)], [MOI.LessThan(7.0)]]))
+    @objective(model, Min, x)
+    optimize!(model)
+    @test termination_status(model) == MOI.OTHER_LIMIT
+    @test result_count(model) == 0
+    @test occursin("master solve finished", raw_status(model))
+end
+
+################################################################################
+#                            MOCK SOLVER
+################################################################################
+# Delegates every MOI call to a wrapped optimizer, but sleeps
+# `sleep_time` seconds in each solve and, from solve `fail_from` on,
+# skips the inner solve and reports `fail_status` with no solution.
+# Deterministic triggers for the deadline and abnormal-master paths.
+mutable struct MockSolver <: MOI.AbstractOptimizer
+    inner::MOI.AbstractOptimizer
+    sleep_time::Float64
+    fail_from::Int
+    fail_status::MOI.TerminationStatusCode
+    solves::Int
+    failing::Bool
+end
+
+function MockSolver(
+    factory;
+    sleep_time::Float64 = 0.0,
+    fail_from::Int = typemax(Int),
+    fail_status::MOI.TerminationStatusCode = MOI.NODE_LIMIT
+    )
+    return MockSolver(MOI.instantiate(factory), sleep_time, fail_from,
+        fail_status, 0, false)
+end
+
+function MOI.optimize!(model::MockSolver)
+    model.solves += 1
+    model.sleep_time > 0 && sleep(model.sleep_time)
+    model.failing = model.solves >= model.fail_from
+    model.failing || MOI.optimize!(model.inner)
+    return
+end
+
+const _WrappedAttr = Union{MOI.AbstractModelAttribute,
+    MOI.AbstractOptimizerAttribute}
+const _WrappedIndexAttr = Union{MOI.AbstractVariableAttribute,
+    MOI.AbstractConstraintAttribute}
+const _WrappedIndex = Union{MOI.VariableIndex, MOI.ConstraintIndex}
+
+function MOI.get(model::MockSolver, attr::_WrappedAttr)
+    if model.failing
+        attr isa MOI.TerminationStatus && return model.fail_status
+        attr isa MOI.PrimalStatus && return MOI.NO_SOLUTION
+    end
+    return MOI.get(model.inner, attr)
+end
+
+MOI.is_empty(model::MockSolver) = MOI.is_empty(model.inner)
+MOI.empty!(model::MockSolver) = MOI.empty!(model.inner)
+MOI.supports_incremental_interface(::MockSolver) = true
+MOI.copy_to(model::MockSolver, src::MOI.ModelLike) =
+    MOI.copy_to(model.inner, src)
+MOI.add_variable(model::MockSolver) = MOI.add_variable(model.inner)
+MOI.delete(model::MockSolver, index) = MOI.delete(model.inner, index)
+MOI.is_valid(model::MockSolver, index) = MOI.is_valid(model.inner, index)
+
+function MOI.add_constraint(
+    model::MockSolver,
+    func::MOI.AbstractFunction,
+    set::MOI.AbstractSet
+    )
+    return MOI.add_constraint(model.inner, func, set)
+end
+
+function MOI.supports_constraint(
+    model::MockSolver,
+    F::Type{<:MOI.AbstractFunction},
+    S::Type{<:MOI.AbstractSet}
+    )
+    return MOI.supports_constraint(model.inner, F, S)
+end
+
+MOI.supports(model::MockSolver, attr::_WrappedAttr) =
+    MOI.supports(model.inner, attr)
+
+MOI.set(model::MockSolver, attr::_WrappedAttr, value) =
+    MOI.set(model.inner, attr, value)
+
+function MOI.supports(
+    model::MockSolver,
+    attr::_WrappedIndexAttr,
+    I::Type{<:_WrappedIndex}
+    )
+    return MOI.supports(model.inner, attr, I)
+end
+
+function MOI.get(
+    model::MockSolver,
+    attr::_WrappedIndexAttr,
+    index::_WrappedIndex
+    )
+    return MOI.get(model.inner, attr, index)
+end
+
+function MOI.set(
+    model::MockSolver,
+    attr::_WrappedIndexAttr,
+    index::_WrappedIndex,
+    value
+    )
+    return MOI.set(model.inner, attr, index, value)
+end
+
+function _mock_time_limit_model(limit::Float64; kwargs...)
+    factory = () -> GDPO.Optimizer(
+        nlp_solver = () -> MockSolver(Ipopt.Optimizer; kwargs...),
+        mip_solver = HiGHS.Optimizer,
+        iteration_time_limit = limit)
+    model = Model(factory)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, z[1:2], Bin)
+    @constraint(model, [1, z[1], z[2], x, x] in GDPO.DisjunctionSet([
+        [MOI.GreaterThan(2.0)], [MOI.GreaterThan(5.0)]]))
+    @objective(model, Min, x)
+    return model
+end
+
+# The loop deadline passes right after the covering incumbent: the
+# mock NLP sleeps past `iteration_time_limit`, so the main loop never
+# starts and the incumbent is reported against the time limit. The
+# first solve warms up the mock stack so compilation latency cannot
+# eat the deadline before the covering pass runs.
+function test_time_limit_with_incumbent()
+    warmup = _mock_time_limit_model(Inf)
+    optimize!(warmup)
+    @test objective_value(warmup) ≈ 2.0 atol = 1e-5
+    model = _mock_time_limit_model(0.5, sleep_time = 1.5)
+    optimize!(model)
+    @test termination_status(model) == MOI.TIME_LIMIT
+    @test primal_status(model) == MOI.FEASIBLE_POINT
+    @test occursin("limit hit", raw_status(model))
+end
+
+# The master finishes abnormally after an incumbent exists: the mock
+# master reports a node limit on its second solve.
+function test_master_abnormal_status_with_incumbent()
+    factory = () -> GDPO.Optimizer(
+        nlp_solver = Ipopt.Optimizer,
+        mip_solver = () -> MockSolver(HiGHS.Optimizer, fail_from = 2))
+    model = Model(factory)
+    set_silent(model)
+    @variable(model, 0 <= x <= 10)
+    @variable(model, z[1:2], Bin)
+    @constraint(model, [1, z[1], z[2], x, x] in GDPO.DisjunctionSet([
+        [MOI.GreaterThan(2.0)], [MOI.GreaterThan(5.0)]]))
+    @objective(model, Min, x)
+    optimize!(model)
+    @test termination_status(model) == MOI.OTHER_LIMIT
+    @test primal_status(model) == MOI.FEASIBLE_POINT
+    @test occursin("limit hit", raw_status(model))
+end
+
 ################################################################################
 #                            UNIT TESTS
 ################################################################################
@@ -464,16 +756,26 @@ end
     test_max_sense_linear()
     test_two_disjunctions()
     test_nonlinear_global()
+    test_nonlinear_exp_global()
     test_nonlinear_equality_global()
     test_nonlinear_equality_disjunct()
     test_nonlinear_interval_disjunct()
     test_complement_indicator()
     test_nlpf_disabled()
+    test_nlpf_disabled_infeasible_combination()
+    test_nlpf_slacked_rows()
+    test_demoted_affine_global()
+    test_vector_of_variables_disjunction()
     test_bigm_master_gating()
     test_integer_options()
     test_non_indicator_binary()
     test_infeasible_no_incumbent()
     test_time_limit()
+    test_iteration_limit_no_incumbent()
+    test_iteration_limit_with_incumbent()
+    test_master_abnormal_status()
+    test_time_limit_with_incumbent()
+    test_master_abnormal_status_with_incumbent()
     test_nonconvex_never_optimal()
     test_feasibility_sense()
     test_linear_interval_disjunct()

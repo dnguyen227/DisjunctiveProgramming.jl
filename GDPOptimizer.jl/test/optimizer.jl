@@ -84,9 +84,44 @@ function test_copy_to()
     @test dest_func.terms[1].scalar_term.variable == index_map[z[1]]
 end
 
+# The incremental MOI surface forwards to the cache: names, starts,
+# constrained variables, and deletion.
+function test_moi_forwarding()
+    optimizer = GDPO.Optimizer()
+    @test MOI.supports_incremental_interface(optimizer)
+    x = MOI.add_variable(optimizer)
+    MOI.set(optimizer, MOI.VariableName(), x, "x")
+    @test MOI.get(optimizer, MOI.VariableIndex, "x") == x
+    MOI.set(optimizer, MOI.VariablePrimalStart(), x, 2.5)
+    @test MOI.get(optimizer, MOI.VariablePrimalStart(), x) == 2.5
+    y, ci_y = MOI.add_constrained_variables(optimizer, MOI.Nonnegatives(2))
+    @test length(y) == 2
+    @test MOI.is_valid(optimizer, ci_y)
+    func = MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(1.0, x)], 0.0)
+    ci = MOI.add_constraint(optimizer, func, MOI.LessThan(1.0))
+    MOI.set(optimizer, MOI.ConstraintName(), ci, "c")
+    @test MOI.get(optimizer, typeof(ci), "c") == ci
+    MOI.delete(optimizer, ci)
+    @test !MOI.is_valid(optimizer, ci)
+    @test !MOI.supports_add_constrained_variables(optimizer,
+        GDPO.DisjunctionSet)
+end
+
+# A constraint type the partition cannot place errors at solve time.
+function test_unsupported_constraint_type()
+    optimizer = GDPO.Optimizer()
+    x = MOI.add_variable(optimizer)
+    func = MOI.VectorAffineFunction(
+        [MOI.VectorAffineTerm(1, MOI.ScalarAffineTerm(1.0, x))], [0.0])
+    MOI.add_constraint(optimizer, func, MOI.Nonnegatives(1))
+    @test_throws ErrorException MOI.optimize!(optimizer)
+end
+
 @testset "Optimizer scaffold" begin
     test_optimizer_scaffold()
     test_optimizer_options()
     test_model_building()
     test_copy_to()
+    test_moi_forwarding()
+    test_unsupported_constraint_type()
 end

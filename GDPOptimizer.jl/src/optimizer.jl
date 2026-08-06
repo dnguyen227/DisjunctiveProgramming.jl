@@ -234,6 +234,16 @@ function MOI.supports(
     return MOI.supports(model.cache.model, attr, MOI.VariableIndex)
 end
 
+# The LOA loop consumes warm starts, so accept them even though the
+# honest inner model does not store them (the fallback does).
+function MOI.supports(
+    ::Optimizer,
+    ::MOI.VariablePrimalStart,
+    ::Type{MOI.VariableIndex}
+    )
+    return true
+end
+
 function MOI.set(
     model::Optimizer,
     attr::MOI.AbstractVariableAttribute,
