@@ -156,6 +156,25 @@ function _optimize_hook(model::JuMP.AbstractModel, method::LOA; kwargs...)
         _log_loa_progress(t_start, best_objective, master_bound)
     end
 
+    # Terminal certificate solve. The loop reads its bound off
+    # alpha_oa at a master incumbent solved to the working MIPGap, so
+    # the reported bound floats within that tolerance of the
+    # incumbent on either side. One tight re-solve of the final
+    # master reads alpha_oa at a near-optimal incumbent instead,
+    # shrinking that float to the certificate gap. (The master's dual
+    # objective bound is no substitute: it bounds alpha_oa plus the
+    # penalty slacks, which are active exactly when cuts misbehave.)
+    if master_bound !== nothing && master_failure === nothing
+        JuMP.set_attribute(master.model,
+            _MOI.RelativeGapTolerance(), 1e-6)
+        JuMP.set_time_limit_sec(master.model, 60.0)
+        JuMP.optimize!(master.model)
+        if JuMP.is_solved_and_feasible(master.model)
+            master_bound = JuMP.value(master.alpha_oa)
+            _log_loa_progress(t_start, best_objective, master_bound)
+        end
+    end
+
     _restore_time_limit(nlp, original_time_limit)
     status = _loa_termination_status(best_result !== nothing, converged,
         master_failure, cuts_added, time() >= loop_deadline)
