@@ -4,10 +4,6 @@ authors = ["hdavid16 <hperez16@gmail.com>"]
 version = "0.6.1"
 
 [deps]
-# GDPOptimizer is unregistered: it lives in [deps] (dev'ed by path) so
-# the extension loads through its strong dependency. Move it to
-# [weakdeps] once registered.
-GDPOptimizer = "7da86d0c-51ea-4770-ae9e-8cf6d5933256"
 JuMP = "4076af6c-e467-56ae-b986-b466b2749572"
 Reexport = "189a3867-3050-52da-a836-e630ba90ab69"
 
@@ -15,12 +11,10 @@ Reexport = "189a3867-3050-52da-a836-e630ba90ab69"
 InfiniteOpt = "20393b10-9daf-11e9-18c9-8db751c92c57"
 
 [extensions]
-GDPOptimizerDisjunctiveProgramming = "GDPOptimizer"
 InfiniteDisjunctiveProgramming = "InfiniteOpt"
 
 [compat]
 Aqua = "0.8"
-GDPOptimizer = "0.1"
 InfiniteOpt = "0.6.3"
 Ipopt = "1.9.0"
 JuMP = "1.18"

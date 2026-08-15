@@ -1,20 +1,35 @@
-module GDPOptimizerDisjunctiveProgramming
-
-import DisjunctiveProgramming as DP
-import GDPOptimizer
-import JuMP
-import JuMP.MOI as _MOI
-
 ################################################################################
 #                        DISJUNCTION SET LOWERING
 ################################################################################
+"""
+    MOIDisjunction()
+
+Reformulation method that lowers each disjunction to a single vector
+constraint in [`DisjunctionSet`](@ref) so the model can be solved by
+an MOI optimizer that supports the set, such as
+`DisjunctiveAlgorithms.Optimizer`.
+
+**Example**
+```julia
+julia> using DisjunctiveProgramming, DisjunctiveAlgorithms, HiGHS, Ipopt
+
+julia> model = GDPModel(() -> DisjunctiveAlgorithms.Optimizer(
+           nlp_solver = Ipopt.Optimizer, mip_solver = HiGHS.Optimizer));
+
+julia> optimize!(model, gdp_method = MOIDisjunction())
+```
+"""
+struct MOIDisjunction <: AbstractReformulationMethod end
+
+requires_exactly1(::MOIDisjunction) = true
+
 # One flat constraint per disjunction: [activation, indicators,
 # rows]. Nested disjunctions get their own constraint with the parent
 # indicator as the activation. InfiniteOpt transcribes per support.
-function DP.reformulate_disjunction(
+function reformulate_disjunction(
     model::JuMP.AbstractModel,
-    disj::DP.Disjunction,
-    method::DP.MOIDisjunction
+    disj::Disjunction,
+    method::MOIDisjunction
     )
     constraints = JuMP.AbstractConstraint[]
     _lower_disjunction(constraints, model, disj, 1.0)
@@ -24,20 +39,20 @@ end
 function _lower_disjunction(
     constraints::Vector{JuMP.AbstractConstraint},
     model::JuMP.AbstractModel,
-    disj::DP.Disjunction,
+    disj::Disjunction,
     activation
     )
     indicators = JuMP.AbstractJuMPScalar[]
     rows = JuMP.AbstractJuMPScalar[]
     inner_sets = Vector{_MOI.AbstractScalarSet}[]
     for lvref in disj.indicators
-        indicator = 1.0 * DP.binary_variable(lvref)
+        indicator = 1.0 * binary_variable(lvref)
         push!(indicators, indicator)
         sets = _MOI.AbstractScalarSet[]
-        for cref in get(DP._indicator_to_constraints(model), lvref, [])
+        for cref in get(_indicator_to_constraints(model), lvref, [])
             constraint = JuMP.constraint_object(cref)
-            if constraint isa DP.Disjunction
-                haskey(DP._exactly1_constraints(model), cref) || error(
+            if constraint isa Disjunction
+                haskey(_exactly1_constraints(model), cref) || error(
                     "`MOIDisjunction` requires nested " *
                     "disjunctions created with `exactly1 = true`.")
                 _lower_disjunction(constraints, model, constraint,
@@ -51,7 +66,7 @@ function _lower_disjunction(
     end
     push!(constraints, JuMP.VectorConstraint(
         collect(promote(1.0 * activation, indicators..., rows...)),
-        GDPOptimizer.DisjunctionSet(inner_sets)))
+        DisjunctionSet(inner_sets)))
     return
 end
 
@@ -60,17 +75,23 @@ end
 function JuMP.build_constraint(
     ::Function,
     func::AbstractVector{<:JuMP.AbstractJuMPScalar},
-    set::GDPOptimizer.DisjunctionSet
+    set::DisjunctionSet
     )
     return JuMP.VectorConstraint(func, set)
 end
 
 function JuMP.build_constraint(
     ::Function,
-    func::AbstractVector,
-    set::GDPOptimizer.DisjunctionSet
+    func::AbstractVector{<:Union{Number, JuMP.AbstractJuMPScalar}},
+    set::DisjunctionSet
     )
     return JuMP.VectorConstraint(collect(promote(func...)), set)
 end
 
+function JuMP.build_constraint(
+    ::Function,
+    func::AbstractVector,
+    set::DisjunctionSet
+    )
+    return JuMP.VectorConstraint(collect(promote(func...)), set)
 end

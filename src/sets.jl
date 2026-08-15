@@ -2,10 +2,10 @@
 #                              DISJUNCTION SET
 ################################################################################
 const _SupportedInnerSet = Union{
-    MOI.LessThan{Float64},
-    MOI.GreaterThan{Float64},
-    MOI.EqualTo{Float64},
-    MOI.Interval{Float64}
+    _MOI.LessThan{Float64},
+    _MOI.GreaterThan{Float64},
+    _MOI.EqualTo{Float64},
+    _MOI.Interval{Float64}
 }
 
 """
@@ -36,8 +36,8 @@ Supported inner sets: `MOI.LessThan{Float64}`,
 `MOI.GreaterThan{Float64}`, `MOI.EqualTo{Float64}`,
 `MOI.Interval{Float64}`.
 """
-struct DisjunctionSet <: MOI.AbstractVectorSet
-    inner_sets::Vector{Vector{MOI.AbstractScalarSet}}
+struct DisjunctionSet <: _MOI.AbstractVectorSet
+    inner_sets::Vector{Vector{_MOI.AbstractScalarSet}}
     function DisjunctionSet(inner_sets::Vector{<:Vector})
         isempty(inner_sets) && throw(ArgumentError(
             "A `DisjunctionSet` requires at least one disjunct."))
@@ -45,7 +45,7 @@ struct DisjunctionSet <: MOI.AbstractVectorSet
             set isa _SupportedInnerSet || throw(ArgumentError(
                 "Unsupported inner set `$set` in `DisjunctionSet`."))
         end
-        return new([MOI.AbstractScalarSet[set for set in sets]
+        return new([_MOI.AbstractScalarSet[set for set in sets]
             for sets in inner_sets])
     end
 end
@@ -85,7 +85,7 @@ function row_indices(set::DisjunctionSet, i::Int)
     return offset .+ (1:length(set.inner_sets[i]))
 end
 
-function MOI.dimension(set::DisjunctionSet)
+function _MOI.dimension(set::DisjunctionSet)
     return 1 + num_disjuncts(set) + sum(length, set.inner_sets)
 end
 
