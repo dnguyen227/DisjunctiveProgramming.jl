@@ -14,7 +14,7 @@ an MOI optimizer that supports the set, such as
 julia> using DisjunctiveProgramming, DisjunctiveAlgorithms, HiGHS, Ipopt
 
 julia> model = GDPModel(() -> DisjunctiveAlgorithms.Optimizer(
-           nlp_solver = Ipopt.Optimizer, mip_solver = HiGHS.Optimizer));
+           Ipopt.Optimizer, HiGHS.Optimizer));
 
 julia> optimize!(model, gdp_method = MOIDisjunction())
 ```
