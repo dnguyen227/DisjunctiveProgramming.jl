@@ -50,7 +50,7 @@ function test_disjunction_set_lowering()
     @constraint(model, x <= 3, Disjunct(Y[1]))
     @constraint(model, x^2 == 64, Disjunct(Y[2]))
     @disjunction(model, Y)
-    reformulate_model(model, MOIDisjunction())
+    reformulate_model(model, Direct())
     crefs = DP._reformulation_constraints(model)
     vector_crefs = filter(crefs) do cref
         constraint_object(cref).set isa DisjunctionSet
@@ -78,7 +78,7 @@ function test_lowering_nested()
     @constraint(model, x <= 6, Disjunct(W[2]))
     @disjunction(model, W, Disjunct(Y[2]))
     @disjunction(model, Y)
-    reformulate_model(model, MOIDisjunction())
+    reformulate_model(model, Direct())
     objs = [constraint_object(cref)
             for cref in DP._reformulation_constraints(model)
             if constraint_object(cref).set isa DisjunctionSet]
@@ -103,7 +103,7 @@ function test_lowering_nested_requires_exactly1()
     @disjunction(model, W, Disjunct(Y[2]), exactly1 = false)
     @disjunction(model, Y)
     @test_throws ErrorException reformulate_model(model,
-        MOIDisjunction())
+        Direct())
 end
 
 @testset "DisjunctionSet" begin
@@ -113,7 +113,7 @@ end
     test_set_validation()
 end
 
-@testset "MOIDisjunction lowering" begin
+@testset "Direct lowering" begin
     test_disjunction_set_lowering()
     test_lowering_nested()
     test_lowering_nested_requires_exactly1()

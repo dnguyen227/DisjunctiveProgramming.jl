@@ -2,11 +2,12 @@
 #                        DISJUNCTION SET LOWERING
 ################################################################################
 """
-    MOIDisjunction()
+    Direct()
 
-Reformulation method that lowers each disjunction to a single vector
-constraint in [`DisjunctionSet`](@ref) so the model can be solved by
-an MOI optimizer that supports the set, such as
+Reformulation method that passes the disjunctions to the solver
+directly: each disjunction is lowered to a single vector constraint
+in [`DisjunctionSet`](@ref), so the model can be solved by an MOI
+optimizer that supports the set, such as
 `DisjunctiveAlgorithms.Optimizer`.
 
 **Example**
@@ -16,12 +17,12 @@ julia> using DisjunctiveProgramming, DisjunctiveAlgorithms, HiGHS, Ipopt
 julia> model = GDPModel(() -> DisjunctiveAlgorithms.Optimizer(
            Ipopt.Optimizer, HiGHS.Optimizer));
 
-julia> optimize!(model, gdp_method = MOIDisjunction())
+julia> optimize!(model, gdp_method = Direct())
 ```
 """
-struct MOIDisjunction <: AbstractReformulationMethod end
+struct Direct <: AbstractReformulationMethod end
 
-requires_exactly1(::MOIDisjunction) = true
+requires_exactly1(::Direct) = true
 
 # One flat constraint per disjunction: [activation, indicators,
 # rows]. Nested disjunctions get their own constraint with the parent
@@ -29,7 +30,7 @@ requires_exactly1(::MOIDisjunction) = true
 function reformulate_disjunction(
     model::JuMP.AbstractModel,
     disj::Disjunction,
-    method::MOIDisjunction
+    method::Direct
     )
     constraints = JuMP.AbstractConstraint[]
     _lower_disjunction(constraints, model, disj, 1.0)
@@ -53,7 +54,7 @@ function _lower_disjunction(
             constraint = JuMP.constraint_object(cref)
             if constraint isa Disjunction
                 haskey(_exactly1_constraints(model), cref) || error(
-                    "`MOIDisjunction` requires nested " *
+                    "`Direct` requires nested " *
                     "disjunctions created with `exactly1 = true`.")
                 _lower_disjunction(constraints, model, constraint,
                     indicator)
