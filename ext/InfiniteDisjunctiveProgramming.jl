@@ -320,7 +320,7 @@ end
 
 # The infinite parameters of `mini_expr` and their supports, in the
 # ascending order of `parameter_refs`. Only defined when M varies over
-# the supports, so it is deferred until an M sampler needs it.
+# the supports, so it is deferred until sample_M_values needs it.
 function _support_grids(sub::DP.GDPSubmodel, mini_expr)
     reverse_map = Dict(ws[1] => v for (v, ws) in sub.fwd_map)
     prefs = Tuple(get(reverse_map, p) do
@@ -331,24 +331,14 @@ function _support_grids(sub::DP.GDPSubmodel, mini_expr)
     return prefs, Tuple(InfiniteOpt.supports(p) for p in prefs)
 end
 
-# Resolve `:auto` to the GP sampler when the GP extension is loaded
-function _resolve_M_sampler(sampler)
-    sampler === :auto || return sampler
-    gp = Base.get_extension(DP, :InfiniteGPDisjunctiveProgramming)
-    return isnothing(gp) ? :exact : DP.GPSampler()
-end
-
 # Solve the M subproblem exactly at every support
 function DP.sample_M_values(
-    sampler::Symbol,
+    gp::Nothing,
     objectives::AbstractArray,
     sub::DP.GDPSubmodel,
     method::DP._MBM,
     support_grids
     )
-    sampler === :exact || error(
-        "Unrecognized `M_sampler` `$(repr(sampler))` for MBM on an " *
-        "infinite model. Use `:auto`, `:exact`, or a `GPSampler`.")
     M_vals = Array{Float64}(undef, size(objectives))
     for I in eachindex(objectives)
         m = DP.raw_M(sub, objectives[I], method)
@@ -359,7 +349,7 @@ function DP.sample_M_values(
 end
 
 # Transcribe mini_expr, compute the per-support M values with the
-# resolved M sampler, and aggregate to a scalar if uniform, else to a
+# method's gp, and aggregate to a scalar if uniform, else to a
 # parameter function on main.
 function DP.raw_M(
     sub::DP.GDPSubmodel{<:InfiniteOpt.InfiniteModel},
@@ -376,9 +366,8 @@ function DP.raw_M(
     transcribed = InfiniteOpt.transformation_model(sub.model)
     inner_sub = DP.GDPSubmodel(transcribed, JuMP.VariableRef[],
         Dict{JuMP.VariableRef, Vector{JuMP.VariableRef}}())
-    sampler = _resolve_M_sampler(method.M_sampler)
-    M_vals = DP.sample_M_values(sampler, objectives, inner_sub, method,
-        () -> _support_grids(sub, mini_expr)[2])
+    M_vals = DP.sample_M_values(method.gp, objectives, inner_sub,
+        method, () -> _support_grids(sub, mini_expr)[2])
     M_vals === nothing && return nothing
     M_vals isa Number && return M_vals
     all(==(first(M_vals)), M_vals) && return first(M_vals)

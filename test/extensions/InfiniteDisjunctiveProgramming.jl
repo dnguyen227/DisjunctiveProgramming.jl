@@ -376,7 +376,7 @@ function test_raw_M_infinite_scalar()
     @constraint(model, con, x >= 5, Disjunct(Y[1]))
     @constraint(model, con2, x <= 3, Disjunct(Y[2]))
     @disjunction(model, Y)
-    mbm = DP._MBM(MBM(HiGHS.Optimizer, M_sampler = :exact), model)
+    mbm = DP._MBM(MBM(HiGHS.Optimizer), model)
     sub = DP.copy_model_with_constraints(
         model, DP.DisjunctConstraintRef[con2], mbm)
     obj = DP.prepare_max_M_objective(
@@ -399,7 +399,7 @@ function test_raw_M_infinite_param_function()
     @constraint(model, con, x <= f, Disjunct(Y[1]))
     @constraint(model, con2, x >= 0.5, Disjunct(Y[2]))
     @disjunction(model, Y)
-    mbm = DP._MBM(MBM(HiGHS.Optimizer, M_sampler = :exact), model)
+    mbm = DP._MBM(MBM(HiGHS.Optimizer), model)
     sub = DP.copy_model_with_constraints(
         model, DP.DisjunctConstraintRef[con2], mbm)
     obj = DP.prepare_max_M_objective(
@@ -428,7 +428,7 @@ function test_raw_M_infinite_two_params()
     @constraint(model, con, x <= t + s, Disjunct(Y[1]))
     @constraint(model, con2, x >= 0.5, Disjunct(Y[2]))
     @disjunction(model, Y)
-    mbm = DP._MBM(MBM(HiGHS.Optimizer, M_sampler = :exact), model)
+    mbm = DP._MBM(MBM(HiGHS.Optimizer), model)
     sub = DP.copy_model_with_constraints(
         model, DP.DisjunctConstraintRef[con2], mbm)
     obj = DP.prepare_max_M_objective(
@@ -452,14 +452,12 @@ function test_raw_M_infinite_dependent_params()
     @constraint(model, con, x >= 5, Disjunct(Y[1]))
     @constraint(model, con2, x <= 3, Disjunct(Y[2]))
     @disjunction(model, Y)
-    for sampler in (:exact, :auto)
-        mbm = DP._MBM(MBM(HiGHS.Optimizer, M_sampler = sampler), model)
-        sub = DP.copy_model_with_constraints(
-            model, DP.DisjunctConstraintRef[con2], mbm)
-        obj = DP.prepare_max_M_objective(
-            model, JuMP.constraint_object(con), sub)
-        @test DP.raw_M(sub, obj, mbm) == 5.0
-    end
+    mbm = DP._MBM(MBM(HiGHS.Optimizer), model)
+    sub = DP.copy_model_with_constraints(
+        model, DP.DisjunctConstraintRef[con2], mbm)
+    obj = DP.prepare_max_M_objective(
+        model, JuMP.constraint_object(con), sub)
+    @test DP.raw_M(sub, obj, mbm) == 5.0
 end
 
 # Piecewise-constant max-of-corners: returns the maximum value over

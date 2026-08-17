@@ -176,7 +176,7 @@ The following reformulation methods are currently supported:
 
     - `optimizer`: Optimizer to use when solving subproblems to determine M values. This is a required value.
     - `default_M`: Default big-M value to use if no big-M is specified for a logical variable (1e9).
-    - `M_sampler`: Strategy for computing M values across the supports of an infinite model. Default: `:auto`, which uses a Gaussian-process sampler (`GPSampler`) when AbstractGPs is loaded and otherwise solves an M subproblem at every support (`:exact`). Ignored for finite models.
+    - `gp`: Gaussian process (or kernel) used to estimate the M values across the supports of an infinite model. Default: `nothing`, which solves an M subproblem at every support. Pass an `AbstractGPs.AbstractGP` or a `KernelFunctions.Kernel` to instead solve a subset of the supports and fill the rest with a conservative GP estimate. Ignored for finite models, as are the tuning keywords `kappa`, `budget`, `min_solves`, and `detect_uniform_M` (see the `MBM` docstring).
 
 5. [P-Split](https://arxiv.org/abs/2202.05198): This method reformulates each disjunct constraint into P constraints, each with a partitioned group defined by the user. This method requires that terms in the constraint be convex additively seperable with respect to each variable. The `PSplit` struct is created with the following required arguments:
 
@@ -224,7 +224,7 @@ optimize!(model, gdp_method = Hull())
 value(W)
 ```
 
-When the `MBM` reformulation is used on an infinite model, an M subproblem is solved at every support by default. Loading [AbstractGPs.jl](https://github.com/JuliaGaussianProcesses/AbstractGPs.jl) (`using AbstractGPs`) activates an additional extension that instead solves M at a subset of the supports and fills the rest with a conservative Gaussian-process estimate, which can substantially reduce the number of subproblem solves. The filled values are heuristic upper estimates rather than certificates; see the `GPSampler` docstring for the tuning knobs (`kappa`, `budget`) and use `MBM(optimizer, M_sampler = :exact)` to force exact solves.
+When the `MBM` reformulation is used on an infinite model, an M subproblem is solved at every support by default. Loading [AbstractGPs.jl](https://github.com/JuliaGaussianProcesses/AbstractGPs.jl) (`using AbstractGPs`) enables an additional extension that instead solves M at a subset of the supports and fills the rest with a conservative Gaussian-process estimate, which can substantially reduce the number of subproblem solves. To opt in, pass a GP or kernel via the `gp` keyword, e.g. `MBM(optimizer, gp = SqExponentialKernel())` (lengthscale selected by marginal likelihood) or `MBM(optimizer, gp = GP(with_lengthscale(Matern52Kernel(), 0.2)))` (used as given). The filled values are heuristic upper estimates rather than certificates; see the `MBM` docstring for the tuning knobs (`kappa`, `budget`, `min_solves`, `detect_uniform_M`).
 
 ## Release Notes
 

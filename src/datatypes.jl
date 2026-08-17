@@ -375,21 +375,48 @@ A type for using the multiple big-M reformulation approach for disjunctive const
 **Fields**
 - `optimizer::O`: Optimizer to use when solving mini-models (required).
 - `default_M::T`: Default big-M value to use if no big-M is specified for a logical variable (1e9).
-- `M_sampler::Any`: Strategy for computing M values across the supports
-  of an infinite model (`:auto`). `:auto` uses [`GPSampler`](@ref) when
-  the AbstractGPs extension is loaded and `:exact` otherwise; `:exact`
-  solves an M subproblem at every support. Ignored for finite models.
+- `gp::Any`: Gaussian process (or kernel) used to estimate the M values
+  across the supports of an infinite model (`nothing`). `nothing` solves
+  an M subproblem at every support; an `AbstractGPs.AbstractGP` or a
+  `KernelFunctions.Kernel` solves a subset of the supports and fills the
+  rest with a conservative GP estimate (see [`sample_M_values`](@ref)).
+  Ignored for finite models, as are the remaining fields.
+- `kappa::Float64`: Upper-confidence-bound multiplier used to select the
+  next support to solve and to fill unsolved supports (2.5).
+- `budget::Float64`: Fraction of the supports to solve exactly, in
+  `(0, 1]` (0.25).
+- `min_solves::Int`: Minimum number of exactly solved supports (6).
+- `detect_uniform_M::Bool`: If `true` (the default), M values that agree
+  at the first few supports are taken to be uniform and used for every
+  support. Set it to `false` to always fit the GP, which leaves the
+  usual `kappa * sd` cushion on the unsolved supports at the cost of
+  the extra solves, and which requires that every infinite parameter
+  have a support grid.
 """
 mutable struct MBM{O, T} <: AbstractReformulationMethod
     optimizer::O
     default_M::T
-    M_sampler::Any
+    gp::Any
+    kappa::Float64
+    budget::Float64
+    min_solves::Int
+    detect_uniform_M::Bool
 
     # Constructor with optimizer (required) and optional default_M
     function MBM(
-        optimizer::O, default_M::T = 1e9; M_sampler = :auto
+        optimizer::O,
+        default_M::T = 1e9;
+        gp = nothing,
+        kappa::Real = 2.5,
+        budget::Real = 0.25,
+        min_solves::Int = 6,
+        detect_uniform_M::Bool = true
         ) where {O, T}
-        new{O, T}(optimizer, default_M, M_sampler)
+        kappa >= 0 || error("`kappa` must be nonnegative.")
+        0 < budget <= 1 || error("`budget` must be in `(0, 1]`.")
+        min_solves >= 1 || error("`min_solves` must be at least 1.")
+        new{O, T}(optimizer, default_M, gp, Float64(kappa),
+            Float64(budget), min_solves, detect_uniform_M)
     end
 end
 
@@ -397,7 +424,11 @@ mutable struct _MBM{O, T, M <: JuMP.AbstractModel} <: AbstractReformulationMetho
     optimizer::O
     M::Dict{LogicalVariableRef{M}, Any}
     default_M::T
-    M_sampler::Any
+    gp::Any
+    kappa::Float64
+    budget::Float64
+    min_solves::Int
+    detect_uniform_M::Bool
     subproblem_indicators::Vector{LogicalVariableRef{M}}
     # Cached submodels: indicator => GDPSubmodel.
     # Typed Any so extensions can store different types.
@@ -408,7 +439,11 @@ mutable struct _MBM{O, T, M <: JuMP.AbstractModel} <: AbstractReformulationMetho
             method.optimizer,
             Dict{LogicalVariableRef{M}, Any}(),
             method.default_M,
-            method.M_sampler,
+            method.gp,
+            method.kappa,
+            method.budget,
+            method.min_solves,
+            method.detect_uniform_M,
             Vector{LogicalVariableRef{M}}(),
             Dict{LogicalVariableRef{M}, Any}()
         )
