@@ -1,6 +1,5 @@
-module InfiniteGPDisjunctiveProgramming
+module AbstractGPsDisjunctiveProgramming
 
-import InfiniteOpt, JuMP
 import AbstractGPs
 import AbstractGPs.KernelFunctions
 import DisjunctiveProgramming as DP

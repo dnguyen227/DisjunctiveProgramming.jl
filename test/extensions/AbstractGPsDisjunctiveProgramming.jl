@@ -215,7 +215,7 @@ function test_gp_unknown_gp_error()
         gdp_method = MBM(HiGHS.Optimizer, gp = :grid))
 end
 
-@testset "InfiniteGPDisjunctiveProgramming" begin
+@testset "AbstractGPsDisjunctiveProgramming" begin
     test_gp_mbm_kwargs()
     test_gp_raw_M_scalar()
     test_gp_raw_M_matches_exact()

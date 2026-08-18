@@ -12,8 +12,8 @@ AbstractGPs = "99985d1d-32ba-4be9-9821-2ec096f28918"
 InfiniteOpt = "20393b10-9daf-11e9-18c9-8db751c92c57"
 
 [extensions]
+AbstractGPsDisjunctiveProgramming = "AbstractGPs"
 InfiniteDisjunctiveProgramming = "InfiniteOpt"
-InfiniteGPDisjunctiveProgramming = ["InfiniteOpt", "AbstractGPs"]
 
 [compat]
 AbstractGPs = "0.5"
