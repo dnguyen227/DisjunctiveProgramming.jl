@@ -387,11 +387,24 @@ A type for using the multiple big-M reformulation approach for disjunctive const
   `(0, 1]` (0.25).
 - `min_solves::Int`: Minimum number of exactly solved supports (6).
 - `detect_uniform_M::Bool`: If `true` (the default), M values that agree
-  at the first few supports are taken to be uniform and used for every
+  at the seed supports are taken to be uniform and used for every
   support. Set it to `false` to always fit the GP, which leaves the
   usual `kappa * sd` cushion on the unsolved supports at the cost of
   the extra solves, and which requires that every infinite parameter
   have a support grid.
+- `lengthscales::Vector{Float64}`: Candidate lengthscales for the
+  marginal-likelihood kernel fit when `gp` is a kernel, relative to
+  support coordinates normalized to `[0, 1]`; ignored when `gp` is a
+  full Gaussian process ([0.05, 0.1, 0.2, 0.4, 0.8]).
+- `jitter::Float64`: Observation-noise nugget added to the GP prior
+  when fitting (1e-8).
+- `n_seeds::Int`: Number of supports solved before the first GP fit,
+  taken as an evenly spaced grid over the supports (4).
+- `seeds::Any`: Optional vector of fractions in `[0, 1]` giving the
+  positions along the support grid to solve before the first GP fit,
+  overriding the evenly spaced grid (`nothing`). With
+  `detect_uniform_M`, evenly spaced seeds can read a periodic M as
+  uniform; pass unevenly spaced seeds to guard against that.
 """
 mutable struct MBM{O, T} <: AbstractReformulationMethod
     optimizer::O
@@ -401,6 +414,10 @@ mutable struct MBM{O, T} <: AbstractReformulationMethod
     budget::Float64
     min_solves::Int
     detect_uniform_M::Bool
+    lengthscales::Vector{Float64}
+    jitter::Float64
+    n_seeds::Int
+    seeds::Any
 
     # Constructor with optimizer (required) and optional default_M
     function MBM(
@@ -410,13 +427,28 @@ mutable struct MBM{O, T} <: AbstractReformulationMethod
         kappa::Real = 2.5,
         budget::Real = 0.25,
         min_solves::Int = 6,
-        detect_uniform_M::Bool = true
+        detect_uniform_M::Bool = true,
+        lengthscales = [0.05, 0.1, 0.2, 0.4, 0.8],
+        jitter::Real = 1e-8,
+        n_seeds::Int = 4,
+        seeds = nothing
         ) where {O, T}
         kappa >= 0 || error("`kappa` must be nonnegative.")
         0 < budget <= 1 || error("`budget` must be in `(0, 1]`.")
         min_solves >= 1 || error("`min_solves` must be at least 1.")
+        lengthscales = collect(Float64, lengthscales)
+        (!isempty(lengthscales) && all(>(0), lengthscales)) ||
+            error("`lengthscales` must be positive and nonempty.")
+        jitter >= 0 || error("`jitter` must be nonnegative.")
+        n_seeds >= 2 || error("`n_seeds` must be at least 2.")
+        if seeds !== nothing
+            seeds = collect(Float64, seeds)
+            (!isempty(seeds) && all(f -> 0 <= f <= 1, seeds)) ||
+                error("`seeds` must be fractions in `[0, 1]`.")
+        end
         new{O, T}(optimizer, default_M, gp, Float64(kappa),
-            Float64(budget), min_solves, detect_uniform_M)
+            Float64(budget), min_solves, detect_uniform_M,
+            lengthscales, Float64(jitter), n_seeds, seeds)
     end
 end
 
@@ -429,6 +461,10 @@ mutable struct _MBM{O, T, M <: JuMP.AbstractModel} <: AbstractReformulationMetho
     budget::Float64
     min_solves::Int
     detect_uniform_M::Bool
+    lengthscales::Vector{Float64}
+    jitter::Float64
+    n_seeds::Int
+    seeds::Any
     subproblem_indicators::Vector{LogicalVariableRef{M}}
     # Cached submodels: indicator => GDPSubmodel.
     # Typed Any so extensions can store different types.
@@ -444,6 +480,10 @@ mutable struct _MBM{O, T, M <: JuMP.AbstractModel} <: AbstractReformulationMetho
             method.budget,
             method.min_solves,
             method.detect_uniform_M,
+            method.lengthscales,
+            method.jitter,
+            method.n_seeds,
+            method.seeds,
             Vector{LogicalVariableRef{M}}(),
             Dict{LogicalVariableRef{M}, Any}()
         )

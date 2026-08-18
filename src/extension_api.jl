@@ -45,9 +45,10 @@ function InfiniteLogical end
 Compute the MBM M values at the transcription supports of an infinite
 model. `gp` is the `gp` field of [`MBM`](@ref), `objectives` is the
 array of per-support objective expressions, `sub` is the transcribed
-submodel wrapped as a `GDPSubmodel`, `method` is the `_MBM` data (which
-carries the sampling settings `kappa`, `budget`, `min_solves`, and
-`detect_uniform_M`), and `support_grids` is a function returning the
+submodel wrapped as a `GDPSubmodel`, `method` is the `_MBM` data
+(which carries the sampling settings `kappa`, `budget`, `min_solves`,
+`detect_uniform_M`, `lengthscales`, `jitter`, `n_seeds`, and `seeds`),
+and `support_grids` is a function returning the
 support vectors of the infinite parameters. It is a function because
 the supports are only well defined once M is known to vary over them,
 so methods that return early (or never need coordinates) must not

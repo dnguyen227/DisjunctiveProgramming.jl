@@ -8,18 +8,37 @@ function test_gp_mbm_kwargs()
     @test method.budget == 0.25
     @test method.min_solves == 6
     @test method.detect_uniform_M
+    @test method.lengthscales == [0.05, 0.1, 0.2, 0.4, 0.8]
+    @test method.jitter == 1e-8
+    @test method.n_seeds == 4
+    @test method.seeds === nothing
     kern = with_lengthscale(SqExponentialKernel(), 0.3)
     method = MBM(HiGHS.Optimizer, gp = kern, kappa = 4.0,
-        budget = 0.1, min_solves = 3, detect_uniform_M = false)
+        budget = 0.1, min_solves = 3, detect_uniform_M = false,
+        lengthscales = (0.1, 0.3), jitter = 1e-6, n_seeds = 6,
+        seeds = [0.0, 0.3, 1.0])
     @test method.gp === kern
     @test method.kappa == 4.0
     @test method.budget == 0.1
     @test method.min_solves == 3
     @test !method.detect_uniform_M
+    @test method.lengthscales == [0.1, 0.3]
+    @test method.jitter == 1e-6
+    @test method.n_seeds == 6
+    @test method.seeds == [0.0, 0.3, 1.0]
     @test_throws ErrorException MBM(HiGHS.Optimizer, kappa = -1)
     @test_throws ErrorException MBM(HiGHS.Optimizer, budget = 0)
     @test_throws ErrorException MBM(HiGHS.Optimizer, budget = 1.5)
     @test_throws ErrorException MBM(HiGHS.Optimizer, min_solves = 0)
+    @test_throws ErrorException MBM(HiGHS.Optimizer,
+        lengthscales = Float64[])
+    @test_throws ErrorException MBM(HiGHS.Optimizer,
+        lengthscales = [-0.1])
+    @test_throws ErrorException MBM(HiGHS.Optimizer, jitter = -1)
+    @test_throws ErrorException MBM(HiGHS.Optimizer, n_seeds = 1)
+    @test_throws ErrorException MBM(HiGHS.Optimizer, seeds = [1.5])
+    @test_throws ErrorException MBM(HiGHS.Optimizer,
+        seeds = Float64[])
 end
 
 # Mirror of test_raw_M_infinite_scalar: uniform seed M values collapse
@@ -126,13 +145,15 @@ function test_gp_mbm_solve_equivalence()
     @test obj_tuned ≈ obj_exact atol = 1e-2
 end
 
-# A periodic M must not read as uniform. With f(t) = 2|cos(2*pi*t)|
-# on these supports, M = 10 - f is 8 at supports 1, 3, 5 and 10 at
-# supports 2, 4, so evenly spaced probes alias and collapse M to 8,
-# which caps x at 8 and cuts the optimum from 10 down to 9.
-function test_gp_periodic_M_not_uniform()
+# Seed placement vs a periodic M. With f(t) = 2|cos(2*pi*t)| on these
+# supports, M = 10 - f is 8 at supports 1, 3, 5 and 10 at supports
+# 2, 4. Seeds that only hit the M = 8 supports alias the periodic M
+# to uniform 8, which caps x at 8 and cuts the optimum from 10 down
+# to 9; the default and denser seed grids see both values and stay
+# exact.
+function test_gp_periodic_M_seeds()
     supports = [0.0, 0.25, 0.5, 0.75, 1.0]
-    function solve_with(gp)
+    function solve_with(; kwargs...)
         model = InfiniteGDPModel(HiGHS.Optimizer)
         set_silent(model)
         @infinite_parameter(model, t ∈ [0, 1], supports = supports)
@@ -143,11 +164,16 @@ function test_gp_periodic_M_not_uniform()
         @constraint(model, x >= 0.5, Disjunct(Y[2]))
         @disjunction(model, Y)
         @objective(model, Max, 𝔼(x, t))
-        optimize!(model, gdp_method = MBM(HiGHS.Optimizer, gp = gp))
+        optimize!(model,
+            gdp_method = MBM(HiGHS.Optimizer; kwargs...))
         return objective_value(model)
     end
-    @test solve_with(nothing) ≈ 10.0 atol = 1e-6
-    @test solve_with(SqExponentialKernel()) ≈ 10.0 atol = 1e-6
+    @test solve_with() ≈ 10.0 atol = 1e-6
+    @test solve_with(gp = SqExponentialKernel()) ≈ 10.0 atol = 1e-6
+    @test solve_with(gp = SqExponentialKernel(), n_seeds = 5) ≈
+        10.0 atol = 1e-6
+    @test solve_with(gp = SqExponentialKernel(),
+        seeds = [0.0, 0.5, 1.0]) ≈ 9.0 atol = 1e-6
 end
 
 # With detection off the uniform M is not collapsed to a scalar: the
@@ -220,7 +246,7 @@ end
     test_gp_raw_M_scalar()
     test_gp_raw_M_matches_exact()
     test_gp_mbm_solve_equivalence()
-    test_gp_periodic_M_not_uniform()
+    test_gp_periodic_M_seeds()
     test_gp_detect_uniform_M_off()
     test_gp_detect_uniform_M_off_dependent()
     test_gp_unknown_gp_error()
