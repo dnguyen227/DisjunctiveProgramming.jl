@@ -1,44 +1,38 @@
 using InfiniteOpt, HiGHS, AbstractGPs
 import DisjunctiveProgramming as DP
 
-function test_gp_mbm_kwargs()
-    method = MBM(HiGHS.Optimizer)
-    @test method.gp === nothing
-    @test method.kappa == 2.5
-    @test method.budget == 0.25
-    @test method.min_solves == 6
-    @test method.detect_uniform_M
-    @test method.lengthscales == [0.05, 0.1, 0.2, 0.4, 0.8]
-    @test method.jitter == 1e-8
-    @test method.n_seeds == 4
-    @test method.seeds === nothing
-    kern = with_lengthscale(SqExponentialKernel(), 0.3)
-    method = MBM(HiGHS.Optimizer, gp = kern, kappa = 4.0,
-        budget = 0.1, min_solves = 3, detect_uniform_M = false,
-        lengthscales = (0.1, 0.3), jitter = 1e-6, n_seeds = 6,
-        seeds = [0.0, 0.3, 1.0])
-    @test method.gp === kern
-    @test method.kappa == 4.0
-    @test method.budget == 0.1
-    @test method.min_solves == 3
-    @test !method.detect_uniform_M
-    @test method.lengthscales == [0.1, 0.3]
-    @test method.jitter == 1e-6
-    @test method.n_seeds == 6
-    @test method.seeds == [0.0, 0.3, 1.0]
-    @test_throws ErrorException MBM(HiGHS.Optimizer, kappa = -1)
-    @test_throws ErrorException MBM(HiGHS.Optimizer, budget = 0)
-    @test_throws ErrorException MBM(HiGHS.Optimizer, budget = 1.5)
-    @test_throws ErrorException MBM(HiGHS.Optimizer, min_solves = 0)
-    @test_throws ErrorException MBM(HiGHS.Optimizer,
-        lengthscales = Float64[])
-    @test_throws ErrorException MBM(HiGHS.Optimizer,
-        lengthscales = [-0.1])
-    @test_throws ErrorException MBM(HiGHS.Optimizer, jitter = -1)
-    @test_throws ErrorException MBM(HiGHS.Optimizer, n_seeds = 1)
-    @test_throws ErrorException MBM(HiGHS.Optimizer, seeds = [1.5])
-    @test_throws ErrorException MBM(HiGHS.Optimizer,
-        seeds = Float64[])
+function test_gp_sampler_kwargs()
+    @test MBM(HiGHS.Optimizer).sampler === nothing
+    sampler = GPSampler()
+    @test sampler.kernel === nothing
+    @test sampler.kappa == 2.5
+    @test sampler.budget == 0.25
+    @test sampler.detect_uniform_M
+    @test sampler.lengthscales == [0.05, 0.1, 0.2, 0.4, 0.8]
+    @test sampler.jitter == 1e-8
+    @test sampler.seeds == 4
+    kern = SqExponentialKernel()
+    sampler = GPSampler(kern, kappa = 4.0, budget = 0.1,
+        detect_uniform_M = false, lengthscales = (0.1, 0.3),
+        jitter = 1e-6, seeds = [0.0, 0.3, 1.0])
+    @test sampler.kernel === kern
+    @test sampler.kappa == 4.0
+    @test sampler.budget == 0.1
+    @test !sampler.detect_uniform_M
+    @test sampler.lengthscales == [0.1, 0.3]
+    @test sampler.jitter == 1e-6
+    @test sampler.seeds == [0.0, 0.3, 1.0]
+    @test GPSampler(seeds = 6).seeds == 6
+    @test MBM(HiGHS.Optimizer, sampler = sampler).sampler === sampler
+    @test_throws ErrorException GPSampler(kappa = -1)
+    @test_throws ErrorException GPSampler(budget = 0)
+    @test_throws ErrorException GPSampler(budget = 1.5)
+    @test_throws ErrorException GPSampler(lengthscales = Float64[])
+    @test_throws ErrorException GPSampler(lengthscales = [-0.1])
+    @test_throws ErrorException GPSampler(jitter = -1)
+    @test_throws ErrorException GPSampler(seeds = 1)
+    @test_throws ErrorException GPSampler(seeds = [1.5])
+    @test_throws ErrorException GPSampler(seeds = Float64[])
 end
 
 # Mirror of test_raw_M_infinite_scalar: uniform seed M values collapse
@@ -52,7 +46,7 @@ function test_gp_raw_M_scalar()
     @constraint(model, con2, x <= 3, Disjunct(Y[2]))
     @disjunction(model, Y)
     mbm = DP._MBM(
-        MBM(HiGHS.Optimizer, gp = SqExponentialKernel()), model)
+        MBM(HiGHS.Optimizer, sampler = GPSampler()), model)
     sub = DP.copy_model_with_constraints(
         model, DP.DisjunctConstraintRef[con2], mbm)
     obj = DP.prepare_max_M_objective(
@@ -60,11 +54,10 @@ function test_gp_raw_M_scalar()
     @test DP.raw_M(sub, obj, mbm) == 5.0
 end
 
-# With few supports the budget floor covers every support, so the GP
-# sampler solves all of them exactly and must reproduce the exact
-# grid parameter function
+# With budget = 1.0 every support is solved exactly, so the GP
+# sampler must reproduce the exact grid parameter function
 function test_gp_raw_M_matches_exact()
-    function pfunc_values(gp, supports)
+    function pfunc_values(sampler, supports)
         model = InfiniteGDPModel()
         @infinite_parameter(model, t ∈ [0, 1], supports = supports)
         @variable(model, 0 <= x <= 10, Infinite(t))
@@ -73,7 +66,8 @@ function test_gp_raw_M_matches_exact()
         @constraint(model, con, x <= f, Disjunct(Y[1]))
         @constraint(model, con2, x >= 0.5, Disjunct(Y[2]))
         @disjunction(model, Y)
-        mbm = DP._MBM(MBM(HiGHS.Optimizer, gp = gp), model)
+        mbm = DP._MBM(
+            MBM(HiGHS.Optimizer, sampler = sampler), model)
         sub = DP.copy_model_with_constraints(
             model, DP.DisjunctConstraintRef[con2], mbm)
         obj = DP.prepare_max_M_objective(
@@ -84,11 +78,15 @@ function test_gp_raw_M_matches_exact()
     end
     supports = [0.0, 0.25, 0.5, 0.75, 1.0]
     exact_vals = pfunc_values(nothing, supports)
-    # a kernel gets its lengthscale fit; a GP is used as given. Both
-    # solve the same supports here, so the M values match exactly
-    @test pfunc_values(SqExponentialKernel(), supports) == exact_vals
-    gp = GP(with_lengthscale(SqExponentialKernel(), 0.2))
-    @test pfunc_values(gp, supports) == exact_vals
+    # default kernel, user kernel, and pinned lengthscale all solve
+    # the same supports here, so the M values match exactly
+    @test pfunc_values(GPSampler(budget = 1.0), supports) ==
+        exact_vals
+    @test pfunc_values(
+        GPSampler(SqExponentialKernel(), budget = 1.0), supports) ==
+        exact_vals
+    @test pfunc_values(GPSampler(SqExponentialKernel(),
+        lengthscales = [0.2], budget = 1.0), supports) == exact_vals
 end
 
 # an empty disjunct region makes the M subproblems infeasible; both
@@ -108,16 +106,16 @@ function test_gp_infeasible_disjunct()
         @objective(model, Max, 𝔼(x, t))
         return model
     end
-    for gp in (nothing, SqExponentialKernel())
+    for sampler in (nothing, GPSampler())
         model = build()
         @test_throws ErrorException optimize!(model,
-            gdp_method = MBM(HiGHS.Optimizer, gp = gp))
+            gdp_method = MBM(HiGHS.Optimizer, sampler = sampler))
     end
 end
 
 # optimum (10) needs M(t) >= 10 - 2t pointwise; the GP fill is heuristic
 function test_gp_mbm_solve_equivalence()
-    function solve_with(method)
+    function solve_with(sampler)
         model = InfiniteGDPModel(HiGHS.Optimizer)
         set_silent(model)
         @infinite_parameter(model, t ∈ [0, 1], num_supports = 20)
@@ -128,15 +126,14 @@ function test_gp_mbm_solve_equivalence()
         @constraint(model, x >= 0.5, Disjunct(Y[2]))
         @disjunction(model, Y)
         @objective(model, Max, 𝔼(x, t))
-        optimize!(model, gdp_method = method)
+        optimize!(model,
+            gdp_method = MBM(HiGHS.Optimizer, sampler = sampler))
         @test termination_status(model) == MOI.OPTIMAL
         return objective_value(model)
     end
-    obj_exact = solve_with(MBM(HiGHS.Optimizer))
-    obj_gp = solve_with(
-        MBM(HiGHS.Optimizer, gp = SqExponentialKernel()))
-    obj_tuned = solve_with(MBM(HiGHS.Optimizer,
-        gp = SqExponentialKernel(), kappa = 4.0, budget = 0.2))
+    obj_exact = solve_with(nothing)
+    obj_gp = solve_with(GPSampler())
+    obj_tuned = solve_with(GPSampler(kappa = 4.0, budget = 0.2))
     @test obj_exact ≈ 10.0 atol = 1e-4
     # over-M can't raise the optimum, under-M can only shave it a bit
     @test obj_gp <= obj_exact + 1e-6
@@ -153,7 +150,7 @@ end
 # exact.
 function test_gp_periodic_M_seeds()
     supports = [0.0, 0.25, 0.5, 0.75, 1.0]
-    function solve_with(; kwargs...)
+    function solve_with(sampler)
         model = InfiniteGDPModel(HiGHS.Optimizer)
         set_silent(model)
         @infinite_parameter(model, t ∈ [0, 1], supports = supports)
@@ -165,15 +162,14 @@ function test_gp_periodic_M_seeds()
         @disjunction(model, Y)
         @objective(model, Max, 𝔼(x, t))
         optimize!(model,
-            gdp_method = MBM(HiGHS.Optimizer; kwargs...))
+            gdp_method = MBM(HiGHS.Optimizer, sampler = sampler))
         return objective_value(model)
     end
-    @test solve_with() ≈ 10.0 atol = 1e-6
-    @test solve_with(gp = SqExponentialKernel()) ≈ 10.0 atol = 1e-6
-    @test solve_with(gp = SqExponentialKernel(), n_seeds = 5) ≈
-        10.0 atol = 1e-6
-    @test solve_with(gp = SqExponentialKernel(),
-        seeds = [0.0, 0.5, 1.0]) ≈ 9.0 atol = 1e-6
+    @test solve_with(nothing) ≈ 10.0 atol = 1e-6
+    @test solve_with(GPSampler()) ≈ 10.0 atol = 1e-6
+    @test solve_with(GPSampler(seeds = 5)) ≈ 10.0 atol = 1e-6
+    @test solve_with(GPSampler(seeds = [0.0, 0.5, 1.0])) ≈
+        9.0 atol = 1e-6
 end
 
 # With detection off the uniform M is not collapsed to a scalar: the
@@ -189,8 +185,7 @@ function test_gp_detect_uniform_M_off()
         @constraint(model, con2, x <= 3, Disjunct(Y[2]))
         @disjunction(model, Y)
         mbm = DP._MBM(MBM(HiGHS.Optimizer,
-            gp = SqExponentialKernel(),
-            detect_uniform_M = detect), model)
+            sampler = GPSampler(detect_uniform_M = detect)), model)
         sub = DP.copy_model_with_constraints(
             model, DP.DisjunctConstraintRef[con2], mbm)
         obj = DP.prepare_max_M_objective(
@@ -217,8 +212,7 @@ function test_gp_detect_uniform_M_off_dependent()
     @constraint(model, con2, x <= 3, Disjunct(Y[2]))
     @disjunction(model, Y)
     mbm = DP._MBM(MBM(HiGHS.Optimizer,
-        gp = SqExponentialKernel(),
-        detect_uniform_M = false), model)
+        sampler = GPSampler(detect_uniform_M = false)), model)
     sub = DP.copy_model_with_constraints(
         model, DP.DisjunctConstraintRef[con2], mbm)
     obj = DP.prepare_max_M_objective(
@@ -226,7 +220,7 @@ function test_gp_detect_uniform_M_off_dependent()
     @test_throws ErrorException DP.raw_M(sub, obj, mbm)
 end
 
-function test_gp_unknown_gp_error()
+function test_gp_unknown_sampler_error()
     model = InfiniteGDPModel(HiGHS.Optimizer)
     set_silent(model)
     @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
@@ -238,17 +232,17 @@ function test_gp_unknown_gp_error()
     @disjunction(model, Y)
     @objective(model, Max, 𝔼(x, t))
     @test_throws ErrorException optimize!(model,
-        gdp_method = MBM(HiGHS.Optimizer, gp = :grid))
+        gdp_method = MBM(HiGHS.Optimizer, sampler = :grid))
 end
 
 @testset "AbstractGPsDisjunctiveProgramming" begin
-    test_gp_mbm_kwargs()
+    test_gp_sampler_kwargs()
     test_gp_raw_M_scalar()
     test_gp_raw_M_matches_exact()
     test_gp_mbm_solve_equivalence()
     test_gp_periodic_M_seeds()
     test_gp_detect_uniform_M_off()
     test_gp_detect_uniform_M_off_dependent()
-    test_gp_unknown_gp_error()
+    test_gp_unknown_sampler_error()
     test_gp_infeasible_disjunct()
 end

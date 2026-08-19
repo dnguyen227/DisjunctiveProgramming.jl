@@ -333,7 +333,7 @@ end
 
 # Solve the M subproblem exactly at every support
 function DP.sample_M_values(
-    gp::Nothing,
+    sampler::Nothing,
     objectives::AbstractArray,
     sub::DP.GDPSubmodel,
     method::DP._MBM,
@@ -349,7 +349,7 @@ function DP.sample_M_values(
 end
 
 # Transcribe mini_expr, compute the per-support M values with the
-# method's gp, and aggregate to a scalar if uniform, else to a
+# method's sampler, and aggregate to a scalar if uniform, else to a
 # parameter function on main.
 function DP.raw_M(
     sub::DP.GDPSubmodel{<:InfiniteOpt.InfiniteModel},
@@ -366,8 +366,8 @@ function DP.raw_M(
     transcribed = InfiniteOpt.transformation_model(sub.model)
     inner_sub = DP.GDPSubmodel(transcribed, JuMP.VariableRef[],
         Dict{JuMP.VariableRef, Vector{JuMP.VariableRef}}())
-    M_vals = DP.sample_M_values(method.gp, objectives, inner_sub,
-        method, () -> _support_grids(sub, mini_expr)[2])
+    M_vals = DP.sample_M_values(method.sampler, objectives,
+        inner_sub, method, () -> _support_grids(sub, mini_expr)[2])
     M_vals === nothing && return nothing
     M_vals isa Number && return M_vals
     all(==(first(M_vals)), M_vals) && return first(M_vals)

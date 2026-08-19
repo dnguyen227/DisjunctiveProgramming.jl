@@ -375,80 +375,113 @@ A type for using the multiple big-M reformulation approach for disjunctive const
 **Fields**
 - `optimizer::O`: Optimizer to use when solving mini-models (required).
 - `default_M::T`: Default big-M value to use if no big-M is specified for a logical variable (1e9).
-- `gp::Any`: Gaussian process (or kernel) used to estimate the M values
-  across the supports of an infinite model (`nothing`). `nothing` solves
-  an M subproblem at every support; an `AbstractGPs.AbstractGP` or a
-  `KernelFunctions.Kernel` solves a subset of the supports and fills the
-  rest with a conservative GP estimate (see [`sample_M_values`](@ref)).
-  Ignored for finite models, as are the remaining fields.
-- `kappa::Float64`: Upper-confidence-bound multiplier used to select the
-  next support to solve and to fill unsolved supports (2.5).
-- `budget::Float64`: Fraction of the supports to solve exactly, in
-  `(0, 1]` (0.25).
-- `min_solves::Int`: Minimum number of exactly solved supports (6).
-- `detect_uniform_M::Bool`: If `true` (the default), M values that agree
-  at the seed supports are taken to be uniform and used for every
-  support. Set it to `false` to always fit the GP, which leaves the
-  usual `kappa * sd` cushion on the unsolved supports at the cost of
-  the extra solves, and which requires that every infinite parameter
-  have a support grid.
-- `lengthscales::Vector{Float64}`: Candidate lengthscales for the
-  marginal-likelihood kernel fit when `gp` is a kernel, relative to
-  support coordinates normalized to `[0, 1]`; ignored when `gp` is a
-  full Gaussian process ([0.05, 0.1, 0.2, 0.4, 0.8]).
-- `jitter::Float64`: Observation-noise nugget added to the GP prior
-  when fitting (1e-8).
-- `n_seeds::Int`: Number of supports solved before the first GP fit,
-  taken as an evenly spaced grid over the supports (4).
-- `seeds::Any`: Optional vector of fractions in `[0, 1]` giving the
-  positions along the support grid to solve before the first GP fit,
-  overriding the evenly spaced grid (`nothing`). With
-  `detect_uniform_M`, evenly spaced seeds can read a periodic M as
-  uniform; pass unevenly spaced seeds to guard against that.
+- `sampler::Any`: M-value sampler for infinite models (`nothing`).
+  `nothing` solves an M subproblem at every support; a
+  [`GPSampler`](@ref) solves a subset of the supports and fills the
+  rest with a conservative Gaussian-process estimate (see
+  [`sample_M_values`](@ref)). Ignored for finite models.
 """
 mutable struct MBM{O, T} <: AbstractReformulationMethod
     optimizer::O
     default_M::T
-    gp::Any
-    kappa::Float64
-    budget::Float64
-    min_solves::Int
-    detect_uniform_M::Bool
-    lengthscales::Vector{Float64}
-    jitter::Float64
-    n_seeds::Int
-    seeds::Any
+    sampler::Any
 
     # Constructor with optimizer (required) and optional default_M
     function MBM(
-        optimizer::O,
-        default_M::T = 1e9;
-        gp = nothing,
+        optimizer::O, default_M::T = 1e9; sampler = nothing
+        ) where {O, T}
+        new{O, T}(optimizer, default_M, sampler)
+    end
+end
+
+"""
+    GPSampler(
+        kernel = nothing;
         kappa::Real = 2.5,
         budget::Real = 0.25,
-        min_solves::Int = 6,
         detect_uniform_M::Bool = true,
         lengthscales = [0.05, 0.1, 0.2, 0.4, 0.8],
         jitter::Real = 1e-8,
-        n_seeds::Int = 4,
-        seeds = nothing
-        ) where {O, T}
+        seeds = 4
+        )
+
+A Gaussian-process M sampler for the `sampler` field of [`MBM`](@ref)
+on infinite models. Instead of solving an M subproblem at every
+support, it solves the seed supports, then the supports selected by
+an upper-confidence-bound acquisition until the budget is spent, and
+fills the remaining supports with the posterior upper confidence
+bound `mean + kappa * sd`. The filled values are heuristic upper
+estimates of the exact M values, not certificates. Using it requires
+that AbstractGPs be loaded.
+
+**Arguments**
+- `kernel`: Covariance kernel for the GP fit; `nothing` (the
+  default) uses a squared exponential kernel. The lengthscale is
+  selected from `lengthscales` by marginal likelihood.
+- `kappa::Real`: Upper-confidence-bound multiplier used to select the
+  next support to solve and to fill unsolved supports (2.5).
+- `budget::Real`: Fraction of the supports to solve exactly, in
+  `(0, 1]` (0.25). The seed supports are always solved;
+  `budget = 1.0` solves every support.
+- `detect_uniform_M::Bool`: If `true` (the default), M values that
+  agree at the seed supports are taken to be uniform and used for
+  every support. Set it to `false` to always fit the GP, which
+  leaves the usual `kappa * sd` cushion on the unsolved supports at
+  the cost of the extra solves, and which requires that every
+  infinite parameter have a support grid.
+- `lengthscales`: Candidate lengthscales for the marginal-likelihood
+  kernel fit, relative to support coordinates normalized to
+  `[0, 1]` ([0.05, 0.1, 0.2, 0.4, 0.8]). Give a single candidate to
+  pin the lengthscale.
+- `jitter::Real`: Observation-noise nugget added to the GP prior
+  when fitting (1e-8).
+- `seeds`: Number of evenly spaced supports solved before the first
+  GP fit (4), or a vector of fractions in `[0, 1]` giving their
+  positions along the support grid. With `detect_uniform_M`, evenly
+  spaced seeds can read a periodic M as uniform; pass unevenly
+  spaced fractions to guard against that.
+
+**Example**
+```julia
+julia> using DisjunctiveProgramming, InfiniteOpt, AbstractGPs, HiGHS
+
+julia> method = MBM(HiGHS.Optimizer, sampler = GPSampler(kappa = 4.0))
+```
+"""
+struct GPSampler
+    # Typed Any so base needs no AbstractGPs dependency
+    kernel::Any
+    kappa::Float64
+    budget::Float64
+    detect_uniform_M::Bool
+    lengthscales::Vector{Float64}
+    jitter::Float64
+    seeds::Union{Int, Vector{Float64}}
+
+    function GPSampler(
+        kernel = nothing;
+        kappa::Real = 2.5,
+        budget::Real = 0.25,
+        detect_uniform_M::Bool = true,
+        lengthscales = [0.05, 0.1, 0.2, 0.4, 0.8],
+        jitter::Real = 1e-8,
+        seeds = 4
+        )
         kappa >= 0 || error("`kappa` must be nonnegative.")
         0 < budget <= 1 || error("`budget` must be in `(0, 1]`.")
-        min_solves >= 1 || error("`min_solves` must be at least 1.")
         lengthscales = collect(Float64, lengthscales)
         (!isempty(lengthscales) && all(>(0), lengthscales)) ||
             error("`lengthscales` must be positive and nonempty.")
         jitter >= 0 || error("`jitter` must be nonnegative.")
-        n_seeds >= 2 || error("`n_seeds` must be at least 2.")
-        if seeds !== nothing
+        if seeds isa Int
+            seeds >= 2 || error("`seeds` must be at least 2.")
+        else
             seeds = collect(Float64, seeds)
             (!isempty(seeds) && all(f -> 0 <= f <= 1, seeds)) ||
                 error("`seeds` must be fractions in `[0, 1]`.")
         end
-        new{O, T}(optimizer, default_M, gp, Float64(kappa),
-            Float64(budget), min_solves, detect_uniform_M,
-            lengthscales, Float64(jitter), n_seeds, seeds)
+        new(kernel, Float64(kappa), Float64(budget),
+            detect_uniform_M, lengthscales, Float64(jitter), seeds)
     end
 end
 
@@ -456,15 +489,7 @@ mutable struct _MBM{O, T, M <: JuMP.AbstractModel} <: AbstractReformulationMetho
     optimizer::O
     M::Dict{LogicalVariableRef{M}, Any}
     default_M::T
-    gp::Any
-    kappa::Float64
-    budget::Float64
-    min_solves::Int
-    detect_uniform_M::Bool
-    lengthscales::Vector{Float64}
-    jitter::Float64
-    n_seeds::Int
-    seeds::Any
+    sampler::Any
     subproblem_indicators::Vector{LogicalVariableRef{M}}
     # Cached submodels: indicator => GDPSubmodel.
     # Typed Any so extensions can store different types.
@@ -475,15 +500,7 @@ mutable struct _MBM{O, T, M <: JuMP.AbstractModel} <: AbstractReformulationMetho
             method.optimizer,
             Dict{LogicalVariableRef{M}, Any}(),
             method.default_M,
-            method.gp,
-            method.kappa,
-            method.budget,
-            method.min_solves,
-            method.detect_uniform_M,
-            method.lengthscales,
-            method.jitter,
-            method.n_seeds,
-            method.seeds,
+            method.sampler,
             Vector{LogicalVariableRef{M}}(),
             Dict{LogicalVariableRef{M}, Any}()
         )
