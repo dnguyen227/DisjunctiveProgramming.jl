@@ -8,41 +8,56 @@ import DisjunctiveProgramming as DP
 #                                 GP FITTING
 ################################################################################
 # Normalized to [0, 1]^d so one lengthscale works across dimensions
-function _support_coords(grids)
-    idxs = CartesianIndices(length.(grids))
-    los = [minimum(g) for g in grids]
-    rng = [max(maximum(g) - minimum(g), eps()) for g in grids]
-    return [[(grids[d][I[d]] - los[d]) / rng[d] for d in 1:length(grids)]
-            for I in vec(idxs)]
+function _support_coords(
+    grids::Tuple{Vararg{Vector{Float64}}}
+    )::Vector{Vector{Float64}}
+    indices = CartesianIndices(length.(grids))
+    mins = [minimum(g) for g in grids]
+    ranges = [max(maximum(g) - minimum(g), eps()) for g in grids]
+    return [[(grids[d][I[d]] - mins[d]) / ranges[d]
+             for d in 1:length(grids)] for I in vec(indices)]
 end
 
 # Lengthscale selected by marginal likelihood over the candidates
-function _fit_posterior(kernel, X, y, sampler)
-    best_post, best_lp = nothing, -Inf
-    for ls in sampler.lengthscales
-        kern = KernelFunctions.with_lengthscale(kernel, ls)
-        fx = AbstractGPs.GP(kern)(X, sampler.jitter)
-        lp = AbstractGPs.logpdf(fx, y)
-        if lp > best_lp
-            best_post, best_lp = AbstractGPs.posterior(fx, y), lp
+function _fit_posterior(
+    kernel::KernelFunctions.Kernel,
+    X::Vector{Vector{Float64}},
+    y::Vector{Float64},
+    sampler::DP.GPSampler
+    )
+    best_posterior, best_log_prob = nothing, -Inf
+    for lengthscale in sampler.lengthscales
+        scaled_kernel = KernelFunctions.with_lengthscale(
+            kernel, lengthscale)
+        finite_gp = AbstractGPs.GP(scaled_kernel)(X, sampler.jitter)
+        log_prob = AbstractGPs.logpdf(finite_gp, y)
+        if log_prob > best_log_prob
+            best_posterior = AbstractGPs.posterior(finite_gp, y)
+            best_log_prob = log_prob
         end
     end
-    return best_post
+    return best_posterior
 end
 
-function _mean_sd(sampler, X, solved)
-    lis = collect(keys(solved))
-    y = [solved[li] for li in lis]
-    ybar = sum(y) / length(y)
+function _mean_sd(
+    sampler::DP.GPSampler,
+    X::Vector{Vector{Float64}},
+    solved::Dict{Int, Float64}
+    )
+    solved_indices = collect(keys(solved))
+    y = [solved[i] for i in solved_indices]
+    y_mean = sum(y) / length(y)
     # floored so near-equal solved values still cushion the filled ones
-    ystd = max(sqrt(sum(abs2, y .- ybar) / max(length(y) - 1, 1)),
-        1e-2 * abs(ybar), 1e-8)
+    y_scale = max(sqrt(sum(abs2, y .- y_mean) / max(length(y) - 1, 1)),
+        1e-2 * abs(y_mean), 1e-8)
     kernel = something(sampler.kernel,
         KernelFunctions.SqExponentialKernel())
-    post = _fit_posterior(kernel, X[lis], (y .- ybar) ./ ystd, sampler)
-    mz = AbstractGPs.mean(post, X)
-    vz = max.(AbstractGPs.var(post, X), 0.0)
-    return mz .* ystd .+ ybar, sqrt.(vz) .* ystd
+    posterior = _fit_posterior(
+        kernel, X[solved_indices], (y .- y_mean) ./ y_scale, sampler)
+    posterior_mean = AbstractGPs.mean(posterior, X)
+    posterior_var = max.(AbstractGPs.var(posterior, X), 0.0)
+    return posterior_mean .* y_scale .+ y_mean,
+        sqrt.(posterior_var) .* y_scale
 end
 
 ################################################################################
@@ -54,22 +69,22 @@ function DP.sample_M_values(
     objectives::AbstractArray,
     sub::DP.GDPSubmodel,
     method::DP._MBM,
-    support_grids
+    support_grids::Function
     )
-    idxs = collect(CartesianIndices(objectives))
-    n = length(idxs)
+    indices = collect(CartesianIndices(objectives))
+    n = length(indices)
     solved = Dict{Int, Float64}()
-    solve_at(li) = begin
-        m = DP.raw_M(sub, objectives[idxs[li]], method)
-        m === nothing && return false
-        solved[li] = m
+    solve_at(index::Int) = begin
+        M_val = DP.raw_M(sub, objectives[indices[index]], method)
+        M_val === nothing && return false
+        solved[index] = M_val
         return true
     end
     # an evenly spaced seed count, or user-given seed fractions
-    fracs = sampler.seeds isa Int ?
+    fractions = sampler.seeds isa Int ?
         range(0, 1, length = sampler.seeds) : sampler.seeds
-    for s in unique(1 .+ round.(Int, fracs .* (n - 1)))
-        solve_at(s) || return nothing
+    for index in unique(1 .+ round.(Int, fractions .* (n - 1)))
+        solve_at(index) || return nothing
     end
     if sampler.detect_uniform_M
         # a uniform M needs no fit, and so no support grid either
@@ -79,24 +94,24 @@ function DP.sample_M_values(
     budget = min(ceil(Int, sampler.budget * n), n)
     X = _support_coords(support_grids())
     while length(solved) < budget
-        ms, ss = _mean_sd(sampler, X, solved)
-        acq = ms .+ sampler.kappa .* ss
-        for li in keys(solved)
-            acq[li] = -Inf
+        means, sds = _mean_sd(sampler, X, solved)
+        acquisition = means .+ sampler.kappa .* sds
+        for index in keys(solved)
+            acquisition[index] = -Inf
         end
-        solve_at(argmax(acq)) || return nothing
+        solve_at(argmax(acquisition)) || return nothing
     end
     M_vals = Array{Float64}(undef, size(objectives))
     if length(solved) == n # nothing left to estimate
-        for (li, I) in enumerate(idxs)
-            M_vals[I] = solved[li]
+        for (index, I) in enumerate(indices)
+            M_vals[I] = solved[index]
         end
         return M_vals
     end
-    ms, ss = _mean_sd(sampler, X, solved)
-    for (li, I) in enumerate(idxs) # exact M values are nonnegative
-        M_vals[I] = get(solved, li,
-            max(ms[li] + sampler.kappa * ss[li], 0.0))
+    means, sds = _mean_sd(sampler, X, solved)
+    for (index, I) in enumerate(indices) # exact M values are nonnegative
+        M_vals[I] = get(solved, index,
+            max(means[index] + sampler.kappa * sds[index], 0.0))
     end
     return M_vals
 end

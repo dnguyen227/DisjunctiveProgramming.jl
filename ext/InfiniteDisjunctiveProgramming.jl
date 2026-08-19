@@ -41,20 +41,22 @@ end
 # Bound info for parameter refs in disjunct constraints: parameter
 # functions report their support extrema, finite parameters a point,
 # other parameters (-Inf, Inf). Returns nothing for variables.
-function _parameter_bound_info(vref::InfiniteOpt.GeneralVariableRef)
+function _parameter_bound_info(
+    vref::InfiniteOpt.GeneralVariableRef
+    )::Union{Nothing, Tuple{Float64, Float64}}
     _is_parameter(vref) || return nothing
     dvref = InfiniteOpt.dispatch_variable_ref(vref)
     if dvref isa InfiniteOpt.ParameterFunctionRef
         prefs = InfiniteOpt.parameter_list(dvref)
         length(prefs) == 1 || return (-Inf, Inf)
-        supps = InfiniteOpt.supports(first(prefs))
-        isempty(supps) && return (-Inf, Inf)
-        f = InfiniteOpt.raw_function(dvref)
-        vals = [f(s) for s in supps]
-        return (minimum(vals), maximum(vals))
+        supports = InfiniteOpt.supports(first(prefs))
+        isempty(supports) && return (-Inf, Inf)
+        func = InfiniteOpt.raw_function(dvref)
+        func_values = [func(s) for s in supports]
+        return (minimum(func_values), maximum(func_values))
     elseif dvref isa InfiniteOpt.FiniteParameterRef
-        v = InfiniteOpt.parameter_value(dvref)
-        return (v, v)
+        value = InfiniteOpt.parameter_value(dvref)
+        return (value, value)
     end
     return (-Inf, Inf)
 end
@@ -69,7 +71,11 @@ function DP.set_variable_bound_info(
 end
 
 # Hull and PSplit require finite bounds that include 0
-function _clamped_bound_info(vref, info, method_name)
+function _zero_inclusive_bounds(
+    vref::InfiniteOpt.GeneralVariableRef,
+    info::Union{Nothing, Tuple{Float64, Float64}},
+    method_name::String
+    )::Tuple{Float64, Float64}
     info === nothing || return (min(0, info[1]), max(0, info[2]))
     if !JuMP.has_lower_bound(vref) || !JuMP.has_upper_bound(vref)
         error("Variable $vref must have both lower and upper " *
@@ -82,14 +88,14 @@ end
 
 function DP.set_variable_bound_info(
     vref::InfiniteOpt.GeneralVariableRef, ::DP.Hull)
-    return _clamped_bound_info(vref,
+    return _zero_inclusive_bounds(vref,
         _parameter_bound_info(vref), "Hull")
 end
 
 function DP.set_variable_bound_info(
     vref::InfiniteOpt.GeneralVariableRef,
     ::Union{DP.PSplit, DP._PSplit})
-    return _clamped_bound_info(vref,
+    return _zero_inclusive_bounds(vref,
         _parameter_bound_info(vref), "PSplit")
 end
 
@@ -321,7 +327,8 @@ end
 # The infinite parameters of `mini_expr` and their supports, in the
 # ascending order of `parameter_refs`. Only defined when M varies over
 # the supports, so it is deferred until sample_M_values needs it.
-function _support_grids(sub::DP.GDPSubmodel, mini_expr)
+function _support_grids(
+    sub::DP.GDPSubmodel, mini_expr::JuMP.AbstractJuMPScalar)
     reverse_map = Dict(ws[1] => v for (v, ws) in sub.fwd_map)
     prefs = Tuple(get(reverse_map, p) do
             error("MBM cannot build a support grid over `$p`, which " *
@@ -337,7 +344,7 @@ function DP.sample_M_values(
     objectives::AbstractArray,
     sub::DP.GDPSubmodel,
     method::DP._MBM,
-    support_grids
+    support_grids::Function
     )
     M_vals = Array{Float64}(undef, size(objectives))
     for I in eachindex(objectives)
