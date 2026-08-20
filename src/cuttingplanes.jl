@@ -30,7 +30,9 @@ function extract_solution(sub::GDPSubmodel)
 end
 
 # Set quadratic separation objective: min Σ (x_k - rBM_k)².
-function _set_separation_objective(
+# Extensions override for models needing a different separation
+# geometry (e.g. quadrature-weighted distances).
+function set_separation_objective(
     sub::GDPSubmodel,
     rBM_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}}
     )
@@ -57,7 +59,7 @@ function _solve_separation(
     separation::GDPSubmodel,
     rBM_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}}
     )
-    _set_separation_objective(separation, rBM_sol)
+    set_separation_objective(separation, rBM_sol)
     JuMP.optimize!(separation.model, ignore_optimize_hook = true)
     separation_obj = JuMP.objective_value(separation.model)
     separation_sol = extract_solution(separation)

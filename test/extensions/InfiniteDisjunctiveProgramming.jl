@@ -486,6 +486,8 @@ function test_add_cut_infinite()
         count_variable_in_set_constraints = false)
     rBM_sol = Dict(x => [1.0, 2.0, 3.0])
     sep_sol = Dict(x => [0.5, 1.5, 2.5])
+    # add_cut reads the quadrature weights probed at submodel build
+    model.ext[:cp_quadrature_weights] = Dict(x => ones(3))
     DP.add_cut(model, [x], rBM_sol, sep_sol)
     n_after = JuMP.num_constraints(transcribed;
         count_variable_in_set_constraints = false)
@@ -791,6 +793,135 @@ function test_CuttingPlanes_multiparameter()
         [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
 end
 
+# Probed quadrature weights: trapezoid coefficients from the
+# objective's default UniTrapezoid integrals on uniform and
+# nonuniform grids, unit weight for finite variables, and the
+# model left untouched by the probe.
+function test_probe_weights_trapezoid()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @infinite_parameter(model, s ∈ [0, 1],
+        supports = [0.0, 0.1, 0.4, 1.0])
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, 0 <= y <= 10, Infinite(s))
+    @variable(model, 0 <= w <= 10)
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, ∫(x, t) + ∫(y, s) + w)
+
+    method = CuttingPlanes(HiGHS.Optimizer)
+    dvars = DP.collect_cutting_planes_vars(model)
+    DP.copy_and_reformulate(model, dvars, Hull(), method)
+    weights = model.ext[:cp_quadrature_weights]
+
+    # UniTrapezoid, uniform grid h = 0.25: [h/2, h, h, h, h/2]
+    @test weights[x] ≈ [0.125, 0.25, 0.25, 0.25, 0.125]
+    # UniTrapezoid, nonuniform grid [0, 0.1, 0.4, 1.0]
+    @test weights[y] ≈ [0.05, 0.2, 0.45, 0.3]
+    # finite variable: unit weight
+    @test weights[w] == [1.0]
+    # the probe runs on a copy: the model's objective is untouched
+    @test JuMP.objective_sense(model) == MOI.MIN_SENSE
+    @test length(JuMP.objective_function(model).terms) == 3
+end
+
+# The probe matches the objective's evaluation scheme, not a
+# hardcoded rule: a GaussLegendre integral yields Gauss weights on
+# its generated nodes and zero weight on the remaining supports.
+function test_probe_weights_gauss()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, ∫(x, t, eval_method = GaussLegendre()))
+
+    method = CuttingPlanes(HiGHS.Optimizer)
+    dvars = DP.collect_cutting_planes_vars(model)
+    DP.copy_and_reformulate(model, dvars, Hull(), method)
+    w = model.ext[:cp_quadrature_weights][x]
+
+    @test sum(w) ≈ 1.0
+    @test any(iszero, w)  # the uniform supports carry no weight
+    @test length(w) > 5   # Gauss nodes were added to the grid
+end
+
+# Multi-parameter weights: the probed tensor weights align with
+# vec(transformation_variable) via the flattened support tuples.
+function test_probe_weights_multiparameter()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @infinite_parameter(model, s ∈ [0, 2], num_supports = 4)
+    @variable(model, 0 <= x <= 10, Infinite(t, s))
+    @variable(model, Y[1:2], InfiniteLogical(t, s))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, ∫(∫(x, t), s))
+
+    method = CuttingPlanes(HiGHS.Optimizer)
+    dvars = DP.collect_cutting_planes_vars(model)
+    DP.copy_and_reformulate(model, dvars, Hull(), method)
+    w = model.ext[:cp_quadrature_weights][x]
+
+    @test length(w) == 20
+    # total weight = measure of the domain [0,1] x [0,2]
+    @test sum(w) ≈ 2.0
+
+    # per-support alignment: w[k] = omega_t(t_k) * omega_s(s_k)
+    # for the support tuple (t_k, s_k) at the same flattened index
+    InfiniteOpt.build_transformation_backend!(model)
+    wt = Dict(zip(InfiniteOpt.supports(t),
+        [0.125, 0.25, 0.25, 0.25, 0.125]))
+    ws = Dict(zip(InfiniteOpt.supports(s), [1/3, 2/3, 2/3, 1/3]))
+    supps = vec(InfiniteOpt.supports(x))
+    for k in eachindex(supps)
+        @test w[k] ≈ wt[supps[k][1]] * ws[supps[k][2]]
+    end
+end
+
+# The cut coefficients carry the probed quadrature weights:
+# ξ_k = 2 ω_k (sep_k - rBM_k) on each transcribed variable.
+function test_add_cut_weighted_coefficients()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 3)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, ∫(x, t))
+
+    # populate the weight stash the way the CP loop does
+    method = CuttingPlanes(HiGHS.Optimizer)
+    dvars = DP.collect_cutting_planes_vars(model)
+    DP.copy_and_reformulate(model, dvars, Hull(), method)
+
+    DP.reformulate_model(model, BigM(10.0))
+    InfiniteOpt.build_transformation_backend!(model)
+    transcribed = InfiniteOpt.transformation_model(model)
+    rBM_sol = Dict(x => [1.0, 2.0, 3.0])
+    sep_sol = Dict(x => [0.5, 1.5, 2.5])
+    DP.add_cut(model, [x], rBM_sol, sep_sol)
+
+    # UniTrapezoid on 3 uniform supports: [0.25, 0.5, 0.25]
+    cut = JuMP.constraint_object(last(JuMP.all_constraints(
+        transcribed, JuMP.AffExpr, MOI.GreaterThan{Float64})))
+    xs = vec(InfiniteOpt.transformation_variable(x))
+    expected = 2 .* [0.25, 0.5, 0.25] .* (-0.5)
+    for k in eachindex(xs)
+        @test JuMP.coefficient(cut.func, xs[k]) ≈ expected[k]
+    end
+end
+
 @testset "InfiniteDisjunctiveProgramming" begin
 
     @testset "Model" begin
@@ -849,6 +980,10 @@ end
     @testset "Cutting Planes" begin
         test_extract_solution_infinite()
         test_add_cut_infinite()
+        test_probe_weights_trapezoid()
+        test_probe_weights_gauss()
+        test_probe_weights_multiparameter()
+        test_add_cut_weighted_coefficients()
         test_CuttingPlanes_infinite_simple()
         test_CuttingPlanes_infinite_two_disj()
         test_CuttingPlanes_with_cuts()

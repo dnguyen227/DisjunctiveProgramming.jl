@@ -111,7 +111,7 @@ function test_cp_loop_helpers()
     @test length(rBM_sol[x]) == 1
 
     # Set SEP objective and solve
-    DP._set_separation_objective(separation, rBM_sol)
+    DP.set_separation_objective(separation, rBM_sol)
     optimize!(separation.model, ignore_optimize_hook = true)
     @test termination_status(separation.model) == MOI.OPTIMAL
 
@@ -149,7 +149,7 @@ function test_cp_cut_generation()
     rBM_sol = DP.extract_solution(model)
 
     # Solve SEP
-    DP._set_separation_objective(separation, rBM_sol)
+    DP.set_separation_objective(separation, rBM_sol)
     optimize!(separation.model, ignore_optimize_hook = true)
     separation_sol = DP.extract_solution(separation)
 
