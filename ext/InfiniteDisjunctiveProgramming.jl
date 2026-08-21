@@ -305,8 +305,7 @@ function DP.copy_and_reformulate(
     reform_method::DP.AbstractReformulationMethod,
     method::DP.CuttingPlanes
     )
-    # Quadrature weights for the separation objective and cut,
-    # probed on a throwaway copy (the model is not mutated).
+    # Probe quadrature weights for the separation objective and cut.
     model.ext[:cp_quadrature_weights] =
         _probe_quadrature_weights(model, decision_vars)
     DP.reformulate_model(model, reform_method)
@@ -335,9 +334,7 @@ end
 # Collect the objective's measure data (nested measures included),
 # mapped from each measured parameter to its measure data.
 _collect_measure_data(data, expr::Number) = nothing
-function _collect_measure_data(
-    data::Dict, expr::InfiniteOpt.GeneralVariableRef
-    )
+function _collect_measure_data(data::Dict, expr::InfiniteOpt.GeneralVariableRef)
     dispatch = InfiniteOpt.dispatch_variable_ref(expr)
     dispatch isa InfiniteOpt.MeasureRef || return nothing
     md = InfiniteOpt.measure_data(expr)
@@ -368,20 +365,17 @@ function _collect_measure_data(data::Dict, expr::JuMP.GenericNonlinearExpr)
     return nothing
 end
 
-# Probe the quadrature weights on a throwaway constraint-free copy
-# of the model: give it the objective sum_v m(v * v), where m
-# applies the objective's own measure data over each of v's
-# parameters (a default integral where the objective measures
-# none), transcribe it, and read the weight the expansion assigned
-# to each support off the x_k^2 coefficients of its transcribed
-# objective. The model itself is never mutated. Finite variables
-# get a unit weight.
+# Probe quadrature weights on a throwaway constraint-free copy of the
+# model: give it the objective sum_v m(v * v), with m the objective's
+# own measure data per parameter (if unmeasured, a default integral,
+# or an expectation when the parameter is unbounded), transcribe, and
+# read each support's weight off the x_k^2 objective coefficients.
+# Finite variables get a unit weight.
 function _probe_quadrature_weights(
     model::InfiniteOpt.InfiniteModel,
     decision_vars::Vector{InfiniteOpt.GeneralVariableRef}
     )
-    mini, ref_map = JuMP.copy_model(
-        model; filter_constraints = cref -> false)
+    mini, ref_map = JuMP.copy_model(model; filter_constraints = cref -> false)
     measure_data = Dict{InfiniteOpt.GeneralVariableRef,
         InfiniteOpt.AbstractMeasureData}()
     _collect_measure_data(measure_data, JuMP.objective_function(mini))
@@ -391,13 +385,16 @@ function _probe_quadrature_weights(
         isempty(prefs) && continue
         expr = ref_map[v] * ref_map[v]
         for g in prefs
-            mini_g = g isa AbstractArray ?
-                [ref_map[p] for p in g] : ref_map[g]
+            mini_g = g isa AbstractArray ? [ref_map[p] for p in g] : ref_map[g]
             key = mini_g isa AbstractArray ? first(mini_g) : mini_g
             md = get(measure_data, key, nothing)
-            expr = md === nothing ?
-                InfiniteOpt.integral(expr, mini_g) :
-                InfiniteOpt.measure(expr, md)
+            if md !== nothing
+                expr = InfiniteOpt.measure(expr, md)
+            elseif JuMP.has_lower_bound(key) && JuMP.has_upper_bound(key)
+                expr = InfiniteOpt.integral(expr, mini_g)
+            else
+                expr = InfiniteOpt.expect(expr, mini_g)
+            end
         end
         push!(terms, expr)
     end
@@ -416,10 +413,8 @@ function _probe_quadrature_weights(
     return weights
 end
 
-# Quadrature weights per decision variable, probed once at
-# separation-submodel build. The separation objective and the cut
-# must share these; a missing entry fails loudly rather than
-# falling back to an unweighted (invalid) pairing.
+# Weights probed at submodel build; the separation objective and the
+# cut must share these, so a missing entry fails loudly.
 function _quadrature_weights(model::InfiniteOpt.InfiniteModel)
     return model.ext[:cp_quadrature_weights]
 end
@@ -430,8 +425,7 @@ function DP.set_separation_objective(
     sub::DP.GDPSubmodel{<:JuMP.AbstractModel, InfiniteOpt.GeneralVariableRef},
     rBM_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}}
     )
-    weights = _quadrature_weights(
-        JuMP.owner_model(first(sub.decision_vars)))
+    weights = _quadrature_weights(JuMP.owner_model(first(sub.decision_vars)))
     obj_expr = zero(JuMP.GenericQuadExpr{
         JuMP.value_type(typeof(sub.model)),
         JuMP.variable_ref_type(sub.model)})
@@ -439,10 +433,9 @@ function DP.set_separation_objective(
         sub_vars = sub.fwd_map[var]
         vals = rBM_sol[var]
         w = weights[var]
-        for k in 1:length(sub_vars)
+        for k in eachindex(sub_vars)
             JuMP.add_to_expression!(obj_expr,
-                w[k] * (sub_vars[k] - vals[k]) *
-                (sub_vars[k] - vals[k]))
+                w[k] * (sub_vars[k] - vals[k]) * (sub_vars[k] - vals[k]))
         end
     end
     JuMP.@objective(sub.model, Min, obj_expr)
