@@ -1,7 +1,16 @@
 ################################################################################
 #                              DISJUNCTION SET
 ################################################################################
-const _SupportedInnerSet = Union{
+"""
+    SupportedInnerSet
+
+Union of the scalar MOI sets allowed as constraint-row sets inside a
+[`DisjunctionSet`](@ref): `MOI.LessThan{Float64}`,
+`MOI.GreaterThan{Float64}`, `MOI.EqualTo{Float64}`, and
+`MOI.Interval{Float64}`. Solvers consuming `DisjunctionSet` can use
+this union to declare or check inner-set support.
+"""
+const SupportedInnerSet = Union{
     _MOI.LessThan{Float64},
     _MOI.GreaterThan{Float64},
     _MOI.EqualTo{Float64},
@@ -42,7 +51,7 @@ struct DisjunctionSet <: _MOI.AbstractVectorSet
         isempty(inner_sets) && throw(ArgumentError(
             "A `DisjunctionSet` requires at least one disjunct."))
         for sets in inner_sets, set in sets
-            set isa _SupportedInnerSet || throw(ArgumentError(
+            set isa SupportedInnerSet || throw(ArgumentError(
                 "Unsupported inner set `$set` in `DisjunctionSet`."))
         end
         return new([_MOI.AbstractScalarSet[set for set in sets]
@@ -93,4 +102,8 @@ Base.copy(set::DisjunctionSet) = DisjunctionSet(set.inner_sets)
 
 function Base.:(==)(a::DisjunctionSet, b::DisjunctionSet)
     return a.inner_sets == b.inner_sets
+end
+
+function Base.hash(set::DisjunctionSet, h::UInt)
+    return hash(set.inner_sets, hash(:DisjunctionSet, h))
 end
