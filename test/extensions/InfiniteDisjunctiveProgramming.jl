@@ -486,7 +486,7 @@ function test_add_cut_infinite()
         count_variable_in_set_constraints = false)
     rBM_sol = Dict(x => [1.0, 2.0, 3.0])
     sep_sol = Dict(x => [0.5, 1.5, 2.5])
-    # add_cut reads the quadrature weights probed at submodel build
+    # add_cut reads the quadrature weights computed at submodel build
     model.ext[:cp_quadrature_weights] = Dict(x => ones(3))
     DP.add_cut(model, [x], rBM_sol, sep_sol)
     n_after = JuMP.num_constraints(transcribed;
@@ -793,11 +793,10 @@ function test_CuttingPlanes_multiparameter()
         [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
 end
 
-# Probed quadrature weights: trapezoid coefficients from the
-# objective's default UniTrapezoid integrals on uniform and
-# nonuniform grids, unit weight for finite variables, and the
-# model left untouched by the probe.
-function test_probe_weights_trapezoid()
+# Quadrature weights: trapezoid coefficients from the objective's
+# default UniTrapezoid integrals on uniform and nonuniform grids,
+# unit weight for finite variables, and the model left unchanged.
+function test_quadrature_weights_trapezoid()
     model = InfiniteGDPModel(HiGHS.Optimizer)
     set_silent(model)
     @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
@@ -822,15 +821,15 @@ function test_probe_weights_trapezoid()
     @test weights[y] ≈ [0.05, 0.2, 0.45, 0.3]
     # finite variable: unit weight
     @test weights[w] == [1.0]
-    # the probe runs on a copy: the model's objective is untouched
+    # the weights are computed on a copy: the objective is unchanged
     @test JuMP.objective_sense(model) == MOI.MIN_SENSE
     @test length(JuMP.objective_function(model).terms) == 3
 end
 
-# The probe matches the objective's evaluation scheme, not a
+# The weights match the objective's evaluation scheme, not a
 # hardcoded rule: a GaussLegendre integral yields Gauss weights on
 # its generated nodes and zero weight on the remaining supports.
-function test_probe_weights_gauss()
+function test_quadrature_weights_gauss()
     model = InfiniteGDPModel(HiGHS.Optimizer)
     set_silent(model)
     @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
@@ -851,9 +850,9 @@ function test_probe_weights_gauss()
     @test length(w) > 5   # Gauss nodes were added to the grid
 end
 
-# Multi-parameter weights: the probed tensor weights align with
+# Multi-parameter weights: the tensor weights align with
 # vec(transformation_variable) via the flattened support tuples.
-function test_probe_weights_multiparameter()
+function test_quadrature_weights_multiparameter()
     model = InfiniteGDPModel(HiGHS.Optimizer)
     set_silent(model)
     @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
@@ -885,7 +884,7 @@ function test_probe_weights_multiparameter()
     end
 end
 
-# The cut coefficients carry the probed quadrature weights:
+# The cut coefficients carry the quadrature weights:
 # ξ_k = 2 ω_k (sep_k - rBM_k) on each transcribed variable.
 function test_add_cut_weighted_coefficients()
     model = InfiniteGDPModel(HiGHS.Optimizer)
@@ -898,7 +897,7 @@ function test_add_cut_weighted_coefficients()
     @disjunction(model, Y)
     @objective(model, Min, ∫(x, t))
 
-    # populate the weight stash the way the CP loop does
+    # store the weights the way the CP loop does
     method = CuttingPlanes(HiGHS.Optimizer)
     dvars = DP.collect_cutting_planes_vars(model)
     DP.copy_and_reformulate(model, dvars, Hull(), method)
@@ -978,9 +977,9 @@ end
     @testset "Cutting Planes" begin
         test_extract_solution_infinite()
         test_add_cut_infinite()
-        test_probe_weights_trapezoid()
-        test_probe_weights_gauss()
-        test_probe_weights_multiparameter()
+        test_quadrature_weights_trapezoid()
+        test_quadrature_weights_gauss()
+        test_quadrature_weights_multiparameter()
         test_add_cut_weighted_coefficients()
         test_CuttingPlanes_infinite_simple()
         test_CuttingPlanes_infinite_two_disj()

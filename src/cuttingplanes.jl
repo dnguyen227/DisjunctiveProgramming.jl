@@ -29,9 +29,17 @@ function extract_solution(sub::GDPSubmodel)
     return sol
 end
 
-# Set quadratic separation objective: min Σ (x_k - rBM_k)².
-# Extensions override for models needing a different separation
-# geometry (e.g. quadrature-weighted distances).
+"""
+    set_separation_objective(
+        sub::GDPSubmodel,
+        rBM_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}}
+        )
+
+Set the separation problem objective on `sub` to the squared distance
+from the relaxed BigM solution: min sum_k (x_k - rBM_k)^2. Extensions
+may override this for models needing a different separation geometry
+(e.g. quadrature-weighted distances).
+"""
 function set_separation_objective(
     sub::GDPSubmodel,
     rBM_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}}
