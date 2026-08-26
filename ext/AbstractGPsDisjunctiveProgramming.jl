@@ -7,15 +7,22 @@ import DisjunctiveProgramming as DP
 ################################################################################
 #                                 GP FITTING
 ################################################################################
-# Normalized to [0, 1]^d so one lengthscale works across dimensions
-function _support_coords(
-    grids::Tuple{Vararg{Vector{Float64}}}
-    )::Vector{Vector{Float64}}
-    indices = CartesianIndices(length.(grids))
-    mins = [minimum(g) for g in grids]
-    ranges = [max(maximum(g) - minimum(g), eps()) for g in grids]
-    return [[(grids[d][I[d]] - mins[d]) / ranges[d]
-             for d in 1:length(grids)] for I in vec(indices)]
+# Normalized to [0, 1]^d so one lengthscale works across dimensions.
+# An independent parameter contributes one coordinate; a dependent
+# group contributes its joint-support column.
+function _support_coords(grids::Tuple)::Vector{Vector{Float64}}
+    axis_coords = map(grids) do g
+        g isa AbstractMatrix ? [g[:, j] for j in axes(g, 2)] :
+            [[v] for v in g]
+    end
+    coords = [reduce(vcat, getindex.(axis_coords, Tuple(I)))
+              for I in vec(CartesianIndices(length.(axis_coords)))]
+    dims = eachindex(first(coords))
+    mins = [minimum(c[d] for c in coords) for d in dims]
+    ranges = [max(maximum(c[d] for c in coords) - mins[d], eps())
+              for d in dims]
+    return [[(c[d] - mins[d]) / ranges[d] for d in dims]
+            for c in coords]
 end
 
 # Lengthscale selected by marginal likelihood over the candidates
@@ -69,7 +76,7 @@ function DP.sample_M_values(
     objectives::AbstractArray,
     sub::DP.GDPSubmodel,
     method::DP._MBM,
-    support_grids::Function
+    support_grids::Tuple
     )
     indices = collect(CartesianIndices(objectives))
     n = length(indices)
@@ -87,12 +94,12 @@ function DP.sample_M_values(
         solve_at(index) || return nothing
     end
     if sampler.detect_uniform_M
-        # a uniform M needs no fit, and so no support grid either
+        # a uniform M needs no fit
         probes = collect(values(solved))
         all(==(first(probes)), probes) && return first(probes)
     end
     budget = min(ceil(Int, sampler.budget * n), n)
-    X = _support_coords(support_grids())
+    X = _support_coords(support_grids)
     while length(solved) < budget
         means, sds = _mean_sd(sampler, X, solved)
         acquisition = means .+ sampler.kappa .* sds

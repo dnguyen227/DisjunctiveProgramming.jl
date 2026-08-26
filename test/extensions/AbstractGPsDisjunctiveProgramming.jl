@@ -1,8 +1,11 @@
 using InfiniteOpt, HiGHS, AbstractGPs
 import DisjunctiveProgramming as DP
 
+# subtype without a sample_M_values method, for the fallback error
+struct _UnimplementedSampler <: DP.AbstractMBMSampler end
+
 function test_gp_sampler_kwargs()
-    @test MBM(HiGHS.Optimizer).sampler === nothing
+    @test MBM(HiGHS.Optimizer).sampler === ExhaustiveSampler()
     sampler = GPSampler()
     @test sampler.kernel === nothing
     @test sampler.kappa == 2.5
@@ -77,7 +80,7 @@ function test_gp_raw_M_matches_exact()
         return [InfiniteOpt.raw_function(M)(t_val) for t_val in supports]
     end
     supports = [0.0, 0.25, 0.5, 0.75, 1.0]
-    exact_vals = pfunc_values(nothing, supports)
+    exact_vals = pfunc_values(ExhaustiveSampler(), supports)
     # default kernel, user kernel, and pinned lengthscale all solve
     # the same supports here, so the M values match exactly
     @test pfunc_values(GPSampler(budget = 1.0), supports) ==
@@ -87,6 +90,60 @@ function test_gp_raw_M_matches_exact()
         exact_vals
     @test pfunc_values(GPSampler(SqExponentialKernel(),
         lengthscales = [0.2], budget = 1.0), supports) == exact_vals
+end
+
+# Two independent parameters: the GP path builds 2-D coordinates and
+# fits a multivariate GP; with budget = 1.0 every support is solved
+# exactly, so the M values match the exhaustive grid. Setup as in
+# test_raw_M_infinite_two_params: M(t, s) = 10 - t - s.
+function test_gp_raw_M_two_params()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, t ∈ [0, 1], supports = [0.0, 0.5, 1.0])
+    @infinite_parameter(model, s ∈ [0, 1], supports = [0.0, 1.0])
+    @variable(model, 0 <= x <= 10, Infinite(t, s))
+    @variable(model, Y[1:2], InfiniteLogical(t, s))
+    @constraint(model, con, x <= t + s, Disjunct(Y[1]))
+    @constraint(model, con2, x >= 0.5, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    mbm = DP._MBM(
+        MBM(HiGHS.Optimizer, sampler = GPSampler(budget = 1.0)), model)
+    sub = DP.copy_model_with_constraints(
+        model, DP.DisjunctConstraintRef[con2], mbm)
+    obj = DP.prepare_max_M_objective(
+        model, JuMP.constraint_object(con), sub)
+    M = DP.raw_M(sub, obj, mbm)
+    @test M isa InfiniteOpt.GeneralVariableRef
+    raw_fn = InfiniteOpt.raw_function(M)
+    for t_val in [0.0, 0.5, 1.0], s_val in [0.0, 1.0]
+        @test raw_fn(t_val, s_val) ≈ 10.0 - t_val - s_val atol = 1e-6
+    end
+end
+
+# Dependent parameters: the joint supports become the GP coordinates
+# directly; with budget = 1.0 every support is solved exactly, so the
+# M values match the exhaustive ones. Setup as in
+# test_raw_M_infinite_dependent_varying: M(ξ) = 10 - ξ[1] - ξ[2].
+function test_gp_raw_M_dependent()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, ξ[1:2] ∈ [0, 1], num_supports = 6)
+    @variable(model, 0 <= x <= 10, Infinite(ξ))
+    @variable(model, Y[1:2], InfiniteLogical(ξ))
+    @constraint(model, con, x <= ξ[1] + ξ[2], Disjunct(Y[1]))
+    @constraint(model, con2, x >= 0.5, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    mbm = DP._MBM(
+        MBM(HiGHS.Optimizer, sampler = GPSampler(budget = 1.0)), model)
+    sub = DP.copy_model_with_constraints(
+        model, DP.DisjunctConstraintRef[con2], mbm)
+    obj = DP.prepare_max_M_objective(
+        model, JuMP.constraint_object(con), sub)
+    M = DP.raw_M(sub, obj, mbm)
+    @test M isa InfiniteOpt.GeneralVariableRef
+    raw_fn = InfiniteOpt.raw_function(M)
+    S = InfiniteOpt.supports(ξ)
+    for j in axes(S, 2)
+        @test raw_fn(S[:, j]) ≈ 10.0 - S[1, j] - S[2, j] atol = 1e-6
+    end
 end
 
 # an empty disjunct region makes the M subproblems infeasible; both
@@ -106,7 +163,7 @@ function test_gp_infeasible_disjunct()
         @objective(model, Max, 𝔼(x, t))
         return model
     end
-    for sampler in (nothing, GPSampler())
+    for sampler in (ExhaustiveSampler(), GPSampler())
         model = build()
         @test_throws ErrorException optimize!(model,
             gdp_method = MBM(HiGHS.Optimizer, sampler = sampler))
@@ -131,7 +188,7 @@ function test_gp_mbm_solve_equivalence()
         @test termination_status(model) == MOI.OPTIMAL
         return objective_value(model)
     end
-    obj_exact = solve_with(nothing)
+    obj_exact = solve_with(ExhaustiveSampler())
     obj_gp = solve_with(GPSampler())
     obj_tuned = solve_with(GPSampler(kappa = 4.0, budget = 0.2))
     @test obj_exact ≈ 10.0 atol = 1e-4
@@ -165,7 +222,7 @@ function test_gp_periodic_M_seeds()
             gdp_method = MBM(HiGHS.Optimizer, sampler = sampler))
         return objective_value(model)
     end
-    @test solve_with(nothing) ≈ 10.0 atol = 1e-6
+    @test solve_with(ExhaustiveSampler()) ≈ 10.0 atol = 1e-6
     @test solve_with(GPSampler()) ≈ 10.0 atol = 1e-6
     @test solve_with(GPSampler(seeds = 5)) ≈ 10.0 atol = 1e-6
     @test solve_with(GPSampler(seeds = [0.0, 0.5, 1.0])) ≈
@@ -203,6 +260,8 @@ end
 
 # Dependent parameters have no support grid, so turning detection off
 # leaves the GP with nothing to fit over
+# detect_uniform_M = false forces coordinate construction from the
+# joint supports; the uniform M still comes back exact
 function test_gp_detect_uniform_M_off_dependent()
     model = InfiniteGDPModel()
     @infinite_parameter(model, ξ[1:2] ∈ [0, 1], num_supports = 4)
@@ -217,10 +276,12 @@ function test_gp_detect_uniform_M_off_dependent()
         model, DP.DisjunctConstraintRef[con2], mbm)
     obj = DP.prepare_max_M_objective(
         model, JuMP.constraint_object(con), sub)
-    @test_throws ErrorException DP.raw_M(sub, obj, mbm)
+    @test DP.raw_M(sub, obj, mbm) == 5.0
 end
 
 function test_gp_unknown_sampler_error()
+    # a non-AbstractMBMSampler is rejected at construction
+    @test_throws TypeError MBM(HiGHS.Optimizer, sampler = :grid)
     model = InfiniteGDPModel(HiGHS.Optimizer)
     set_silent(model)
     @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
@@ -232,13 +293,16 @@ function test_gp_unknown_sampler_error()
     @disjunction(model, Y)
     @objective(model, Max, 𝔼(x, t))
     @test_throws ErrorException optimize!(model,
-        gdp_method = MBM(HiGHS.Optimizer, sampler = :grid))
+        gdp_method = MBM(HiGHS.Optimizer,
+            sampler = _UnimplementedSampler()))
 end
 
 @testset "AbstractGPsDisjunctiveProgramming" begin
     test_gp_sampler_kwargs()
     test_gp_raw_M_scalar()
     test_gp_raw_M_matches_exact()
+    test_gp_raw_M_two_params()
+    test_gp_raw_M_dependent()
     test_gp_mbm_solve_equivalence()
     test_gp_periodic_M_seeds()
     test_gp_detect_uniform_M_off()

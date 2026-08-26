@@ -176,7 +176,7 @@ The following reformulation methods are currently supported:
 
     - `optimizer`: Optimizer to use when solving subproblems to determine M values. This is a required value.
     - `default_M`: Default big-M value to use if no big-M is specified for a logical variable (1e9).
-    - `sampler`: M-value sampler for infinite models. Default: `nothing`, which solves an M subproblem at every support. Pass a `GPSampler` to instead solve a subset of the supports and fill the rest with a conservative Gaussian-process estimate. Ignored for finite models.
+    - `sampler`: M-value sampler for infinite models. Default: `ExhaustiveSampler()`, which solves an M subproblem at every support. Pass a `GPSampler` to instead solve a subset of the supports and fill the rest with a conservative Gaussian-process estimate. Ignored for finite models.
 
 5. [P-Split](https://arxiv.org/abs/2202.05198): This method reformulates each disjunct constraint into P constraints, each with a partitioned group defined by the user. This method requires that terms in the constraint be convex additively seperable with respect to each variable. The `PSplit` struct is created with the following required arguments:
 

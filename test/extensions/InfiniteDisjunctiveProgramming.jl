@@ -471,8 +471,8 @@ function test_raw_M_infinite_two_params()
     end
 end
 
-# Dependent parameters have no per-parameter support grid, so raw_M
-# must not need one when M does not vary. Setup as in
+# Dependent parameters with a uniform M short-circuit to a scalar
+# before any support grid is needed. Setup as in
 # test_raw_M_infinite_scalar, over a dependent parameter array.
 function test_raw_M_infinite_dependent_params()
     model = InfiniteGDPModel()
@@ -488,6 +488,35 @@ function test_raw_M_infinite_dependent_params()
     obj = DP.prepare_max_M_objective(
         model, JuMP.constraint_object(con), sub)
     @test DP.raw_M(sub, obj, mbm) == 5.0
+end
+
+# Dependent parameters with M varying over the joint supports: the
+# parameter function looks M up at each joint support and falls back
+# to the conservative max off-support. Setup: x(ξ) in [0, 10],
+# disj1: x <= ξ[1] + ξ[2], disj2: x >= 0.5, so M(ξ) = 10 - ξ1 - ξ2.
+function test_raw_M_infinite_dependent_varying()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, ξ[1:2] ∈ [0, 1], num_supports = 4)
+    @variable(model, 0 <= x <= 10, Infinite(ξ))
+    @variable(model, Y[1:2], InfiniteLogical(ξ))
+    @constraint(model, con, x <= ξ[1] + ξ[2], Disjunct(Y[1]))
+    @constraint(model, con2, x >= 0.5, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    mbm = DP._MBM(MBM(HiGHS.Optimizer), model)
+    sub = DP.copy_model_with_constraints(
+        model, DP.DisjunctConstraintRef[con2], mbm)
+    obj = DP.prepare_max_M_objective(
+        model, JuMP.constraint_object(con), sub)
+    M = DP.raw_M(sub, obj, mbm)
+    @test M isa InfiniteOpt.GeneralVariableRef
+    raw_fn = InfiniteOpt.raw_function(M)
+    S = InfiniteOpt.supports(ξ)
+    expected = [10.0 - S[1, j] - S[2, j] for j in axes(S, 2)]
+    for j in axes(S, 2)
+        @test raw_fn(S[:, j]) ≈ expected[j] atol = 1e-6
+    end
+    # off-support queries fall back to the maximum over all supports
+    @test raw_fn([0.1234, 0.5678]) ≈ maximum(expected) atol = 1e-6
 end
 
 # Piecewise-constant max-of-corners: returns the maximum value over
@@ -914,6 +943,7 @@ end
         test_raw_M_infinite_param_function()
         test_raw_M_infinite_two_params()
         test_raw_M_infinite_dependent_params()
+        test_raw_M_infinite_dependent_varying()
         test_mbm_finite_and_integer_var()
         test_mbm_infinite_simple()
         test_mbm_infinite_param_dependent()
