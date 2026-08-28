@@ -94,29 +94,32 @@ end
 
 # Two independent parameters: the GP path builds 2-D coordinates and
 # fits a multivariate GP; with budget = 1.0 every support is solved
-# exactly, so the M values match the exhaustive grid. Setup as in
-# test_raw_M_infinite_two_params: M(t, s) = 10 - t - s.
+# exactly, so the parameter function matches the exhaustive one. Setup
+# as in test_raw_M_infinite_two_params: M(t, s) = 10 - t - s.
 function test_gp_raw_M_two_params()
-    model = InfiniteGDPModel()
-    @infinite_parameter(model, t ∈ [0, 1], supports = [0.0, 0.5, 1.0])
-    @infinite_parameter(model, s ∈ [0, 1], supports = [0.0, 1.0])
-    @variable(model, 0 <= x <= 10, Infinite(t, s))
-    @variable(model, Y[1:2], InfiniteLogical(t, s))
-    @constraint(model, con, x <= t + s, Disjunct(Y[1]))
-    @constraint(model, con2, x >= 0.5, Disjunct(Y[2]))
-    @disjunction(model, Y)
-    mbm = DP._MBM(
-        MBM(HiGHS.Optimizer, sampler = GPSampler(budget = 1.0)), model)
-    sub = DP.copy_model_with_constraints(
-        model, DP.DisjunctConstraintRef[con2], mbm)
-    obj = DP.prepare_max_M_objective(
-        model, JuMP.constraint_object(con), sub)
-    M = DP.raw_M(sub, obj, mbm)
-    @test M isa InfiniteOpt.GeneralVariableRef
-    raw_fn = InfiniteOpt.raw_function(M)
-    for t_val in [0.0, 0.5, 1.0], s_val in [0.0, 1.0]
-        @test raw_fn(t_val, s_val) ≈ 10.0 - t_val - s_val atol = 1e-6
+    function pfunc_values(sampler)
+        model = InfiniteGDPModel()
+        @infinite_parameter(model, t ∈ [0, 1], supports = [0.0, 0.5, 1.0])
+        @infinite_parameter(model, s ∈ [0, 1], supports = [0.0, 1.0])
+        @variable(model, 0 <= x <= 10, Infinite(t, s))
+        @variable(model, Y[1:2], InfiniteLogical(t, s))
+        @constraint(model, con, x <= t + s, Disjunct(Y[1]))
+        @constraint(model, con2, x >= 0.5, Disjunct(Y[2]))
+        @disjunction(model, Y)
+        mbm = DP._MBM(
+            MBM(HiGHS.Optimizer, sampler = sampler), model)
+        sub = DP.copy_model_with_constraints(
+            model, DP.DisjunctConstraintRef[con2], mbm)
+        obj = DP.prepare_max_M_objective(
+            model, JuMP.constraint_object(con), sub)
+        M = DP.raw_M(sub, obj, mbm)
+        @test M isa InfiniteOpt.GeneralVariableRef
+        raw_fn = InfiniteOpt.raw_function(M)
+        return [raw_fn(t_val, s_val)
+                for t_val in [0.0, 0.5, 1.0], s_val in [0.0, 1.0]]
     end
+    @test pfunc_values(GPSampler(budget = 1.0)) ==
+        pfunc_values(ExhaustiveSampler())
 end
 
 # Dependent parameters: the joint supports become the GP coordinates
