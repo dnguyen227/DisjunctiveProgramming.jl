@@ -303,11 +303,12 @@ function DP.copy_and_reformulate(
     model::InfiniteOpt.InfiniteModel,
     decision_vars::Vector{InfiniteOpt.GeneralVariableRef},
     reform_method::DP.AbstractReformulationMethod,
-    method::DP.CuttingPlanes
+    method::DP._CuttingPlanes
     )
-    # Compute quadrature weights for the separation objective and cut.
-    model.ext[:cp_quadrature_weights] =
-        _compute_quadrature_weights(model, decision_vars)
+    # Quadrature weights come from the clean model, before reformulation.
+    for (v, w) in _compute_quadrature_weights(model, decision_vars)
+        method.weights[v] = w
+    end
     DP.reformulate_model(model, reform_method)
     InfiniteOpt.build_transformation_backend!(model)
     transcribed = InfiniteOpt.transformation_model(model)
@@ -359,12 +360,23 @@ function _collect_measure_data(data::Dict, expr::JuMP.GenericNonlinearExpr)
     return nothing
 end
 
+# Whether a (scalar) parameter ranges over a plain interval;
+# dependent groups and distribution parameters return false.
+function _is_interval_parameter(pref)
+    pref isa AbstractArray && return false
+    dispatch = InfiniteOpt.dispatch_variable_ref(pref)
+    return InfiniteOpt.infinite_domain(dispatch) isa
+        InfiniteOpt.IntervalDomain
+end
+
 # Compute quadrature weights on a constraint-free copy of the model:
 # give it the objective sum_v m(v), with m the objective's own
-# measure data per parameter (if unmeasured, a default integral, or
-# an expectation when the parameter is unbounded), transcribe, and
-# take each support's weight from the transcribed coefficients.
-# Finite variables get a unit weight.
+# measure data per parameter (if unmeasured, a default integral for
+# scalar interval parameters, else a support average - the measures
+# that keep the copy's supports, and so the weights, aligned with
+# the transcription), transcribe, and take each support's weight
+# from the transcribed coefficients. Finite variables get a unit
+# weight.
 function _compute_quadrature_weights(
     model::InfiniteOpt.InfiniteModel,
     decision_vars::Vector{InfiniteOpt.GeneralVariableRef}
@@ -384,10 +396,11 @@ function _compute_quadrature_weights(
             md = get(measure_data, key, nothing)
             if md !== nothing
                 expr = InfiniteOpt.measure(expr, md)
-            elseif JuMP.has_lower_bound(key) && JuMP.has_upper_bound(key)
+            elseif _is_interval_parameter(mini_g)
                 expr = InfiniteOpt.integral(expr, mini_g)
             else
-                expr = InfiniteOpt.expect(expr, mini_g)
+                expr = InfiniteOpt.support_sum(expr, mini_g) /
+                    InfiniteOpt.num_supports(key)
             end
         end
         push!(terms, expr)
@@ -407,33 +420,13 @@ function _compute_quadrature_weights(
     return weights
 end
 
-# Quadrature-weighted separation objective:
-# min sum_v sum_k omega_k (x_k - rBM_k)^2.
-function DP.set_separation_objective(
-    sub::DP.GDPSubmodel{<:JuMP.AbstractModel, InfiniteOpt.GeneralVariableRef},
-    rBM_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}}
-    )
-    model = JuMP.owner_model(first(sub.decision_vars))
-    weights = model.ext[:cp_quadrature_weights]
-    obj_expr = zero(JuMP.QuadExpr)
-    for var in sub.decision_vars
-        sub_vars = sub.fwd_map[var]
-        vals = rBM_sol[var]
-        w = weights[var]
-        for k in eachindex(sub_vars)
-            JuMP.add_to_expression!(obj_expr,
-                w[k] * (sub_vars[k] - vals[k]) * (sub_vars[k] - vals[k]))
-        end
-    end
-    JuMP.@objective(sub.model, Min, obj_expr)
-    return
-end
-
 # Read per-support values from the transformation backend.
-function DP.extract_solution(model::InfiniteOpt.InfiniteModel)
-    dvars = DP.collect_cutting_planes_vars(model)
+function DP.extract_solution(
+    model::InfiniteOpt.InfiniteModel,
+    reform_state::DP._CuttingPlanes
+    )
     sol = Dict{InfiniteOpt.GeneralVariableRef, Vector{Float64}}()
-    for v in dvars
+    for v in reform_state.decision_vars
         transcription_var = InfiniteOpt.transformation_variable(v)
         var_prefs = InfiniteOpt.parameter_refs(v)
         sol[v] = isempty(var_prefs) ? [JuMP.value(transcription_var)] :
@@ -447,20 +440,19 @@ end
 # wipe the cut.
 function DP.add_cut(
     model::InfiniteOpt.InfiniteModel,
-    decision_vars::Vector{InfiniteOpt.GeneralVariableRef},
+    reform_state::DP._CuttingPlanes,
     rBM_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}},
     sep_sol::Dict{<:JuMP.AbstractVariableRef, <:Vector{<:Number}}
     )
     transcribed = InfiniteOpt.transformation_model(model)
-    weights = model.ext[:cp_quadrature_weights]
     cut_expr = zero(JuMP.AffExpr)
-    for var in decision_vars
+    for var in reform_state.decision_vars
         rbm_vals = rBM_sol[var]
         sep_vals = sep_sol[var]
         transcription_var = InfiniteOpt.transformation_variable(var)
         transcribed_vars = transcription_var isa AbstractArray ?
             vec(transcription_var) : [transcription_var]
-        w = weights[var]
+        w = reform_state.weights[var]
         for k in eachindex(transcribed_vars)
             xi = 2 * w[k] * (sep_vals[k] - rbm_vals[k])
             JuMP.add_to_expression!(cut_expr, xi, transcribed_vars[k])

@@ -461,7 +461,8 @@ function test_extract_solution_infinite()
     set_optimizer(model, HiGHS.Optimizer)
     set_silent(model)
     optimize!(model, ignore_optimize_hook = true)
-    sol = DP.extract_solution(model)
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    sol = DP.extract_solution(model, reform_state)
     @test haskey(sol, x)
     @test length(sol[x]) == K
     @test all(v -> isapprox(v, 0.0; atol=1e-6), sol[x])
@@ -486,9 +487,12 @@ function test_add_cut_infinite()
         count_variable_in_set_constraints = false)
     rBM_sol = Dict(x => [1.0, 2.0, 3.0])
     sep_sol = Dict(x => [0.5, 1.5, 2.5])
-    # add_cut reads the quadrature weights computed at submodel build
-    model.ext[:cp_quadrature_weights] = Dict(x => ones(3))
-    DP.add_cut(model, [x], rBM_sol, sep_sol)
+    # add_cut reads the decision variables and weights from the CP
+    # working state; restrict both to x for this isolated call
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    reform_state.decision_vars = [x]
+    reform_state.weights[x] = ones(3)
+    DP.add_cut(model, reform_state, rBM_sol, sep_sol)
     n_after = JuMP.num_constraints(transcribed;
         count_variable_in_set_constraints = false)
     @test n_after == n_before + 1
@@ -743,8 +747,6 @@ function test_CuttingPlanes_infinite_two_disj()
     @test cp_obj ≈ bigm_obj atol = 1.0
 end
 
-
-
 function test_CuttingPlanes_with_cuts()
     # Maximization with single-constraint disjuncts where Hull
     # is strictly tighter than BigM. BigM allows x+y up to
@@ -810,10 +812,10 @@ function test_quadrature_weights_trapezoid()
     @disjunction(model, Y)
     @objective(model, Min, ∫(x, t) + ∫(y, s) + w)
 
-    method = CuttingPlanes(HiGHS.Optimizer)
-    dvars = DP.collect_cutting_planes_vars(model)
-    DP.copy_and_reformulate(model, dvars, Hull(), method)
-    weights = model.ext[:cp_quadrature_weights]
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+    weights = reform_state.weights
 
     # UniTrapezoid, uniform grid h = 0.25: [h/2, h, h, h, h/2]
     @test weights[x] ≈ [0.125, 0.25, 0.25, 0.25, 0.125]
@@ -840,10 +842,10 @@ function test_quadrature_weights_gauss()
     @disjunction(model, Y)
     @objective(model, Min, ∫(x, t, eval_method = GaussLegendre()))
 
-    method = CuttingPlanes(HiGHS.Optimizer)
-    dvars = DP.collect_cutting_planes_vars(model)
-    DP.copy_and_reformulate(model, dvars, Hull(), method)
-    w = model.ext[:cp_quadrature_weights][x]
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+    w = reform_state.weights[x]
 
     @test sum(w) ≈ 1.0
     @test any(iszero, w)  # the uniform supports carry no weight
@@ -864,10 +866,10 @@ function test_quadrature_weights_multiparameter()
     @disjunction(model, Y)
     @objective(model, Min, ∫(∫(x, t), s))
 
-    method = CuttingPlanes(HiGHS.Optimizer)
-    dvars = DP.collect_cutting_planes_vars(model)
-    DP.copy_and_reformulate(model, dvars, Hull(), method)
-    w = model.ext[:cp_quadrature_weights][x]
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+    w = reform_state.weights[x]
 
     @test length(w) == 20
     # total weight = measure of the domain [0,1] x [0,2]
@@ -884,6 +886,108 @@ function test_quadrature_weights_multiparameter()
     end
 end
 
+# No measure in the objective: a scalar interval parameter falls
+# back to the default integral (trapezoid on its own supports), a
+# distribution parameter to the support average (an integral would
+# add quadrature nodes and misalign the weights), and a finite
+# variable keeps the unit weight.
+function test_quadrature_weights_default_fallbacks()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t in [0, 1], num_supports = 5)
+    @infinite_parameter(model, xi ~ InfiniteOpt.Distributions.Normal(),
+        num_supports = 4)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, 0 <= z <= 10, Infinite(xi))
+    @variable(model, 0 <= w <= 10)
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, w + 1)
+
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+
+    @test reform_state.weights[x] ≈ [0.125, 0.25, 0.25, 0.25, 0.125]
+    @test reform_state.weights[z] ≈ fill(0.25, 4)
+    @test reform_state.weights[w] == [1.0]
+end
+
+# Dependent groups always get the support average: 1/N per joint
+# support, aligned with the transcription, for random and interval
+# domains alike.
+function test_quadrature_weights_dependent_groups()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, xi[1:2] ~ InfiniteOpt.Distributions.MvNormal(
+        [0.0, 0.0], [1.0 0.0; 0.0 1.0]), num_supports = 4)
+    @variable(model, 0 <= z <= 10, Infinite(xi))
+    @variable(model, Y[1:2], InfiniteLogical(xi))
+    @constraint(model, z >= 5, Disjunct(Y[1]))
+    @constraint(model, z <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+    @test reform_state.weights[z] ≈ fill(0.25, 4)
+
+    model2 = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model2)
+    @infinite_parameter(model2, q[1:2] in [0, 1], num_supports = 3)
+    @variable(model2, 0 <= z2 <= 10, Infinite(q))
+    @variable(model2, W[1:2], InfiniteLogical(q))
+    @constraint(model2, z2 >= 5, Disjunct(W[1]))
+    @constraint(model2, z2 <= 3, Disjunct(W[2]))
+    @disjunction(model2, W)
+
+    reform_state2 = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model2)
+    DP.copy_and_reformulate(
+        model2, reform_state2.decision_vars, Hull(), reform_state2)
+    @test reform_state2.weights[z2] ≈ fill(1 / 3, 3)
+end
+
+# The measure collector reaches a measure inside a quadratic
+# objective: the support_sum coefficients (one per support) become
+# the weights instead of the trapezoid rule.
+function test_quadrature_weights_quadratic_objective()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t in [0, 1], num_supports = 3)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, support_sum(x, t)^2)
+
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+    @test reform_state.weights[x] == [1.0, 1.0, 1.0]
+end
+
+# Same through a nonlinear objective with a numeric literal; the
+# model carries no optimizer so the transcription accepts the
+# nonlinear objective.
+function test_quadrature_weights_nonlinear_objective()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, t in [0, 1], num_supports = 3)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, exp(support_sum(x, t)) + 2)
+
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+    @test reform_state.weights[x] == [1.0, 1.0, 1.0]
+end
+
 # The cut coefficients carry the quadrature weights:
 # ξ_k = 2 ω_k (sep_k - rBM_k) on each transcribed variable.
 function test_add_cut_weighted_coefficients()
@@ -898,16 +1002,18 @@ function test_add_cut_weighted_coefficients()
     @objective(model, Min, ∫(x, t))
 
     # store the weights the way the CP loop does
-    method = CuttingPlanes(HiGHS.Optimizer)
-    dvars = DP.collect_cutting_planes_vars(model)
-    DP.copy_and_reformulate(model, dvars, Hull(), method)
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
 
     DP.reformulate_model(model, BigM(10.0))
     InfiniteOpt.build_transformation_backend!(model)
     transcribed = InfiniteOpt.transformation_model(model)
     rBM_sol = Dict(x => [1.0, 2.0, 3.0])
     sep_sol = Dict(x => [0.5, 1.5, 2.5])
-    DP.add_cut(model, [x], rBM_sol, sep_sol)
+    # the cut call consumes reform_state.decision_vars; restrict to x
+    reform_state.decision_vars = [x]
+    DP.add_cut(model, reform_state, rBM_sol, sep_sol)
 
     # UniTrapezoid on 3 uniform supports: [0.25, 0.5, 0.25]
     cut = JuMP.constraint_object(last(JuMP.all_constraints(
@@ -980,6 +1086,10 @@ end
         test_quadrature_weights_trapezoid()
         test_quadrature_weights_gauss()
         test_quadrature_weights_multiparameter()
+        test_quadrature_weights_default_fallbacks()
+        test_quadrature_weights_dependent_groups()
+        test_quadrature_weights_quadratic_objective()
+        test_quadrature_weights_nonlinear_objective()
         test_add_cut_weighted_coefficients()
         test_CuttingPlanes_infinite_simple()
         test_CuttingPlanes_infinite_two_disj()
