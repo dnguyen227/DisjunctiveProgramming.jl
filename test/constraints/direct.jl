@@ -30,6 +30,14 @@ function test_set_empty_disjunct()
     @test row_indices(set, 2) == 4:4
 end
 
+function test_set_hash_and_equality()
+    set = DisjunctionSet([[MOI.LessThan(1.0)], [MOI.EqualTo(2.0)]])
+    other = DisjunctionSet([[MOI.LessThan(1.0)], [MOI.EqualTo(3.0)]])
+    @test hash(set) == hash(copy(set))
+    @test set != other
+    @test length(Set([set, copy(set), other])) == 2
+end
+
 function test_set_validation()
     @test_throws ArgumentError DisjunctionSet(
         Vector{MOI.AbstractScalarSet}[])
@@ -92,6 +100,35 @@ function test_lowering_nested()
     @test length(outer.func) == MOI.dimension(outer.set) == 4
 end
 
+# The transcription entry point: build_constraint promotes mixed
+# number/expression vectors (a collapsed constant activation) back to
+# a uniform expression vector.
+function test_build_constraint_promotion()
+    model = GDPModel()
+    @variable(model, x)
+    @variable(model, z, Bin)
+    set = DisjunctionSet([[MOI.LessThan(3.0)]])
+    scalars = [1.0 * z, 1.0 * z, 1.0 * x]
+    con = JuMP.build_constraint(error, scalars, set)
+    @test con isa JuMP.VectorConstraint
+    @test con.func === scalars
+    @test con.set == set
+    mixed = Union{Float64, JuMP.VariableRef}[1.0, z, x]
+    con = JuMP.build_constraint(error, mixed, set)
+    @test con.func isa Vector{JuMP.AffExpr}
+    @test isequal_canonical(con.func[1], one(JuMP.AffExpr))
+    @test isequal_canonical(con.func[3], 1.0 * x)
+    untyped = Any[1, z, 2.0 * x]
+    con = JuMP.build_constraint(error, untyped, set)
+    @test con.func isa Vector{JuMP.AffExpr}
+    @test isequal_canonical(con.func[3], 2.0 * x)
+    @test con.set == set
+end
+
+function test_direct_requires_exactly1()
+    @test DP.requires_exactly1(Direct())
+end
+
 function test_lowering_nested_requires_exactly1()
     model = GDPModel()
     @variable(model, 0 <= x <= 10)
@@ -110,6 +147,7 @@ end
     test_set_construction()
     test_set_interval_inner()
     test_set_empty_disjunct()
+    test_set_hash_and_equality()
     test_set_validation()
 end
 
@@ -117,4 +155,6 @@ end
     test_disjunction_set_lowering()
     test_lowering_nested()
     test_lowering_nested_requires_exactly1()
+    test_build_constraint_promotion()
+    test_direct_requires_exactly1()
 end
