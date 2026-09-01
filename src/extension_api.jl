@@ -41,93 +41,56 @@ function InfiniteLogical end
 
 """
     GPSampler(
-        kernel = nothing;
-        kappa::Real = 2.5,
-        budget::Real = 0.25,
+        f = nothing;
+        std_dev_margin::Real = 2.5,
+        frac_supports::Real = 0.25,
         detect_uniform_M::Bool = true,
-        lengthscales = [0.05, 0.1, 0.2, 0.4, 0.8],
-        jitter::Real = 1e-8,
-        seeds = 4
+        initial_supports = 4
         )
 
 A Gaussian-process M sampler for the `sampler` field of [`MBM`](@ref)
 on infinite models. Instead of solving an M subproblem at every
-support, it solves the seed supports, then the supports selected by
-an upper-confidence-bound acquisition until the budget is spent, and
-fills the remaining supports with the posterior upper confidence
-bound `mean + kappa * sd`. The filled values are heuristic upper
-estimates of the exact M values, not certificates. Using it requires
-that AbstractGPs be loaded.
+support, it solves the initial supports, then the supports selected
+by an upper-confidence-bound acquisition until `frac_supports` of
+them are solved, and fills the remaining supports with the posterior
+upper confidence bound `mean + std_dev_margin * sd`. The filled
+values are heuristic upper estimates of the exact M values, not
+certificates. This requires that AbstractGPs be imported first.
 
 **Arguments**
-- `kernel`: Covariance kernel for the GP fit; `nothing` (the
-  default) uses a squared exponential kernel. The lengthscale is
-  selected from `lengthscales` by marginal likelihood.
-- `kappa::Real`: Upper-confidence-bound multiplier used to select the
-  next support to solve and to fill unsolved supports (2.5).
-- `budget::Real`: Fraction of the supports to solve exactly, in
-  `(0, 1]` (0.25). The seed supports are always solved;
-  `budget = 1.0` solves every support.
+- `f`: An `AbstractGPs.GP` prior, used as given, e.g.
+  `GP(Matern52Kernel())`; `nothing` (the default) uses a squared
+  exponential kernel with its lengthscale selected by marginal
+  likelihood. The prior is fit to support coordinates normalized to
+  `[0, 1]` per dimension and to M values standardized to zero mean
+  and unit scale, so any lengthscale baked into `f` is relative to
+  the unit box.
+- `std_dev_margin::Real`: Standard deviations added above the
+  posterior mean, both to select the next support to solve and to
+  fill the unsolved supports (2.5).
+- `frac_supports::Real`: Fraction of the supports to solve exactly,
+  in `(0, 1]` (0.25). The initial supports are always solved;
+  `frac_supports = 1.0` solves every support.
 - `detect_uniform_M::Bool`: If `true` (the default), M values that
-  agree at the seed supports are taken to be uniform and used for
+  agree at the initial supports are taken to be uniform and used for
   every support. Set it to `false` to always fit the GP, which
-  leaves the usual `kappa * sd` cushion on the unsolved supports at
-  the cost of the extra solves.
-- `lengthscales`: Candidate lengthscales for the marginal-likelihood
-  kernel fit, relative to support coordinates normalized to
-  `[0, 1]` ([0.05, 0.1, 0.2, 0.4, 0.8]). Give a single candidate to
-  pin the lengthscale.
-- `jitter::Real`: Observation-noise nugget added to the GP prior
-  when fitting (1e-8).
-- `seeds`: Number of evenly spaced supports solved before the first
-  GP fit (4), or a vector of fractions in `[0, 1]` giving their
-  positions along the supports. With `detect_uniform_M`, evenly
-  spaced seeds can read a periodic M as uniform; pass unevenly
-  spaced fractions to guard against that.
+  leaves the usual `std_dev_margin * sd` cushion on the unsolved
+  supports at the cost of the extra solves.
+- `initial_supports`: Number of evenly spaced supports solved before
+  the first GP fit (4), or a vector of fractions in `[0, 1]` giving
+  their positions along the supports. With `detect_uniform_M`,
+  evenly spaced initial supports can read a periodic M as uniform;
+  pass unevenly spaced fractions to guard against that.
 
 **Example**
 ```julia
 julia> using DisjunctiveProgramming, InfiniteOpt, AbstractGPs, HiGHS
 
-julia> method = MBM(HiGHS.Optimizer, sampler = GPSampler(kappa = 4.0))
+julia> method = MBM(HiGHS.Optimizer,
+           sampler = GPSampler(GP(Matern52Kernel()), std_dev_margin = 4.0))
 ```
 """
-struct GPSampler{K} <: AbstractMBMSampler
-    # Parametric so base needs no AbstractGPs dependency
-    kernel::K
-    kappa::Float64
-    budget::Float64
-    detect_uniform_M::Bool
-    lengthscales::Vector{Float64}
-    jitter::Float64
-    seeds::Union{Int, Vector{Float64}}
-
-    function GPSampler(
-        kernel::K = nothing;
-        kappa::Real = 2.5,
-        budget::Real = 0.25,
-        detect_uniform_M::Bool = true,
-        lengthscales = [0.05, 0.1, 0.2, 0.4, 0.8],
-        jitter::Real = 1e-8,
-        seeds = 4
-        ) where {K}
-        kappa >= 0 || error("`kappa` must be nonnegative.")
-        0 < budget <= 1 || error("`budget` must be in `(0, 1]`.")
-        lengthscales = collect(Float64, lengthscales)
-        (!isempty(lengthscales) && all(>(0), lengthscales)) ||
-            error("`lengthscales` must be positive and nonempty.")
-        jitter >= 0 || error("`jitter` must be nonnegative.")
-        if seeds isa Int
-            seeds >= 2 || error("`seeds` must be at least 2.")
-        else
-            seeds = collect(Float64, seeds)
-            (!isempty(seeds) && all(f -> 0 <= f <= 1, seeds)) ||
-                error("`seeds` must be fractions in `[0, 1]`.")
-        end
-        new{K}(kernel, Float64(kappa), Float64(budget),
-            detect_uniform_M, lengthscales, Float64(jitter), seeds)
-    end
-end
+function GPSampler end
 
 """
     sample_M_values(sampler, objectives, sub, method, support_grids)

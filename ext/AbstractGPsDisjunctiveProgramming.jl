@@ -5,6 +5,46 @@ import AbstractGPs.KernelFunctions
 import DisjunctiveProgramming as DP
 
 ################################################################################
+#                               SAMPLER CONFIG
+################################################################################
+# The concrete sampler behind DP.GPSampler; the base package only
+# carries the function stub, so constructing one requires AbstractGPs.
+struct _GPSampler{F} <: DP.AbstractMBMSampler
+    f::F
+    std_dev_margin::Float64
+    frac_supports::Float64
+    detect_uniform_M::Bool
+    initial_supports::Union{Int, Vector{Float64}}
+
+    function _GPSampler(
+        f::F;
+        std_dev_margin::Real = 2.5,
+        frac_supports::Real = 0.25,
+        detect_uniform_M::Bool = true,
+        initial_supports = 4
+        ) where {F}
+        f isa Union{Nothing, AbstractGPs.GP} || error(
+            "`f` must be an `AbstractGPs.GP` prior, e.g. " *
+            "`GP(Matern52Kernel())`.")
+        std_dev_margin >= 0 || error("`std_dev_margin` must be nonnegative.")
+        0 < frac_supports <= 1 || error("`frac_supports` must be in `(0, 1]`.")
+        if initial_supports isa Int
+            initial_supports >= 2 ||
+                error("`initial_supports` must be at least 2.")
+        else
+            initial_supports = collect(Float64, initial_supports)
+            (!isempty(initial_supports) &&
+                all(frac -> 0 <= frac <= 1, initial_supports)) ||
+                error("`initial_supports` must be fractions in `[0, 1]`.")
+        end
+        new{F}(f, Float64(std_dev_margin), Float64(frac_supports),
+            detect_uniform_M, initial_supports)
+    end
+end
+
+DP.GPSampler(f = nothing; kwargs...) = _GPSampler(f; kwargs...)
+
+################################################################################
 #                                 GP FITTING
 ################################################################################
 # Normalized to [0, 1]^d so one lengthscale works across dimensions.
@@ -25,18 +65,26 @@ function _support_coords(grids::Tuple)::Vector{Vector{Float64}}
             for c in coords]
 end
 
-# Lengthscale selected by marginal likelihood over the candidates
+# Defaults behind GPSampler(): candidate lengthscales for the
+# marginal-likelihood fit (relative to the unit box) and the
+# observation-noise nugget.
+const _LENGTHSCALES = [0.05, 0.1, 0.2, 0.4, 0.8]
+const _JITTER = 1e-8
+
+# A user prior is used as given; the default squared exponential has
+# its lengthscale selected by marginal likelihood
 function _fit_posterior(
-    kernel::KernelFunctions.Kernel,
+    sampler::_GPSampler,
     X::Vector{Vector{Float64}},
-    y::Vector{Float64},
-    sampler::DP.GPSampler
+    y::Vector{Float64}
     )
+    sampler.f === nothing ||
+        return AbstractGPs.posterior(sampler.f(X, _JITTER), y)
     best_posterior, best_log_prob = nothing, -Inf
-    for lengthscale in sampler.lengthscales
-        scaled_kernel = KernelFunctions.with_lengthscale(
-            kernel, lengthscale)
-        finite_gp = AbstractGPs.GP(scaled_kernel)(X, sampler.jitter)
+    for lengthscale in _LENGTHSCALES
+        kernel = KernelFunctions.with_lengthscale(
+            KernelFunctions.SqExponentialKernel(), lengthscale)
+        finite_gp = AbstractGPs.GP(kernel)(X, _JITTER)
         log_prob = AbstractGPs.logpdf(finite_gp, y)
         if log_prob > best_log_prob
             best_posterior = AbstractGPs.posterior(finite_gp, y)
@@ -47,7 +95,7 @@ function _fit_posterior(
 end
 
 function _mean_sd(
-    sampler::DP.GPSampler,
+    sampler::_GPSampler,
     X::Vector{Vector{Float64}},
     solved::Dict{Int, Float64}
     )
@@ -57,10 +105,8 @@ function _mean_sd(
     # floored so near-equal solved values still cushion the filled ones
     y_scale = max(sqrt(sum(abs2, y .- y_mean) / max(length(y) - 1, 1)),
         1e-2 * abs(y_mean), 1e-8)
-    kernel = something(sampler.kernel,
-        KernelFunctions.SqExponentialKernel())
     posterior = _fit_posterior(
-        kernel, X[solved_indices], (y .- y_mean) ./ y_scale, sampler)
+        sampler, X[solved_indices], (y .- y_mean) ./ y_scale)
     posterior_mean = AbstractGPs.mean(posterior, X)
     posterior_var = max.(AbstractGPs.var(posterior, X), 0.0)
     return posterior_mean .* y_scale .+ y_mean,
@@ -72,7 +118,7 @@ end
 ################################################################################
 # Solve M at max-UCB selected supports, fill the rest with the bound
 function DP.sample_M_values(
-    sampler::DP.GPSampler,
+    sampler::_GPSampler,
     objectives::AbstractArray,
     sub::DP.GDPSubmodel,
     method::DP._MBM,
@@ -87,9 +133,10 @@ function DP.sample_M_values(
         solved[index] = M_val
         return true
     end
-    # an evenly spaced seed count, or user-given seed fractions
-    fractions = sampler.seeds isa Int ?
-        range(0, 1, length = sampler.seeds) : sampler.seeds
+    # an evenly spaced initial count, or user-given fractions
+    fractions = sampler.initial_supports isa Int ?
+        range(0, 1, length = sampler.initial_supports) :
+        sampler.initial_supports
     for index in unique(1 .+ round.(Int, fractions .* (n - 1)))
         solve_at(index) || return nothing
     end
@@ -98,11 +145,11 @@ function DP.sample_M_values(
         probes = collect(values(solved))
         all(==(first(probes)), probes) && return first(probes)
     end
-    budget = min(ceil(Int, sampler.budget * n), n)
+    solve_target = min(ceil(Int, sampler.frac_supports * n), n)
     X = _support_coords(support_grids)
-    while length(solved) < budget
+    while length(solved) < solve_target
         means, sds = _mean_sd(sampler, X, solved)
-        acquisition = means .+ sampler.kappa .* sds
+        acquisition = means .+ sampler.std_dev_margin .* sds
         for index in keys(solved)
             acquisition[index] = -Inf
         end
@@ -118,7 +165,7 @@ function DP.sample_M_values(
     means, sds = _mean_sd(sampler, X, solved)
     for (index, I) in enumerate(indices) # exact M values are nonnegative
         M_vals[I] = get(solved, index,
-            max(means[index] + sampler.kappa * sds[index], 0.0))
+            max(means[index] + sampler.std_dev_margin * sds[index], 0.0))
     end
     return M_vals
 end

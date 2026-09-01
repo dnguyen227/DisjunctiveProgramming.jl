@@ -7,35 +7,29 @@ struct _UnimplementedSampler <: DP.AbstractMBMSampler end
 function test_gp_sampler_kwargs()
     @test MBM(HiGHS.Optimizer).sampler === ExhaustiveSampler()
     sampler = GPSampler()
-    @test sampler.kernel === nothing
-    @test sampler.kappa == 2.5
-    @test sampler.budget == 0.25
+    @test sampler.f === nothing
+    @test sampler.std_dev_margin == 2.5
+    @test sampler.frac_supports == 0.25
     @test sampler.detect_uniform_M
-    @test sampler.lengthscales == [0.05, 0.1, 0.2, 0.4, 0.8]
-    @test sampler.jitter == 1e-8
-    @test sampler.seeds == 4
-    kern = SqExponentialKernel()
-    sampler = GPSampler(kern, kappa = 4.0, budget = 0.1,
-        detect_uniform_M = false, lengthscales = (0.1, 0.3),
-        jitter = 1e-6, seeds = [0.0, 0.3, 1.0])
-    @test sampler.kernel === kern
-    @test sampler.kappa == 4.0
-    @test sampler.budget == 0.1
+    @test sampler.initial_supports == 4
+    f = GP(Matern52Kernel())
+    sampler = GPSampler(f, std_dev_margin = 4.0, frac_supports = 0.1,
+        detect_uniform_M = false, initial_supports = [0.0, 0.3, 1.0])
+    @test sampler.f === f
+    @test sampler.std_dev_margin == 4.0
+    @test sampler.frac_supports == 0.1
     @test !sampler.detect_uniform_M
-    @test sampler.lengthscales == [0.1, 0.3]
-    @test sampler.jitter == 1e-6
-    @test sampler.seeds == [0.0, 0.3, 1.0]
-    @test GPSampler(seeds = 6).seeds == 6
+    @test sampler.initial_supports == [0.0, 0.3, 1.0]
+    @test GPSampler(initial_supports = 6).initial_supports == 6
     @test MBM(HiGHS.Optimizer, sampler = sampler).sampler === sampler
-    @test_throws ErrorException GPSampler(kappa = -1)
-    @test_throws ErrorException GPSampler(budget = 0)
-    @test_throws ErrorException GPSampler(budget = 1.5)
-    @test_throws ErrorException GPSampler(lengthscales = Float64[])
-    @test_throws ErrorException GPSampler(lengthscales = [-0.1])
-    @test_throws ErrorException GPSampler(jitter = -1)
-    @test_throws ErrorException GPSampler(seeds = 1)
-    @test_throws ErrorException GPSampler(seeds = [1.5])
-    @test_throws ErrorException GPSampler(seeds = Float64[])
+    # a bare kernel is not a prior
+    @test_throws ErrorException GPSampler(SqExponentialKernel())
+    @test_throws ErrorException GPSampler(std_dev_margin = -1)
+    @test_throws ErrorException GPSampler(frac_supports = 0)
+    @test_throws ErrorException GPSampler(frac_supports = 1.5)
+    @test_throws ErrorException GPSampler(initial_supports = 1)
+    @test_throws ErrorException GPSampler(initial_supports = [1.5])
+    @test_throws ErrorException GPSampler(initial_supports = Float64[])
 end
 
 # Mirror of test_raw_M_infinite_scalar: uniform seed M values collapse
@@ -57,7 +51,7 @@ function test_gp_raw_M_scalar()
     @test DP.raw_M(sub, obj, mbm) == 5.0
 end
 
-# With budget = 1.0 every support is solved exactly, so the GP
+# With frac_supports = 1.0 every support is solved exactly, so the GP
 # sampler must reproduce the exact grid parameter function
 function test_gp_raw_M_matches_exact()
     function pfunc_values(sampler, supports)
@@ -81,19 +75,20 @@ function test_gp_raw_M_matches_exact()
     end
     supports = [0.0, 0.25, 0.5, 0.75, 1.0]
     exact_vals = pfunc_values(ExhaustiveSampler(), supports)
-    # default kernel, user kernel, and pinned lengthscale all solve
-    # the same supports here, so the M values match exactly
-    @test pfunc_values(GPSampler(budget = 1.0), supports) ==
+    # the default prior, a user prior, and a pinned lengthscale all
+    # solve the same supports here, so the M values match exactly
+    @test pfunc_values(GPSampler(frac_supports = 1.0), supports) ==
         exact_vals
     @test pfunc_values(
-        GPSampler(SqExponentialKernel(), budget = 1.0), supports) ==
+        GPSampler(GP(Matern52Kernel()), frac_supports = 1.0), supports) ==
         exact_vals
-    @test pfunc_values(GPSampler(SqExponentialKernel(),
-        lengthscales = [0.2], budget = 1.0), supports) == exact_vals
+    @test pfunc_values(GPSampler(GP(with_lengthscale(
+        SqExponentialKernel(), 0.2)), frac_supports = 1.0), supports) ==
+        exact_vals
 end
 
 # Two independent parameters: the GP path builds 2-D coordinates and
-# fits a multivariate GP; with budget = 1.0 every support is solved
+# fits a multivariate GP; with frac_supports = 1.0 every support is solved
 # exactly, so the parameter function matches the exhaustive one. Setup
 # as in test_raw_M_infinite_two_params: M(t, s) = 10 - t - s.
 function test_gp_raw_M_two_params()
@@ -118,12 +113,12 @@ function test_gp_raw_M_two_params()
         return [raw_fn(t_val, s_val)
                 for t_val in [0.0, 0.5, 1.0], s_val in [0.0, 1.0]]
     end
-    @test pfunc_values(GPSampler(budget = 1.0)) ==
+    @test pfunc_values(GPSampler(frac_supports = 1.0)) ==
         pfunc_values(ExhaustiveSampler())
 end
 
 # Dependent parameters: the joint supports become the GP coordinates
-# directly; with budget = 1.0 every support is solved exactly, so the
+# directly; with frac_supports = 1.0 every support is solved exactly, so the
 # M values match the exhaustive ones. Setup as in
 # test_raw_M_infinite_dependent_varying: M(ξ) = 10 - ξ[1] - ξ[2].
 function test_gp_raw_M_dependent()
@@ -135,7 +130,7 @@ function test_gp_raw_M_dependent()
     @constraint(model, con2, x >= 0.5, Disjunct(Y[2]))
     @disjunction(model, Y)
     mbm = DP._MBM(
-        MBM(HiGHS.Optimizer, sampler = GPSampler(budget = 1.0)), model)
+        MBM(HiGHS.Optimizer, sampler = GPSampler(frac_supports = 1.0)), model)
     sub = DP.copy_model_with_constraints(
         model, DP.DisjunctConstraintRef[con2], mbm)
     obj = DP.prepare_max_M_objective(
@@ -193,7 +188,7 @@ function test_gp_mbm_solve_equivalence()
     end
     obj_exact = solve_with(ExhaustiveSampler())
     obj_gp = solve_with(GPSampler())
-    obj_tuned = solve_with(GPSampler(kappa = 4.0, budget = 0.2))
+    obj_tuned = solve_with(GPSampler(std_dev_margin = 4.0, frac_supports = 0.2))
     @test obj_exact ≈ 10.0 atol = 1e-4
     # over-M can't raise the optimum, under-M can only shave it a bit
     @test obj_gp <= obj_exact + 1e-6
@@ -227,13 +222,13 @@ function test_gp_periodic_M_seeds()
     end
     @test solve_with(ExhaustiveSampler()) ≈ 10.0 atol = 1e-6
     @test solve_with(GPSampler()) ≈ 10.0 atol = 1e-6
-    @test solve_with(GPSampler(seeds = 5)) ≈ 10.0 atol = 1e-6
-    @test solve_with(GPSampler(seeds = [0.0, 0.5, 1.0])) ≈
+    @test solve_with(GPSampler(initial_supports = 5)) ≈ 10.0 atol = 1e-6
+    @test solve_with(GPSampler(initial_supports = [0.0, 0.5, 1.0])) ≈
         9.0 atol = 1e-6
 end
 
 # With detection off the uniform M is not collapsed to a scalar: the
-# GP is fit and the unsolved supports keep their kappa * sd cushion,
+# GP is fit and the unsolved supports keep their std_dev_margin * sd cushion,
 # which must sit above the M that detection would have returned.
 function test_gp_detect_uniform_M_off()
     function raw_M_with(detect)
