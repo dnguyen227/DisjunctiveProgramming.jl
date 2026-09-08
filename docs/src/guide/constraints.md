@@ -1,58 +1,62 @@
+```@meta
+DocTestFilters = [r"≤|<=", r"≥|>=", r" == | = ", r" ∈ | in ",
+                  r"MathOptInterface|MOI"]
+```
+
 # [Disjunctions](@id constraints_guide)
 
-A guide for disjunct constraints and disjunctions. See the [API](@ref) for the
-technical details of each method.
+A guide for disjunct constraints and disjunctions. See the respective
+[technical manual](@ref constraints_manual) for more details.
 
 ## Overview
 
-A *disjunct constraint* is an ordinary algebraic constraint that is enforced only
-when its associated logical variable is true. A *disjunction* is a group of
+A *disjunct constraint* is an ordinary algebraic constraint that is enforced
+only when its associated logical variable is true. A *disjunction* is a group of
 logical variables among which exactly one may be selected, so that exactly one
 group of disjunct constraints is enforced.
 
-The two are declared separately. Constraints are tagged with the logical
-variable that governs them, and the disjunction is then declared over those
-logical variables. Nothing prevents a logical variable from carrying constraints
-without ever appearing in a disjunction, which is how conditional constraints
-that are not part of an either-or choice are expressed.
+We declare the two separately. First we tag constraints with the logical
+variable that governs them, then we declare the disjunction over those logical
+variables. Nothing stops a logical variable from carrying constraints without
+ever appearing in a disjunction, which is how we express a conditional
+constraint that is not part of an either-or choice.
 
 ## Basic Usage
 
 ### Disjunct Constraints
 
-A constraint becomes a disjunct constraint when a [`Disjunct`](@ref) tag naming
-its logical variable is passed to `@constraint`. Any constraint JuMP accepts may
-be tagged, including nonlinear and vector constraints:
+A constraint becomes a disjunct constraint when we pass a [`Disjunct`](@ref) tag
+naming its logical variable to `@constraint`. We can tag any constraint JuMP
+accepts, including nonlinear and vector constraints:
 
-```@example gdp_cons
-using DisjunctiveProgramming, HiGHS
+```jldoctest gdp_cons; setup = :(using DisjunctiveProgramming, HiGHS)
+julia> model = GDPModel(HiGHS.Optimizer);
 
-model = GDPModel(HiGHS.Optimizer)
-set_silent(model)
+julia> set_silent(model)
 
-@variable(model, 0 <= x[1:2] <= 10)
-@variable(model, Y[1:2], Logical)
+julia> @variable(model, 0 <= x[1:2] <= 10);
 
-@constraint(model, x[1] + x[2] <= 8, Disjunct(Y[1]))
-@constraint(model, x[1] - x[2] >= 2, Disjunct(Y[1]))
+julia> @variable(model, Y[1:2], Logical);
 
-@constraint(model, x[1] + 3 * x[2] <= 12, Disjunct(Y[2]))
-nothing # hide
+julia> @constraint(model, x[1] + x[2] <= 8, Disjunct(Y[1]));
+
+julia> @constraint(model, x[1] - x[2] >= 2, Disjunct(Y[1]));
+
+julia> @constraint(model, x[1] + 3 * x[2] <= 12, Disjunct(Y[2]));
 ```
 
-The tag is the last argument, after the constraint expression. Named and
-containerized constraints follow JuMP's usual syntax, with the name or index
-expression preceding the constraint:
+The tag comes last, after the constraint expression. Named and containerized
+constraints follow JuMP's usual syntax, with the name or index expression
+preceding the constraint:
 
-```@example gdp_cons
-@constraint(model, capacity[i = 1:2], x[i] <= 6, Disjunct(Y[1]))
-nothing # hide
+```jldoctest gdp_cons
+julia> @constraint(model, capacity[i = 1:2], x[i] <= 6, Disjunct(Y[1]));
 ```
 
 !!! note
-    A quadratic or otherwise nonlinear disjunct constraint is supported by
-    [`BigM`](@ref) and [`Hull`](@ref), but the resulting program is only as
-    tractable as the underlying solver makes it. `Hull` additionally requires a
+    [`BigM`](@ref) and [`Hull`](@ref) both support a quadratic or otherwise
+    nonlinear disjunct constraint, but the resulting program is only as
+    tractable as the underlying solver makes it. `Hull` additionally needs a
     perspective reformulation for nonlinear terms, controlled by its epsilon
     parameter.
 
@@ -61,116 +65,165 @@ nothing # hide
 [`@disjunction`](@ref) takes a vector of logical variables. Passing a container
 directly is equivalent to passing its elements:
 
-```@example gdp_cons
-@disjunction(model, Y)
-nothing # hide
+```jldoctest gdp_cons
+julia> @disjunction(model, Y);
 ```
 
-A disjunction may be named, in which case it is registered on the model and can
-be retrieved later:
+We can name a disjunction, in which case it is registered on the model and we
+can retrieve it later:
 
-```@example gdp_cons
-named = GDPModel()
-@variable(named, 0 <= z <= 10)
-@variable(named, W[1:2], Logical)
-@constraint(named, z <= 3, Disjunct(W[1]))
-@constraint(named, z >= 7, Disjunct(W[2]))
+```jldoctest gdp_cons
+julia> named = GDPModel();
 
-@disjunction(named, choice, W)
-named[:choice]
+julia> @variable(named, 0 <= z <= 10);
+
+julia> @variable(named, W[1:2], Logical);
+
+julia> @constraint(named, z <= 3, Disjunct(W[1]));
+
+julia> @constraint(named, z >= 7, Disjunct(W[2]));
+
+julia> @disjunction(named, choice, W);
+
+julia> named[:choice]
+choice : [W[1] --> {z <= 3}] or [W[2] --> {z >= 7}]
 ```
 
 The function form [`disjunction`](@ref) does the same without a macro, which is
-convenient when disjunctions are built programmatically:
+convenient when we build disjunctions programmatically:
 
-```@example gdp_cons
-programmatic = GDPModel()
-@variable(programmatic, 0 <= w <= 10)
-@variable(programmatic, V[1:2], Logical)
-@constraint(programmatic, w <= 3, Disjunct(V[1]))
-@constraint(programmatic, w >= 7, Disjunct(V[2]))
+```jldoctest gdp_cons
+julia> programmatic = GDPModel();
 
-disjunction(programmatic, V)
-nothing # hide
+julia> @variable(programmatic, 0 <= w <= 10);
+
+julia> @variable(programmatic, V[1:2], Logical);
+
+julia> @constraint(programmatic, w <= 3, Disjunct(V[1]));
+
+julia> @constraint(programmatic, w >= 7, Disjunct(V[2]));
+
+julia> disjunction(programmatic, V);
 ```
 
-Several disjunctions may be declared in one block with
-[`@disjunctions`](@ref):
+We can declare several disjunctions in one block with [`@disjunctions`](@ref):
 
-```@example gdp_cons
-several = GDPModel()
-@variable(several, 0 <= v <= 10)
-@variable(several, Z[1:2, 1:2], Logical)
-for i in 1:2, j in 1:2
-    @constraint(several, v <= i + j, Disjunct(Z[i, j]))
-end
+```jldoctest gdp_cons
+julia> several = GDPModel();
 
-@disjunctions(several, begin
-    Z[1, :]
-    Z[2, :]
-end)
-nothing # hide
+julia> @variable(several, 0 <= v <= 10);
+
+julia> @variable(several, Z[1:2, 1:2], Logical);
+
+julia> for i in 1:2, j in 1:2
+           @constraint(several, v <= i + j, Disjunct(Z[i, j]))
+       end
+
+julia> @disjunctions(several, begin
+           Z[1, :]
+           Z[2, :]
+       end);
 ```
 
 ### Exclusivity
 
 By default a disjunction adds a constraint requiring that exactly one of its
-disjuncts be selected. The `exactly1` keyword relaxes this, permitting any
-number of disjuncts to be active, which is occasionally wanted when the
+disjuncts be selected. The `exactly1` keyword relaxes this and permits any
+number of disjuncts to be active, which we occasionally want when the
 disjunction encodes a set of independently available options:
 
-```@example gdp_cons
-relaxed = GDPModel()
-@variable(relaxed, 0 <= u <= 10)
-@variable(relaxed, R[1:2], Logical)
-@constraint(relaxed, u <= 3, Disjunct(R[1]))
-@constraint(relaxed, u <= 7, Disjunct(R[2]))
+```jldoctest gdp_cons
+julia> relaxed = GDPModel();
 
-@disjunction(relaxed, R, exactly1 = false)
-nothing # hide
+julia> @variable(relaxed, 0 <= u <= 10);
+
+julia> @variable(relaxed, R[1:2], Logical);
+
+julia> @constraint(relaxed, u <= 3, Disjunct(R[1]));
+
+julia> @constraint(relaxed, u <= 7, Disjunct(R[2]));
+
+julia> @disjunction(relaxed, R, exactly1 = false);
 ```
 
 !!! warning
     Some reformulations rely on the exclusivity constraint for correctness or
-    for tightness. Setting `exactly1 = false` is appropriate only when the
-    modeling intent genuinely permits several disjuncts at once.
+    for tightness. Set `exactly1 = false` only when the modeling intent
+    genuinely permits several disjuncts at once.
+
+### Empty Disjuncts
+
+A disjunct need not carry any constraints. An empty disjunct represents the
+alternative of imposing nothing beyond the global constraints, which is how we
+model an optional requirement. Here the second disjunct is empty, so selecting
+it leaves `x` bounded only by its global bounds:
+
+```jldoctest gdp_cons
+julia> optional = GDPModel(HiGHS.Optimizer);
+
+julia> set_silent(optional)
+
+julia> @variable(optional, 0 <= q <= 10);
+
+julia> @variable(optional, O[1:2], Logical);
+
+julia> @constraint(optional, q <= 3, Disjunct(O[1]));
+
+julia> @disjunction(optional, O);
+
+julia> @objective(optional, Max, q);
+
+julia> optimize!(optional, gdp_method = BigM())
+
+julia> objective_value(optional)
+10.0
+```
 
 ## Nested Disjunctions
 
-A disjunction may itself sit inside a disjunct, giving a hierarchy of decisions.
-This is done by passing a `Disjunct` tag to `@disjunction`, exactly as for a
-constraint. The inner disjunction is then enforced only when the outer disjunct
-is selected:
+A disjunction can itself sit inside a disjunct, giving us a hierarchy of
+decisions. We do this by passing a `Disjunct` tag to `@disjunction`, exactly as
+we would for a constraint. The inner disjunction is then enforced only when the
+outer disjunct is selected:
 
-```@example gdp_cons
-nested = GDPModel(HiGHS.Optimizer)
-set_silent(nested)
+```jldoctest gdp_cons
+julia> nested = GDPModel(HiGHS.Optimizer);
 
-@variable(nested, 0 <= capacity <= 500)
-@variable(nested, build, Logical)
-@variable(nested, outsource, Logical, logical_complement = build)
-@variable(nested, size_choice[1:2], Logical)
+julia> set_silent(nested)
 
-@constraint(nested, capacity <= 100, Disjunct(size_choice[1]))
-@constraint(nested, capacity <= 500, Disjunct(size_choice[2]))
-@constraint(nested, capacity <= 50, Disjunct(outsource))
+julia> @variable(nested, 0 <= capacity <= 500);
 
-@disjunction(nested, inner, size_choice, Disjunct(build))
-@disjunction(nested, [build, outsource])
+julia> @variable(nested, build, Logical);
 
-@objective(nested, Max, capacity)
-optimize!(nested, gdp_method = BigM())
+julia> @variable(nested, outsource, Logical, logical_complement = build);
 
-value(build), value(capacity)
+julia> @variable(nested, size_choice[1:2], Logical);
+
+julia> @constraint(nested, capacity <= 100, Disjunct(size_choice[1]));
+
+julia> @constraint(nested, capacity <= 500, Disjunct(size_choice[2]));
+
+julia> @constraint(nested, capacity <= 50, Disjunct(outsource));
+
+julia> @disjunction(nested, inner, size_choice, Disjunct(build));
+
+julia> @disjunction(nested, [build, outsource]);
+
+julia> @objective(nested, Max, capacity);
+
+julia> optimize!(nested, gdp_method = BigM())
+
+julia> value(build), value(capacity)
+(true, 500.0)
 ```
 
-Note that the inner disjunction is declared before the outer one. The logical
+Notice that we declare the inner disjunction before the outer one. The logical
 variables of the inner disjunction carry constraints of their own, and the outer
 disjunction governs whether that whole sub-decision is active.
 
-## Next Steps
-
-- [Logical Constraints](@ref logic_guide) covers requirements relating logical
-  variables directly.
-- [Solution Methods](@ref methods_guide) covers how disjunctions become
-  mixed-integer constraints.
+The exclusivity constraint added for a nested disjunction is conditional on its
+parent rather than absolute. For an inner disjunction over `W` sitting inside
+disjunct `P[1]`, the constraint added is equivalent to `W in Exactly(P[1])`.
+Exactly one variable in `W` is true when `P[1]` is true, and every variable in
+`W` is false when `P[1]` is false, meaning the parent disjunct was not selected
+and its sub-decision does not arise.

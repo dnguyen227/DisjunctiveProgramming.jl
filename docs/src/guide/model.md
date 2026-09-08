@@ -1,170 +1,170 @@
+```@meta
+DocTestFilters = [r"≤|<=", r"≥|>=", r" == | = ", r" ∈ | in ",
+                  r"MathOptInterface|MOI"]
+```
+
 # [GDP Models](@id model_guide)
 
-A guide for creating and working with generalized disjunctive programming
-models. See the [API](@ref) for the technical details of each method.
+A guide for creating and working with generalized disjunctive
+programming models. See the respective [technical manual](@ref model_manual)
+for more details.
 
 ## Overview
 
-Generalized disjunctive programming (GDP) expresses a discrete decision as a
-choice between alternative sets of constraints rather than as an algebraic
-relationship between binary variables. Each alternative is called a *disjunct*,
-a group of mutually exclusive disjuncts is a *disjunction*, and a Boolean
-*logical variable* records which disjunct is selected. Writing a model this way
-keeps the modeling layer close to the way the problem is actually described, and
-it defers the choice of algebraic encoding to solution time.
+Generalized disjunctive programming (GDP) lets us express a discrete decision as
+a choice between alternative sets of constraints, rather than as an algebraic
+relationship between binary variables. Each alternative is a *disjunct*, a group
+of mutually exclusive disjuncts is a *disjunction*, and a Boolean *logical
+variable* records which disjunct is selected. Modeling this way keeps our
+formulation close to the way we would describe the problem in words, and it
+defers the choice of algebraic encoding until we solve.
 
-A [`GDPModel`](@ref) is a JuMP model that carries the extra bookkeeping needed to
-support this. It holds ordinary JuMP variables and constraints exactly as a
-`Model` does, and adds storage for logical variables, disjunct constraints,
-disjunctions, and logical constraints. None of that structure is passed to a
-solver directly. Instead, calling `optimize!` first *reformulates* the model into
-an equivalent mixed-integer program using a method of your choosing, and then
-solves that program. The reformulation is described in
-[Solution Methods](@ref methods_guide).
+A [`GDPModel`](@ref) is a JuMP model that carries the extra bookkeeping we need
+for this. It holds ordinary JuMP variables and constraints exactly as a `Model`
+does, and adds storage for logical variables, disjunct constraints, disjunctions,
+and logical constraints. None of that structure goes to a solver directly.
+Instead, `optimize!` first *reformulates* the model into an equivalent
+mixed-integer program using a method we choose, and then solves it. We cover the
+methods in [Solution Methods](@ref methods_guide).
 
 ## Basic Usage
 
-A GDP model is created with [`GDPModel`](@ref), which accepts the same arguments
-as JuMP's `Model`:
+Let's create a GDP model with [`GDPModel`](@ref), which accepts the same
+arguments as JuMP's `Model`:
 
-```@example gdp_model
-using DisjunctiveProgramming, HiGHS
+```jldoctest gdp_model; setup = :(using DisjunctiveProgramming, HiGHS)
+julia> model = GDPModel(HiGHS.Optimizer);
 
-model = GDPModel(HiGHS.Optimizer)
-set_silent(model)
+julia> set_silent(model)
 ```
 
-Ordinary variables and constraints are added with the usual JuMP macros. Logical
-variables use the [`Logical`](@ref) variable type, and a constraint is assigned
-to a disjunct by tagging it with [`Disjunct`](@ref):
+Now we add ordinary variables and constraints with the usual JuMP macros.
+Logical variables use the [`Logical`](@ref) variable type, and we assign a
+constraint to a disjunct by tagging it with [`Disjunct`](@ref):
 
-```@example gdp_model
-@variable(model, 0 <= production <= 20)
-@variable(model, 0 <= cost <= 100)
-@variable(model, Y[1:2], Logical)
+```jldoctest gdp_model
+julia> @variable(model, 0 <= production <= 20);
 
-@constraint(model, production <= 12, Disjunct(Y[1]))
-@constraint(model, cost >= 5 + 2 * production, Disjunct(Y[1]))
+julia> @variable(model, 0 <= cost <= 100);
 
-@constraint(model, production <= 20, Disjunct(Y[2]))
-@constraint(model, cost >= 12 + production, Disjunct(Y[2]))
+julia> @variable(model, Y[1:2], Logical);
 
-@disjunction(model, Y)
-nothing # hide
+julia> @constraint(model, production <= 12, Disjunct(Y[1]));
+
+julia> @constraint(model, cost >= 5 + 2 * production, Disjunct(Y[1]));
+
+julia> @constraint(model, production <= 20, Disjunct(Y[2]));
+
+julia> @constraint(model, cost >= 12 + production, Disjunct(Y[2]));
+
+julia> @disjunction(model, Y);
 ```
 
-Constraints that hold no matter which disjunct is chosen are added without a
+Constraints that hold no matter which disjunct we choose are added without a
 `Disjunct` tag, in the normal way:
 
-```@example gdp_model
-@constraint(model, demand, production >= 10)
-@objective(model, Min, cost)
-nothing # hide
+```jldoctest gdp_model
+julia> @constraint(model, demand, production >= 10);
+
+julia> @objective(model, Min, cost);
 ```
 
-Solving requires choosing a reformulation. The `gdp_method` keyword of
-`optimize!` selects one, and defaults to [`BigM`](@ref):
+To solve, we choose a reformulation. The `gdp_method` keyword of `optimize!`
+selects one, and defaults to [`BigM`](@ref):
 
-```@example gdp_model
-optimize!(model, gdp_method = BigM())
+```jldoctest gdp_model
+julia> optimize!(model, gdp_method = BigM())
 
-println("cost       = ", objective_value(model))
-println("production = ", value(production))
-println("process 1  = ", value(Y[1]))
-println("process 2  = ", value(Y[2]))
+julia> objective_value(model)
+22.0
+
+julia> value(production)
+10.0
 ```
 
-Note that `value` applied to a logical variable returns a `Bool`, not a
-floating-point number, so the selected disjunct can be read off directly.
+Note that `value` applied to a logical variable gives us a `Bool`, not a
+floating-point number, so we can read the selected disjunct off directly:
+
+```jldoctest gdp_model
+julia> value(Y[1]), value(Y[2])
+(false, true)
+```
 
 !!! note
-    An optimizer is required for every reformulation, and some methods need one
-    to solve auxiliary subproblems as well. [`MBM`](@ref) and
-    [`CuttingPlanes`](@ref) both take an optimizer as their first argument for
-    exactly this reason.
+    Every reformulation needs an optimizer, and some need one to solve auxiliary
+    subproblems as well. [`MBM`](@ref) and [`CuttingPlanes`](@ref) both take an
+    optimizer as their first argument for exactly this reason.
 
 ## How a GDP Model is Stored
 
 A `GDPModel` is a JuMP `Model` with a [`GDPData`](@ref) object attached to its
 extension dictionary. That object records the logical variables, the disjunct
 constraints grouped by their indicator, the disjunctions, and the logical
-constraints, together with the mappings produced during reformulation. The
-mappings are what allow a solved model to be queried in terms of the original
-logical variables rather than the binary variables that replaced them.
+constraints, along with the mappings produced during reformulation. Those
+mappings are what let us query a solved model in terms of the original logical
+variables rather than the binary variables that replaced them.
 
-Because reformulation adds variables and constraints to the same model object,
-it is performed at most once for a given method. The model records which method
-was applied and whether it is still current, and repeating an `optimize!` call
-with the same method reuses the existing reformulation instead of rebuilding it.
-Changing the method, or adding new disjunctive structure, marks the model as
-needing to be reformulated again.
+Reformulation adds variables and constraints to the same model object, so it
+runs at most once for a given method. The model records which method was applied
+and whether it is still current, and repeating an `optimize!` call with the same
+method reuses the existing reformulation instead of rebuilding it.
 
-!!! warning
-    Reformulation mutates the model in place. If you need the original GDP
-    structure preserved for a later experiment, build the model inside a
-    function so it can be constructed fresh for each method, rather than
-    reformulating one model repeatedly.
+!!! note
+    Reformulation mutates the model in place, but it is not cumulative. Passing
+    a different method to a later `optimize!` call discards the previous
+    reformulation and rebuilds from the original GDP structure, so we can solve
+    one model with several methods in turn and compare them directly.
 
 ## Queries
 
-The data attached to a model is reached with [`gdp_data`](@ref), and
-[`is_gdp_model`](@ref) reports whether a given JuMP model carries it:
+We reach the attached data with [`gdp_data`](@ref), and [`is_gdp_model`](@ref)
+tells us whether a given JuMP model carries it:
 
-```@example gdp_model
-is_gdp_model(model)
+```jldoctest gdp_model
+julia> is_gdp_model(model)
+true
 ```
 
-```@example gdp_model
-gdp_data(model) isa DisjunctiveProgramming.GDPData
-```
+Since the model is an ordinary mixed-integer program after reformulation, all
+the standard JuMP result queries apply unchanged:
 
-All the standard JuMP result queries apply unchanged, since after reformulation
-the model is an ordinary mixed-integer program:
-
-```@example gdp_model
-termination_status(model)
+```jldoctest gdp_model
+julia> termination_status(model)
+OPTIMAL::TerminationStatusCode = 1
 ```
 
 ## Modification
 
-A model can be reformulated explicitly, without solving, using
-[`reformulate_model`](@ref). This is useful for inspecting the mixed-integer
-program that a given method produces:
+We can reformulate explicitly, without solving, using
+[`reformulate_model`](@ref). This is how we inspect the mixed-integer program a
+method produces:
 
-```@example gdp_model
-inspection = GDPModel()
-@variable(inspection, 0 <= x <= 20)
-@variable(inspection, W[1:2], Logical)
-@constraint(inspection, x <= 5, Disjunct(W[1]))
-@constraint(inspection, x >= 15, Disjunct(W[2]))
-@disjunction(inspection, W)
+```jldoctest gdp_model
+julia> inspection = GDPModel();
 
-reformulate_model(inspection, BigM())
-print(inspection)
+julia> @variable(inspection, 0 <= x <= 20);
+
+julia> @variable(inspection, W[1:2], Logical);
+
+julia> @constraint(inspection, x <= 5, Disjunct(W[1]));
+
+julia> @constraint(inspection, x >= 15, Disjunct(W[2]));
+
+julia> @disjunction(inspection, W);
+
+julia> reformulate_model(inspection, BigM())
+
+julia> num_variables(inspection)
+3
 ```
 
-The same model reformulated with [`Hull`](@ref) produces a larger but tighter
+Reformulating the same model with [`Hull`](@ref) gives a larger but tighter
 program, because each variable appearing in a disjunct is disaggregated into one
 copy per disjunct:
 
-```@example gdp_model
-comparison = GDPModel()
-@variable(comparison, 0 <= x <= 20)
-@variable(comparison, W[1:2], Logical)
-@constraint(comparison, x <= 5, Disjunct(W[1]))
-@constraint(comparison, x >= 15, Disjunct(W[2]))
-@disjunction(comparison, W)
+```jldoctest gdp_model
+julia> reformulate_model(inspection, Hull())
 
-reformulate_model(comparison, Hull())
-num_variables(comparison), num_variables(inspection)
+julia> num_variables(inspection)
+5
 ```
-
-## Next Steps
-
-- [Logical Variables](@ref variables_guide) covers Boolean decisions and their
-  properties.
-- [Logical Constraints](@ref logic_guide) covers propositions and cardinality
-  requirements over those decisions.
-- [Disjunctions](@ref constraints_guide) covers disjunct constraints, nesting,
-  and disjunction construction.
-- [Solution Methods](@ref methods_guide) covers each reformulation in detail.
