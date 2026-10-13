@@ -364,11 +364,11 @@ function test_logical_value()
     @test eltype(val) == Bool
 end
 
-# raw_M against an InfiniteModel where M is constant across supports.
+# compute_M against an InfiniteModel where M is constant across supports.
 # Setup: x(t) ∈ [0, 10], disj1: x ≥ 5, disj2: x ≤ 3.
 # For disj1 slack r(x) = 5 - x maximized over disj2's region x ∈ [0, 3]:
 # max(5 - x) = 5 at x = 0. Same at every support ⇒ scalar M = 5.
-function test_raw_M_infinite_scalar()
+function test_compute_M_infinite_scalar()
     model = InfiniteGDPModel()
     @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
     @variable(model, 0 <= x <= 10, Infinite(t))
@@ -382,14 +382,14 @@ function test_raw_M_infinite_scalar()
     obj = DP.prepare_max_M_objective(
         model, JuMP.constraint_object(con), sub)
     @test length(InfiniteOpt.parameter_refs(obj)) == 1
-    @test DP.raw_M(sub, obj, mbm) == 5.0
+    @test DP.compute_M(sub, obj, mbm) == 5.0
 end
 
-# raw_M with a support-varying M. Setup: x(t) ∈ [0, 10], disj1: x ≤ 2t,
+# compute_M with a support-varying M. Setup: x(t) ∈ [0, 10], disj1: x ≤ 2t,
 # disj2: x ≥ 0.5. Slack r(x) = x - 2t maximized over x ∈ [0.5, 10]:
-# max(x - 2t) = 10 - 2t. Varies with t ⇒ raw_M returns a pfunc whose
+# max(x - 2t) = 10 - 2t. Varies with t ⇒ compute_M returns a pfunc whose
 # raw values at supports are max-of-cell upper bounds for 10 - 2t.
-function test_raw_M_infinite_param_function()
+function test_compute_M_infinite_param_function()
     model = InfiniteGDPModel()
     supports = [0.0, 0.25, 0.5, 0.75, 1.0]
     @infinite_parameter(model, t ∈ [0, 1], supports = supports)
@@ -404,13 +404,89 @@ function test_raw_M_infinite_param_function()
         model, DP.DisjunctConstraintRef[con2], mbm)
     obj = DP.prepare_max_M_objective(
         model, JuMP.constraint_object(con), sub)
-    M = DP.raw_M(sub, obj, mbm)
+    M = DP.compute_M(sub, obj, mbm)
     @test M isa InfiniteOpt.GeneralVariableRef
     raw_fn = InfiniteOpt.raw_function(M)
     # max-of-corners is conservative: raw_fn(t) ≥ 10 - 2t at supports.
     for t_val in supports
         @test raw_fn(t_val) >= 10.0 - 2*t_val - 1e-6
     end
+end
+
+# compute_M over two infinite parameters with different support counts.
+# Transcription orders the objective dimensions by parameter group,
+# which need not be the ascending order of the grids, so the M values
+# must be permuted to line up. Setup: x(t, s) in [0, 10],
+# disj1: x <= t + s, disj2: x >= 0.5. Slack r(x) = x - t - s
+# maximized over x in [0.5, 10]: 10 - t - s.
+function test_compute_M_infinite_two_params()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, t ∈ [0, 1], supports = [0.0, 0.5, 1.0])
+    @infinite_parameter(model, s ∈ [0, 1], supports = [0.0, 1.0])
+    @variable(model, 0 <= x <= 10, Infinite(t, s))
+    @variable(model, Y[1:2], InfiniteLogical(t, s))
+    @constraint(model, con, x <= t + s, Disjunct(Y[1]))
+    @constraint(model, con2, x >= 0.5, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    mbm = DP._MBM(MBM(HiGHS.Optimizer), model)
+    sub = DP.copy_model_with_constraints(
+        model, DP.DisjunctConstraintRef[con2], mbm)
+    obj = DP.prepare_max_M_objective(
+        model, JuMP.constraint_object(con), sub)
+    M = DP.compute_M(sub, obj, mbm)
+    @test M isa InfiniteOpt.GeneralVariableRef
+    raw_fn = InfiniteOpt.raw_function(M)
+    for t_val in [0.0, 0.5, 1.0], s_val in [0.0, 1.0]
+        @test raw_fn(t_val, s_val) >= 10.0 - t_val - s_val - 1e-6
+    end
+end
+
+# Dependent parameters with a uniform M short-circuit to a scalar
+# before any support grid is needed. Setup as in
+# test_compute_M_infinite_scalar, over a dependent parameter array.
+function test_compute_M_infinite_dependent_params()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, ξ[1:2] ∈ [0, 1], num_supports = 4)
+    @variable(model, 0 <= x <= 10, Infinite(ξ))
+    @variable(model, Y[1:2], InfiniteLogical(ξ))
+    @constraint(model, con, x >= 5, Disjunct(Y[1]))
+    @constraint(model, con2, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    mbm = DP._MBM(MBM(HiGHS.Optimizer), model)
+    sub = DP.copy_model_with_constraints(
+        model, DP.DisjunctConstraintRef[con2], mbm)
+    obj = DP.prepare_max_M_objective(
+        model, JuMP.constraint_object(con), sub)
+    @test DP.compute_M(sub, obj, mbm) == 5.0
+end
+
+# Dependent parameters with M varying over the joint supports: the
+# parameter function looks M up at each joint support and falls back
+# to the conservative max off-support. Setup: x(ξ) in [0, 10],
+# disj1: x <= ξ[1] + ξ[2], disj2: x >= 0.5, so M(ξ) = 10 - ξ1 - ξ2.
+function test_compute_M_infinite_dependent_varying()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, ξ[1:2] ∈ [0, 1], num_supports = 4)
+    @variable(model, 0 <= x <= 10, Infinite(ξ))
+    @variable(model, Y[1:2], InfiniteLogical(ξ))
+    @constraint(model, con, x <= ξ[1] + ξ[2], Disjunct(Y[1]))
+    @constraint(model, con2, x >= 0.5, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    mbm = DP._MBM(MBM(HiGHS.Optimizer), model)
+    sub = DP.copy_model_with_constraints(
+        model, DP.DisjunctConstraintRef[con2], mbm)
+    obj = DP.prepare_max_M_objective(
+        model, JuMP.constraint_object(con), sub)
+    M = DP.compute_M(sub, obj, mbm)
+    @test M isa InfiniteOpt.GeneralVariableRef
+    raw_fn = InfiniteOpt.raw_function(M)
+    S = InfiniteOpt.supports(ξ)
+    expected = [10.0 - S[1, j] - S[2, j] for j in axes(S, 2)]
+    for j in axes(S, 2)
+        @test raw_fn(S[:, j]) ≈ expected[j] atol = 1e-6
+    end
+    # off-support queries fall back to the maximum over all supports
+    @test raw_fn([0.1234, 0.5678]) ≈ maximum(expected) atol = 1e-6
 end
 
 # Piecewise-constant max-of-corners: returns the maximum value over
@@ -461,7 +537,8 @@ function test_extract_solution_infinite()
     set_optimizer(model, HiGHS.Optimizer)
     set_silent(model)
     optimize!(model, ignore_optimize_hook = true)
-    sol = DP.extract_solution(model)
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    sol = DP.extract_solution(model, reform_state)
     @test haskey(sol, x)
     @test length(sol[x]) == K
     @test all(v -> isapprox(v, 0.0; atol=1e-6), sol[x])
@@ -486,13 +563,88 @@ function test_add_cut_infinite()
         count_variable_in_set_constraints = false)
     rBM_sol = Dict(x => [1.0, 2.0, 3.0])
     sep_sol = Dict(x => [0.5, 1.5, 2.5])
-    DP.add_cut(model, [x], rBM_sol, sep_sol)
+    # add_cut reads the decision variables and weights from the CP
+    # working state; restrict both to x for this isolated call
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    reform_state.decision_vars = [x]
+    reform_state.weights[x] = ones(3)
+    DP.add_cut(model, reform_state, rBM_sol, sep_sol)
     n_after = JuMP.num_constraints(transcribed;
         count_variable_in_set_constraints = false)
     @test n_after == n_before + 1
     # set_transformation_backend_ready(true) — next optimize! should
     # reuse without re-transcribing (otherwise our cut would be lost)
     @test InfiniteOpt.transformation_backend_ready(model)
+end
+
+# compute_M on a finite disjunct constraint: no supports to sample, one
+# M subproblem. Slack r(d) = 5 - d maximized over d <= 3 gives 5.
+function test_compute_M_infinite_finite_constraint()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, 0 <= d <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, con, d >= 5, Disjunct(Y[1]))
+    @constraint(model, con2, d <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    mbm = DP._MBM(MBM(HiGHS.Optimizer), model)
+    sub = DP.copy_model_with_constraints(
+        model, DP.DisjunctConstraintRef[con2], mbm)
+    obj = DP.prepare_max_M_objective(
+        model, JuMP.constraint_object(con), sub)
+    @test isempty(InfiniteOpt.parameter_refs(obj))
+    @test DP.compute_M(sub, obj, mbm) == 5.0
+end
+
+# MBM with a disjunction made only of finite constraints in an
+# InfiniteModel: d = 3 and x = 1 - t, objective 3 + 1/2.
+function test_mbm_finite_disjunction()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 11)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, 0 <= d <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x >= 1 - t)
+    @constraint(model, d >= 3, Disjunct(Y[1]))
+    @constraint(model, d >= 5, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, d + ∫(x, t))
+    @test optimize!(model, gdp_method = MBM(HiGHS.Optimizer)) isa Nothing
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 3.5 atol = 1e-6
+    @test value(Y[1])
+    # d >= 5 relaxed by M = 5 - 3 when Y[1] holds
+    ref_cons = constraint_object.(DP._reformulation_constraints(model))
+    @test ref_cons[2].func == d + 2 * binary_variable(Y[1])
+    @test ref_cons[2].set == MOI.GreaterThan(5.0)
+end
+
+# MBM with finite and infinite constraints in the same disjunct:
+# d = 1 with x = 1 - t <= 2d, objective 1 + 1/2.
+function test_mbm_mixed_finite_disjunct()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 11)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, 0 <= d <= 10)
+    @variable(model, Y[1:2], Logical)
+    @constraint(model, x >= 1 - t)
+    @constraint(model, x <= d, Disjunct(Y[1]))
+    @constraint(model, d >= 3, Disjunct(Y[1]))
+    @constraint(model, x <= 2d, Disjunct(Y[2]))
+    @constraint(model, d >= 1, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, d + ∫(x, t))
+    @test optimize!(model, gdp_method = MBM(HiGHS.Optimizer)) isa Nothing
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 1.5 atol = 1e-6
+    @test value(Y[2])
+    # d >= 3 relaxed by M = 3 - 1 when Y[2] holds
+    ref_cons = constraint_object.(DP._reformulation_constraints(model))
+    @test ref_cons[2].func == d + 2 * binary_variable(Y[2])
+    @test ref_cons[2].set == MOI.GreaterThan(3.0)
 end
 
 # MBM with finite + integer variables in an InfiniteModel.
@@ -673,6 +825,79 @@ function test_mbm_with_derivatives()
          MOI.ALMOST_LOCALLY_SOLVED]
 end
 
+# evaluate_at_zero on each kind of InfiniteOpt reference
+function test_evaluate_at_zero_infinite()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 3)
+    @variable(model, x, Infinite(t))
+    @variable(model, z)
+    @finite_parameter(model, p == 2.0)
+    @parameter_function(model, pf == t -> 2 * t)
+    @test evaluate_at_zero(x) === 0.0
+    @test evaluate_at_zero(z) === 0.0
+    @test evaluate_at_zero(deriv(x, t)) === 0.0
+    @test evaluate_at_zero(x(0.5)) === 0.0
+    @test evaluate_at_zero(p) === 2.0
+    @test evaluate_at_zero(exp(x) - 1 + p * z) === 0.0
+    @test evaluate_at_zero(log(x + p) * (z + 1)) ≈ log(2.0)
+    @test evaluate_at_zero(t) === t
+    @test evaluate_at_zero(pf) === pf
+    f0 = evaluate_at_zero(exp(x) - t)
+    @test f0 isa JuMP.GenericNonlinearExpr && parameter_refs(f0) == (t,)
+    @test_throws ErrorException evaluate_at_zero(∫(x, t))
+end
+
+# Hull on a non-quadratic nonlinear disjunct constraint of an infinite
+# variable: the perspective constant f(0) is evaluated without a
+# JuMP.value method for GeneralVariableRef. Optimum x = 0 in disjunct 1.
+function test_hull_infinite_nonlinear()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, exp(x) - 1 <= 2, Disjunct(Y[1]))
+    @constraint(model, x >= 5, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, ∫(x, t))
+    @test DP.reformulate_model(model, Hull()) isa Nothing
+    juniper = JuMP.optimizer_with_attributes(
+        Juniper.Optimizer,
+        "nl_solver" => JuMP.optimizer_with_attributes(
+            Ipopt.Optimizer, "print_level" => 0),
+        "log_levels" => Symbol[])
+    set_optimizer(model, juniper)
+    @test optimize!(model, gdp_method = Hull()) isa Nothing
+    @test termination_status(model) in
+        [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
+    @test objective_value(model) ≈ 0.0 atol = 1e-4
+    @test all(value(Y[1]))
+end
+
+# Hull on a nonlinear disjunct constraint that depends on the infinite
+# parameter: f(0) = -t is an expression, substituted per support by the
+# transcription. Only disjunct 1 is feasible, so x(t) = log(1 + t).
+function test_hull_infinite_nonlinear_parameter()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, exp(x) - 1 <= t, Disjunct(Y[1]))
+    @constraint(model, x <= -1, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, ∫(x, t))
+    juniper = JuMP.optimizer_with_attributes(
+        Juniper.Optimizer,
+        "nl_solver" => JuMP.optimizer_with_attributes(
+            Ipopt.Optimizer, "print_level" => 0),
+        "log_levels" => Symbol[])
+    set_optimizer(model, juniper)
+    @test optimize!(model, gdp_method = Hull()) isa Nothing
+    @test termination_status(model) in
+        [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
+    @test value(x) ≈ log.(1 .+ supports(t)) atol = 1e-4
+    @test all(value(Y[1]))
+end
+
 function test_CuttingPlanes_infinite_simple()
     model = InfiniteGDPModel(HiGHS.Optimizer)
     set_silent(model)
@@ -741,8 +966,6 @@ function test_CuttingPlanes_infinite_two_disj()
     @test cp_obj ≈ bigm_obj atol = 1.0
 end
 
-
-
 function test_CuttingPlanes_with_cuts()
     # Maximization with single-constraint disjuncts where Hull
     # is strictly tighter than BigM. BigM allows x+y up to
@@ -791,6 +1014,419 @@ function test_CuttingPlanes_multiparameter()
         [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
 end
 
+# Quadrature weights: trapezoid coefficients from the objective's
+# default UniTrapezoid integrals on uniform and nonuniform grids,
+# unit weight for finite variables, and the model left unchanged.
+function test_quadrature_weights_trapezoid()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @infinite_parameter(model, s ∈ [0, 1], supports = [0.0, 0.1, 0.4, 1.0])
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, 0 <= y <= 10, Infinite(s))
+    @variable(model, 0 <= w <= 10)
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, ∫(x, t) + ∫(y, s) + w)
+
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+    weights = reform_state.weights
+
+    # UniTrapezoid, uniform grid h = 0.25: [h/2, h, h, h, h/2]
+    @test weights[x] ≈ [0.125, 0.25, 0.25, 0.25, 0.125]
+    # UniTrapezoid, nonuniform grid [0, 0.1, 0.4, 1.0]
+    @test weights[y] ≈ [0.05, 0.2, 0.45, 0.3]
+    # finite variable: unit weight
+    @test weights[w] == [1.0]
+    # the objective is never rewritten
+    @test JuMP.objective_sense(model) == MOI.MIN_SENSE
+    @test length(JuMP.objective_function(model).terms) == 3
+end
+
+# The weights match the objective's evaluation scheme, not a
+# hardcoded rule: a GaussLegendre integral yields Gauss weights on
+# its generated nodes and zero weight on the remaining supports.
+function test_quadrature_weights_gauss()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, ∫(x, t, eval_method = GaussLegendre()))
+
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+    w = reform_state.weights[x]
+
+    @test sum(w) ≈ 1.0
+    @test any(iszero, w)  # the uniform supports carry no weight
+    @test length(w) > 5   # Gauss nodes were added to the grid
+end
+
+# Multi-parameter weights: the tensor weights align with
+# vec(transformation_variable) via the flattened support tuples.
+function test_quadrature_weights_multiparameter()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 5)
+    @infinite_parameter(model, s ∈ [0, 2], num_supports = 4)
+    @variable(model, 0 <= x <= 10, Infinite(t, s))
+    @variable(model, Y[1:2], InfiniteLogical(t, s))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, ∫(∫(x, t), s))
+
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+    w = reform_state.weights[x]
+
+    @test length(w) == 20
+    # total weight = measure of the domain [0,1] x [0,2]
+    @test sum(w) ≈ 2.0
+
+    # per-support alignment: w[k] = omega_t(t_k) * omega_s(s_k)
+    # for the support tuple (t_k, s_k) at the same flattened index
+    InfiniteOpt.build_transformation_backend!(model)
+    wt = Dict(zip(InfiniteOpt.supports(t), [0.125, 0.25, 0.25, 0.25, 0.125]))
+    ws = Dict(zip(InfiniteOpt.supports(s), [1/3, 2/3, 2/3, 1/3]))
+    supps = vec(InfiniteOpt.supports(x))
+    for k in eachindex(supps)
+        @test w[k] ≈ wt[supps[k][1]] * ws[supps[k][2]]
+    end
+end
+
+# No measure in the objective: a scalar interval parameter falls
+# back to the default integral (trapezoid on its own supports), a
+# distribution parameter to the support average (an integral would
+# add quadrature nodes and misalign the weights), and a finite
+# variable keeps the unit weight.
+function test_quadrature_weights_default_fallbacks()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t in [0, 1], num_supports = 5)
+    @infinite_parameter(model, xi ~ InfiniteOpt.Distributions.Normal(),
+        num_supports = 4)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, 0 <= z <= 10, Infinite(xi))
+    @variable(model, 0 <= w <= 10)
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, w + 1)
+
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+
+    @test reform_state.weights[x] ≈ [0.125, 0.25, 0.25, 0.25, 0.125]
+    @test reform_state.weights[z] ≈ fill(0.25, 4)
+    @test reform_state.weights[w] == [1.0]
+end
+
+# Dependent groups always get the support average: 1/N per joint
+# support, aligned with the transcription, for random and interval
+# domains alike.
+function test_quadrature_weights_dependent_groups()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, xi[1:2] ~ InfiniteOpt.Distributions.MvNormal(
+        [0.0, 0.0], [1.0 0.0; 0.0 1.0]), num_supports = 4)
+    @variable(model, 0 <= z <= 10, Infinite(xi))
+    @variable(model, Y[1:2], InfiniteLogical(xi))
+    @constraint(model, z >= 5, Disjunct(Y[1]))
+    @constraint(model, z <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+    @test reform_state.weights[z] ≈ fill(0.25, 4)
+
+    model2 = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model2)
+    @infinite_parameter(model2, q[1:2] in [0, 1], num_supports = 3)
+    @variable(model2, 0 <= z2 <= 10, Infinite(q))
+    @variable(model2, W[1:2], InfiniteLogical(q))
+    @constraint(model2, z2 >= 5, Disjunct(W[1]))
+    @constraint(model2, z2 <= 3, Disjunct(W[2]))
+    @disjunction(model2, W)
+
+    reform_state2 = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model2)
+    DP.copy_and_reformulate(
+        model2, reform_state2.decision_vars, Hull(), reform_state2)
+    @test reform_state2.weights[z2] ≈ fill(1 / 3, 3)
+end
+
+# A measure over a dependent group is read off its own data rather
+# than averaged: the joint supports the measure generates carry its
+# coefficients, and the model's original supports carry none.
+function test_quadrature_weights_dependent_group_measure()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, q[1:2] in [0, 1], num_supports = 3)
+    @variable(model, 0 <= z <= 10, Infinite(q))
+    @variable(model, Y[1:2], InfiniteLogical(q))
+    @constraint(model, z >= 5, Disjunct(Y[1]))
+    @constraint(model, z <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, ∫(z, q))
+
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+    w = reform_state.weights[z]
+
+    # 10 Monte Carlo nodes at 1/10 each on top of the 3 original
+    # supports, which the measure never touches
+    @test length(w) == 13
+    @test count(!iszero, w) == 10
+    @test all(v -> iszero(v) || v ≈ 0.1, w)
+    # total weight = measure of the domain [0, 1]^2
+    @test sum(w) ≈ 1.0
+end
+
+# The measure collector reaches a measure inside a quadratic
+# objective: the support_sum coefficients (one per support) become
+# the weights instead of the trapezoid rule.
+function test_quadrature_weights_quadratic_objective()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t in [0, 1], num_supports = 3)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, support_sum(x, t)^2)
+
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+    @test reform_state.weights[x] == [1.0, 1.0, 1.0]
+end
+
+# Same through a nonlinear objective with a numeric literal; the
+# model carries no optimizer so the transcription accepts the
+# nonlinear objective.
+function test_quadrature_weights_nonlinear_objective()
+    model = InfiniteGDPModel()
+    @infinite_parameter(model, t in [0, 1], num_supports = 3)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, exp(support_sum(x, t)) + 2)
+
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+    @test reform_state.weights[x] == [1.0, 1.0, 1.0]
+end
+
+# Measure data that reports no coefficients of its own warns and
+# falls through to the default weighting.
+struct _UnreadableMeasureData <: InfiniteOpt.AbstractMeasureData end
+
+function test_quadrature_weights_unreadable_measure_data()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 3)
+    supps = [0.0, 0.5, 1.0]
+    weights = nothing
+    @test_logs (:warn,) begin
+        weights = IDP._group_weights(_UnreadableMeasureData(), t, supps)
+    end
+    # same as the unmeasured path: UniTrapezoid on 3 uniform supports
+    @test weights == IDP._group_weights(nothing, t, supps)
+    @test weights == Dict(0.0 => 0.25, 0.5 => 0.5, 1.0 => 0.25)
+end
+
+# The cut coefficients carry the quadrature weights:
+# ξ_k = 2 ω_k (sep_k - rBM_k) on each transcribed variable.
+function test_add_cut_weighted_coefficients()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], num_supports = 3)
+    @variable(model, 0 <= x <= 10, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x >= 5, Disjunct(Y[1]))
+    @constraint(model, x <= 3, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Min, ∫(x, t))
+
+    # store the weights the way the CP loop does
+    reform_state = DP._CuttingPlanes(CuttingPlanes(HiGHS.Optimizer), model)
+    DP.copy_and_reformulate(
+        model, reform_state.decision_vars, Hull(), reform_state)
+
+    DP.reformulate_model(model, BigM(10.0))
+    InfiniteOpt.build_transformation_backend!(model)
+    transcribed = InfiniteOpt.transformation_model(model)
+    rBM_sol = Dict(x => [1.0, 2.0, 3.0])
+    sep_sol = Dict(x => [0.5, 1.5, 2.5])
+    # the cut call consumes reform_state.decision_vars; restrict to x
+    reform_state.decision_vars = [x]
+    DP.add_cut(model, reform_state, rBM_sol, sep_sol)
+
+    # UniTrapezoid on 3 uniform supports: [0.25, 0.5, 0.25]
+    cut = JuMP.constraint_object(last(JuMP.all_constraints(
+        transcribed, JuMP.AffExpr, MOI.GreaterThan{Float64})))
+    xs = vec(InfiniteOpt.transformation_variable(x))
+    expected = 2 .* [0.25, 0.5, 0.25] .* (-0.5)
+    for k in eachindex(xs)
+        @test JuMP.coefficient(cut.func, xs[k]) ≈ expected[k]
+    end
+end
+
+# Shared variables: a variable whose infinite parameters do not contain
+# its indicator's, so one copy serves indicator supports that may pick
+# different disjuncts. Optima are by brute force over the disjunct
+# choices at each support.
+
+# finite d under Y(t): per t, d <= 2 - 2t or d <= 1 + 2t; maximize d.
+# Best choice per t is the larger bound, so d = min_t max(...) = 1.5.
+function test_shared_finite_variable()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1],
+        supports = [0.0, 0.25, 0.5, 0.75, 1.0])
+    @variable(model, 0 <= d <= 3)
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, d <= 2 - 2t, Disjunct(Y[1]))
+    @constraint(model, d <= 1 + 2t, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, d)
+
+    optimize!(model, gdp_method = BigM(10.0))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 1.5 atol = 1e-6
+
+    optimize!(model, gdp_method = MBM(HiGHS.Optimizer))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 1.5 atol = 1e-6
+    # M = 4t - 1 and 1 - 4t
+    M_funcs = InfiniteOpt.all_parameter_functions(model)
+    @test value(M_funcs[1]) ≈ [0, 1, 2, 3, 3]
+    @test value(M_funcs[2]) ≈ [1, 0, 0, 0, 0]
+
+    optimize!(model, gdp_method = Hull())
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 1.5 atol = 1e-6
+    # the disaggregated copies are over the indicator's parameters
+    dvrefs = DP._reformulation_variables(model)
+    @test InfiniteOpt.parameter_refs.(dvrefs) == [(t,), (t,)]
+end
+
+# z(t) under Y(t, xi): per (t, xi), z <= 2 - xi or z <= xi; maximize
+# the sum over t of z, so z = min_xi max(2 - xi, xi) = 1 at each t.
+function test_shared_infinite_variable()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], supports = [0.0, 1.0])
+    @infinite_parameter(model, xi ∈ [0, 2], supports = [0.5, 1.0, 1.5, 2.0])
+    @variable(model, 0 <= z <= 3, Infinite(t))
+    @variable(model, Y[1:2], InfiniteLogical(t, xi))
+    @constraint(model, z <= 2 - xi, Disjunct(Y[1]))
+    @constraint(model, z <= xi, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, support_sum(z, t))
+
+    optimize!(model, gdp_method = BigM(10.0))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 2.0 atol = 1e-6
+
+    optimize!(model, gdp_method = MBM(HiGHS.Optimizer))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 2.0 atol = 1e-6
+    # M = 2xi - 2 and 2 - 2xi at both t
+    M_funcs = InfiniteOpt.all_parameter_functions(model)
+    @test value(M_funcs[1]) ≈ [0 1 2 2; 0 1 2 2]
+    @test value(M_funcs[2]) ≈ [1 0 0 0; 1 0 0 0]
+
+    optimize!(model, gdp_method = Hull())
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 2.0 atol = 1e-6
+    # the disaggregated copies are over the indicator's parameters
+    dvrefs = DP._reformulation_variables(model)
+    @test InfiniteOpt.parameter_refs.(dvrefs) == [(t, xi), (t, xi)]
+end
+
+# Y(t) over x(t, xi): no shared variable, the indicator only has fewer
+# parameters than the constraint. Per t, x <= t + xi (sum 3t + 1.5) or
+# x <= 1.2 at a cost of 1.5 (value 2.1): 2.1 + 3.0 + 4.5 = 9.6.
+function test_fewer_indicator_parameters()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1], supports = [0.0, 0.5, 1.0])
+    @infinite_parameter(model, xi ∈ [0, 1], supports = [0.2, 0.5, 0.8])
+    @variable(model, 0 <= x <= 3, Infinite(t, xi))
+    @variable(model, Y[1:2], InfiniteLogical(t))
+    @constraint(model, x <= t + xi, Disjunct(Y[1]))
+    @constraint(model, x <= 1.2, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max,
+        support_sum(support_sum(x, xi) - 1.5 * binary_variable(Y[2]), t))
+
+    optimize!(model, gdp_method = BigM(10.0))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 9.6 atol = 1e-6
+
+    optimize!(model, gdp_method = MBM(HiGHS.Optimizer))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 9.6 atol = 1e-6
+
+    optimize!(model, gdp_method = Hull())
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 9.6 atol = 1e-6
+    # the disaggregated copies are over the indicator's parameters
+    dvrefs = DP._reformulation_variables(model)
+    @test InfiniteOpt.parameter_refs.(dvrefs) == [(t, xi), (t, xi)]
+end
+
+# derivative of a shared z(t) under Y(t, xi): per (t, xi), dz <= 2 - xi or
+# dz <= xi, so dz = max(2 - xi, xi) = 1.5 at both xi and z(1) - z(0) = 1.5.
+function test_shared_variable_derivative()
+    model = InfiniteGDPModel(HiGHS.Optimizer)
+    set_silent(model)
+    @infinite_parameter(model, t ∈ [0, 1],
+        supports = [0.0, 0.25, 0.5, 0.75, 1.0])
+    @infinite_parameter(model, xi ∈ [0, 2], supports = [0.5, 1.5])
+    @variable(model, -5 <= z <= 5, Infinite(t))
+    @variable(model, -10 <= dz <= 10, Deriv(z, t))
+    @variable(model, Y[1:2], InfiniteLogical(t, xi))
+    @constraint(model, dz <= 2 - xi, Disjunct(Y[1]))
+    @constraint(model, dz <= xi, Disjunct(Y[2]))
+    @disjunction(model, Y)
+    @objective(model, Max, z(1) - z(0))
+
+    optimize!(model, gdp_method = BigM(100.0))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 1.5 atol = 1e-6
+
+    optimize!(model, gdp_method = MBM(HiGHS.Optimizer))
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 1.5 atol = 1e-6
+
+    optimize!(model, gdp_method = Hull())
+    @test termination_status(model) == MOI.OPTIMAL
+    @test objective_value(model) ≈ 1.5 atol = 1e-6
+    # the disaggregated copies are over the indicator's parameters
+    dvrefs = DP._reformulation_variables(model)
+    @test InfiniteOpt.parameter_refs.(dvrefs) == [(t, xi), (t, xi)]
+end
+
 @testset "InfiniteDisjunctiveProgramming" begin
 
     @testset "Model" begin
@@ -832,8 +1468,14 @@ end
 
     @testset "MBM" begin
         test_interpolate()
-        test_raw_M_infinite_scalar()
-        test_raw_M_infinite_param_function()
+        test_compute_M_infinite_scalar()
+        test_compute_M_infinite_param_function()
+        test_compute_M_infinite_two_params()
+        test_compute_M_infinite_dependent_params()
+        test_compute_M_infinite_dependent_varying()
+        test_compute_M_infinite_finite_constraint()
+        test_mbm_finite_disjunction()
+        test_mbm_mixed_finite_disjunct()
         test_mbm_finite_and_integer_var()
         test_mbm_infinite_simple()
         test_mbm_infinite_param_dependent()
@@ -841,14 +1483,33 @@ end
         test_mbm_with_derivatives()
     end
 
+    @testset "Shared variables" begin
+        test_shared_finite_variable()
+        test_shared_infinite_variable()
+        test_fewer_indicator_parameters()
+        test_shared_variable_derivative()
+    end
     @testset "Integration" begin
         test_infiniteopt_extension()
         test_methods()
+        test_evaluate_at_zero_infinite()
+        test_hull_infinite_nonlinear()
+        test_hull_infinite_nonlinear_parameter()
     end
 
     @testset "Cutting Planes" begin
         test_extract_solution_infinite()
         test_add_cut_infinite()
+        test_quadrature_weights_trapezoid()
+        test_quadrature_weights_gauss()
+        test_quadrature_weights_multiparameter()
+        test_quadrature_weights_default_fallbacks()
+        test_quadrature_weights_dependent_groups()
+        test_quadrature_weights_dependent_group_measure()
+        test_quadrature_weights_quadratic_objective()
+        test_quadrature_weights_nonlinear_objective()
+        test_quadrature_weights_unreadable_measure_data()
+        test_add_cut_weighted_coefficients()
         test_CuttingPlanes_infinite_simple()
         test_CuttingPlanes_infinite_two_disj()
         test_CuttingPlanes_with_cuts()

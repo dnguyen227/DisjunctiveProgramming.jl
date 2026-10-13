@@ -368,38 +368,72 @@ struct BigM{T} <: AbstractReformulationMethod
 end
 
 """
-    MBM{O, T, L <: LogicalVariableRef} <: AbstractReformulationMethod
+    AbstractMBMSampler
+
+Abstract type for the M-value samplers used by [`MBM`](@ref) on
+infinite models. Concrete samplers implement
+[`sample_M_values`](@ref).
+"""
+abstract type AbstractMBMSampler end
+
+"""
+    ExhaustiveSampler <: AbstractMBMSampler
+
+The default M-value sampler for [`MBM`](@ref): solve an M subproblem
+at every support of the infinite model.
+"""
+struct ExhaustiveSampler <: AbstractMBMSampler end
+
+"""
+    MBM{O, T, S} <: AbstractReformulationMethod
 
 A type for using the multiple big-M reformulation approach for disjunctive constraints.
 
 **Fields**
 - `optimizer::O`: Optimizer to use when solving mini-models (required).
 - `default_M::T`: Default big-M value to use if no big-M is specified for a logical variable (1e9).
+- `sampler::S`: M-value sampler for infinite models
+  (`ExhaustiveSampler()`). An [`ExhaustiveSampler`](@ref) solves an M
+  subproblem at every support; a [`GPSampler`](@ref) solves a subset
+  of the supports and fills the rest with a conservative
+  Gaussian-process estimate (see [`sample_M_values`](@ref)). Ignored
+  for finite models.
 """
-mutable struct MBM{O, T} <: AbstractReformulationMethod
+mutable struct MBM{O, T, S <: AbstractMBMSampler} <:
+    AbstractReformulationMethod
     optimizer::O
     default_M::T
-    
+    sampler::S
+
     # Constructor with optimizer (required) and optional default_M
-    function MBM(optimizer::O, default_M::T = 1e9) where {O, T}
-        new{O, T}(optimizer, default_M)
+    # (kwargs cannot bind static parameters, hence typeof(sampler))
+    function MBM(
+        optimizer::O, default_M::T = 1e9;
+        sampler = ExhaustiveSampler()
+        ) where {O, T}
+        new{O, T, typeof(sampler)}(optimizer, default_M, sampler)
     end
 end
 
-mutable struct _MBM{O, T, M <: JuMP.AbstractModel} <: AbstractReformulationMethod
+mutable struct _MBM{O, T, S <: AbstractMBMSampler,
+    M <: JuMP.AbstractModel} <: AbstractReformulationMethod
     optimizer::O
     M::Dict{LogicalVariableRef{M}, Any}
     default_M::T
+    sampler::S
     subproblem_indicators::Vector{LogicalVariableRef{M}}
     # Cached submodels: indicator => GDPSubmodel.
     # Typed Any so extensions can store different types.
     model_cache::Dict{LogicalVariableRef{M}, Any}
 
-    function _MBM(method::MBM{O, T}, model::M) where {O, T, M <: JuMP.AbstractModel}
-        new{O, T, M}(
+    function _MBM(
+        method::MBM{O, T, S}, model::M
+        ) where {O, T, S, M <: JuMP.AbstractModel}
+        new{O, T, S, M}(
             method.optimizer,
             Dict{LogicalVariableRef{M}, Any}(),
             method.default_M,
+            method.sampler,
             Vector{LogicalVariableRef{M}}(),
             Dict{LogicalVariableRef{M}, Any}()
         )
@@ -445,9 +479,10 @@ A type for using the cutting planes approach for disjunctive constraints.
 - `optimizer::O`: Optimizer to use when solving mini-models (required).
 - `max_iter::Int`: Number of iterations (default = `3`).
 - `seperation_tolerance::T`: Tolerance for the separation problem (default = `1e-6`).
-- `final_reform_method::AbstractReformulationMethod`: Final reformulation 
+- `final_reform_method::AbstractReformulationMethod`: Final reformulation
 method to use after cutting planes (default = `BigM()`).
-- `M_value::T`: Big-M value to use in the final reformulation (default = `1e9`).
+- `M_value::T`: Big-M value of the relaxed BigM model the loop cuts
+against (default = `1e9`).
 """
 struct CuttingPlanes{O, T} <: AbstractReformulationMethod
     optimizer::O;
@@ -462,7 +497,8 @@ struct CuttingPlanes{O, T} <: AbstractReformulationMethod
         final_reform_method = BigM(),
         M_value::T = 1e9
     ) where {O, T}
-        new{O, T}(optimizer, max_iter, seperation_tolerance, final_reform_method, M_value)
+        new{O, T}(optimizer, max_iter, seperation_tolerance,
+            final_reform_method, M_value)
     end
 end
 
@@ -492,6 +528,35 @@ struct GDPSubmodel{M <: JuMP.AbstractModel,
     model::M
     decision_vars::Vector{V}
     fwd_map::Dict{V, Vector{W}}
+end
+
+# Per-run working state for one cutting planes solve: config copied
+# from `CuttingPlanes` plus the decision variables, the separation
+# submodel, and the support weights the separation objective and the
+# cuts share (unit weights for finite models; extensions store
+# quadrature weights at submodel build time).
+mutable struct _CuttingPlanes{O, T, V <: JuMP.AbstractVariableRef} <:
+        AbstractReformulationMethod
+    optimizer::O
+    max_iter::Int
+    separation_tolerance::T
+    final_reform_method::AbstractReformulationMethod
+    M_value::T
+    decision_vars::Vector{V}
+    weights::Dict{V, Vector{T}}
+    separation::Union{Nothing, GDPSubmodel{<:JuMP.AbstractModel, V}}
+
+    function _CuttingPlanes(
+        method::CuttingPlanes{O, T},
+        model::JuMP.AbstractModel
+        ) where {O, T}
+        dvars = collect_cutting_planes_vars(model)
+        V = eltype(dvars)
+        new{O, T, V}(method.optimizer, method.max_iter,
+            method.seperation_tolerance, method.final_reform_method,
+            method.M_value, dvars,
+            Dict{V, Vector{T}}(v => ones(T, 1) for v in dvars), nothing)
+    end
 end
 
 """
